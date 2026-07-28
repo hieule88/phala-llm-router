@@ -102,7 +102,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   # 24.04 docker base enables main+restricted+universe+multiverse by default,
   # so this just works. If the deploy customised sources.list and removed
   # universe, the apt-get below fails loud and we exit before building.
-  apt-get install -y --no-install-recommends ca-certificates rustup
+  apt-get install -y --no-install-recommends ca-certificates rustup build-essential pkg-config libssl-dev
 
   # Install a current stable. --no-self-update so rustup does not silently
   # upgrade itself at runtime; --profile minimal keeps the install to
