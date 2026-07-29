@@ -264,7 +264,7 @@ cat >/tmp/private-ai-gateway.config.json <<EOF
 EOF
 
 PRIVATE_AI_GATEWAY_CONFIG_PATH=/tmp/private-ai-gateway.config.json \
-cargo run --release --bin private-ai-gateway
+cargo run --release --bin leviathan-ai-gateway
 ```
 
 This starts the gateway and proves the identity surface, but it intentionally
@@ -412,8 +412,8 @@ The recommended dstack deployment path uses `git-launcher`:
 
 1. `git-launcher` clones this repo at a pinned commit.
 2. It runs this repo's `entrypoint.sh`.
-3. `entrypoint.sh` builds `private-ai-gateway` with `cargo build --release
-   --locked --bin private-ai-gateway`.
+3. `entrypoint.sh` builds `leviathan-ai-gateway` with `cargo build --release
+   --locked --bin leviathan-ai-gateway`.
 4. The built binary runs with runtime config from Compose environment, mounted
    files, dstack encrypted secrets, and dstack KMS.
 

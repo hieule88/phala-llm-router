@@ -58,8 +58,8 @@ fn entrypoint_sh_is_fail_closed() {
 fn entrypoint_sh_uses_locked_release_build() {
     let body = script_text();
     assert!(
-        body.contains("cargo build --release --locked --bin private-ai-gateway"),
-        "entrypoint.sh must call the exact `cargo build --release --locked --bin private-ai-gateway` command"
+        body.contains("cargo build --release --locked --bin leviathan-ai-gateway"),
+        "entrypoint.sh must call the exact `cargo build --release --locked --bin leviathan-ai-gateway` command"
     );
 }
 
@@ -145,7 +145,7 @@ fn entrypoint_sh_keeps_mutable_build_state_outside_checkout() {
         r#"RUSTUP_HOME=${RUSTUP_HOME:-$PRIVATE_AI_GATEWAY_CACHE_DIR/rustup}"#,
         r#"CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PRIVATE_AI_GATEWAY_CACHE_DIR/target}"#,
         r#"mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$CARGO_TARGET_DIR""#,
-        r#"BIN="$CARGO_TARGET_DIR/release/private-ai-gateway""#,
+        r#"BIN="$CARGO_TARGET_DIR/release/leviathan-ai-gateway""#,
     ] {
         assert!(
             body.contains(required),

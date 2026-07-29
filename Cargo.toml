@@ -1,8 +1,8 @@
 [package]
-name = "private-ai-gateway"
+name = "leviathan-ai-gateway"
 version = "0.1.0"
 edition = "2021"
-description = "Rust implementation of the Attested Confidential Inference (ACI) aggregator service"
+description = "Leviathan AI Gateway — Attested Confidential Inference (ACI) aggregator service"
 license = "Apache-2.0"
 
 [lib]
@@ -10,7 +10,7 @@ name = "private_ai_gateway"
 path = "src/lib.rs"
 
 [[bin]]
-name = "private-ai-gateway"
+name = "leviathan-ai-gateway"
 path = "src/main.rs"
 
 [dependencies]

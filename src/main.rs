@@ -400,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if keyset_epoch_window_seconds == 0 {
         return Err(invalid_input("keyset_epoch_window_seconds must be greater than zero").into());
     }
-    let identity_subject: Option<String> = None;
+    let identity_subject: Option<String> = Some("leviathan:ai-gateway".to_string());
     let keyset_identity = WorkloadIdentity {
         public_key: keys.identity_public_key(),
         subject: identity_subject.clone(),
@@ -430,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let config = AciServiceConfig {
-        vendor: "private-ai-gateway-dev".to_string(),
+        vendor: "leviathan-ai-gateway".to_string(),
         tee_type: "tdx".to_string(),
         source_provenance,
         keyset_epoch,

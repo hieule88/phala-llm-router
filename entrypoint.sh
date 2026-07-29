@@ -125,10 +125,10 @@ log "cache dir: $PRIVATE_AI_GATEWAY_CACHE_DIR"
 # --frozen would additionally refuse network access; we leave that off so the
 # first build inside a fresh TEE can fetch crates. Once a base image with a
 # pre-warmed crate cache lands, switching to --frozen is a one-line change.
-log "cargo build --release --locked --bin private-ai-gateway"
-cargo build --release --locked --bin private-ai-gateway
+log "cargo build --release --locked --bin leviathan-ai-gateway"
+cargo build --release --locked --bin leviathan-ai-gateway
 
-BIN="$CARGO_TARGET_DIR/release/private-ai-gateway"
+BIN="$CARGO_TARGET_DIR/release/leviathan-ai-gateway"
 [[ -x $BIN ]] || die "release binary not found at $BIN after build"
 
 log "exec $BIN"

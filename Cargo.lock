@@ -2717,6 +2717,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "leviathan-ai-gateway"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "axum 0.7.9",
+ "base64 0.22.1",
+ "bytes",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "dcap-qvl",
+ "dstack-sdk",
+ "ed25519-dalek",
+ "flate2",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "http-body-util",
+ "k256",
+ "ml-kem",
+ "prometheus",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "reqwest",
+ "rust_decimal",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots",
+ "x25519-dalek",
+ "x509-parser",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3244,49 +3287,6 @@ dependencies = [
  "fixed-hash",
  "impl-codec",
  "uint",
-]
-
-[[package]]
-name = "private-ai-gateway"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "async-trait",
- "axum 0.7.9",
- "base64 0.22.1",
- "bytes",
- "chacha20poly1305",
- "curve25519-dalek",
- "dcap-qvl",
- "dstack-sdk",
- "ed25519-dalek",
- "flate2",
- "futures-util",
- "hex",
- "hkdf",
- "http-body-util",
- "k256",
- "ml-kem",
- "prometheus",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "reqwest",
- "rust_decimal",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "sha3 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "webpki-roots",
- "x25519-dalek",
- "x509-parser",
 ]
 
 [[package]]
