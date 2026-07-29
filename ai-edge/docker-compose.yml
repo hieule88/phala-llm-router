@@ -1,0 +1,51 @@
+# Leviathan multi-tenant front: Edge + auth-service (credit ledger).
+# The single-tenant AI gateway runs SEPARATELY on Phala; the Edge points at it
+# via GATEWAY_URL and forwards with GATEWAY_API_TOKEN (the gateway's internal
+# api_token). Put values in a .env next to this file.
+name: leviathan-ai-edge
+
+services:
+  auth-service:
+    build: ../auth-service
+    container_name: leviathan-auth-service
+    restart: always
+    environment:
+      - ADMIN_TOKEN=${ADMIN_TOKEN:?set ADMIN_TOKEN (openssl rand -hex 32)}
+      - PROXY_REFUND_TOKEN=${PROXY_REFUND_TOKEN:?set PROXY_REFUND_TOKEN (openssl rand -hex 32)}
+      - AUTH_DB_PATH=/data/auth.db
+      - ALLOW_EMPTY_DB=${ALLOW_EMPTY_DB:-}
+      # NOWPayments (top-ups). Empty disables the webhook (503).
+      - NOWPAYMENTS_IPN_SECRET=${NOWPAYMENTS_IPN_SECRET:-}
+      - NOWPAYMENTS_API_KEY=${NOWPAYMENTS_API_KEY:-}
+      - NOWPAYMENTS_IPN_CALLBACK_URL=${NOWPAYMENTS_IPN_CALLBACK_URL:-}
+    volumes:
+      - auth_data:/data
+    expose:
+      - "8000"
+    networks: [edge-net]
+
+  edge:
+    build: .
+    container_name: leviathan-ai-edge
+    restart: always
+    environment:
+      # Co-located with auth-service on the private network → http is fine.
+      - AUTH_SERVICE_URL=http://auth-service:8000
+      - AUTH_SERVICE_ALLOW_HTTP=true
+      # MUST equal PROXY_REFUND_TOKEN above (gates /v1/consume + /v1/refund).
+      - AUTH_SERVICE_PROXY_TOKEN=${PROXY_REFUND_TOKEN:?}
+      # The Phala-hosted single-tenant gateway + its internal api_token.
+      - GATEWAY_URL=${GATEWAY_URL:?set GATEWAY_URL (the Phala gateway base, no trailing slash)}
+      - GATEWAY_API_TOKEN=${GATEWAY_API_TOKEN:?set GATEWAY_API_TOKEN (the gateway's api_token)}
+    ports:
+      - "8090:8090"
+    depends_on:
+      - auth-service
+    networks: [edge-net]
+
+networks:
+  edge-net:
+    driver: bridge
+
+volumes:
+  auth_data:
