@@ -1,8 +1,17 @@
+import os
 import requests
 import secrets
 from typing import List, Dict, Any, Optional
 from .base import ServiceProvider
 from ..types import AttestationReport
+
+
+def _near_auth_headers() -> Dict[str, str]:
+    """cloud-api.near.ai now requires auth on the attestation endpoint.
+    The upstream vendored provider predates that; read the key from env so the
+    bridge can fetch the report. Set NEAR_AI_API_KEY (or NEARAI_API_KEY)."""
+    key = (os.getenv("NEAR_AI_API_KEY") or os.getenv("NEARAI_API_KEY") or "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 class NearaiProvider(ServiceProvider):
@@ -44,7 +53,7 @@ class NearaiProvider(ServiceProvider):
         if use_tls_fingerprint:
             print(f"[Near] TLS fingerprint binding enabled")
 
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, headers=_near_auth_headers())
         response.raise_for_status()
         data = response.json()
 
@@ -77,7 +86,7 @@ class NearaiProvider(ServiceProvider):
     def list_models(self) -> List[str]:
         url = f"{self.api_base}/model/list"
         print(f"[Near] Fetching models from {url}")
-        response = requests.get(url)
+        response = requests.get(url, headers=_near_auth_headers())
         response.raise_for_status()
         data = response.json()
 
