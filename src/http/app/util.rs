@@ -116,8 +116,20 @@ pub(super) fn enforce_admin(state: &AppState, headers: &HeaderMap) -> Option<Res
     }
 }
 
+/// The service token may arrive on either channel:
+///   * `Authorization: Bearer <token>` — classic single-tenant callers;
+///   * `x-gateway-token: <token>` — a multiplexing front (e.g. the Edge) that
+///     must keep `Authorization` free to carry the END USER's bearer, so each
+///     receipt stays owned by that user (`ReceiptOwner::from_bearer`).
 pub(super) fn enforce_api(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     let expected = state.api_token.as_deref()?;
+    if headers
+        .get("x-gateway-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| token == expected)
+    {
+        return None;
+    }
     let Some(token) = extract_bearer(headers) else {
         return Some(error_response(
             StatusCode::UNAUTHORIZED,

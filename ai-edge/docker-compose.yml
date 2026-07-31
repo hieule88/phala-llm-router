@@ -34,9 +34,13 @@ services:
       - AUTH_SERVICE_ALLOW_HTTP=true
       # MUST equal PROXY_REFUND_TOKEN above (gates /v1/consume + /v1/refund).
       - AUTH_SERVICE_PROXY_TOKEN=${PROXY_REFUND_TOKEN:?}
-      # The Phala-hosted single-tenant gateway + its internal api_token.
+      # The Phala-hosted gateway + its internal service token (sent on
+      # x-gateway-token; authorization carries the per-user tenant bearer).
       - GATEWAY_URL=${GATEWAY_URL:?set GATEWAY_URL (the Phala gateway base, no trailing slash)}
       - GATEWAY_API_TOKEN=${GATEWAY_API_TOKEN:?set GATEWAY_API_TOKEN (the gateway's api_token)}
+      # Derives per-user tenant bearers (receipt ownership at the gateway).
+      # Rotating it orphans receipts issued under the old bearers.
+      - EDGE_TENANT_SECRET=${EDGE_TENANT_SECRET:?set EDGE_TENANT_SECRET (openssl rand -hex 32)}
     ports:
       - "8090:8090"
     depends_on:

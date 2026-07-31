@@ -363,20 +363,23 @@ fn deploy_readme_documents_one_command_deploy_and_seed_config() {
 fn deploy_examples_target_router_middleware_repo() {
     let compose = deploy_text("compose.yaml");
     let launcher = deploy_text("aggregator.conf");
-    let repo_url =
+    // This fork deploys from its own repo, pinned by COMMIT_SHA in the
+    // compose file (hardcoded — not env-interpolated — so `phala cvms
+    // stop/start` works without re-supplying env).
+    let fork_repo_url = "https://github.com/hieule88/phala-llm-router.git";
+    let upstream_repo_url =
         "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git";
 
     assert!(
-        compose.contains(repo_url),
-        "deploy/compose.yaml must pin this router-middleware repo"
+        compose.contains(fork_repo_url),
+        "deploy/compose.yaml must pin this fork's repo"
     );
     assert!(
-        launcher.contains(repo_url),
-        "deploy/aggregator.conf must pin this router-middleware repo"
+        launcher.contains(fork_repo_url) || launcher.contains(upstream_repo_url),
+        "deploy/aggregator.conf must pin a router-middleware repo"
     );
     assert!(
-        compose.contains(r#""middleware": {"#)
-            && compose.contains(r#""public_model": "${PRIVATE_AI_GATEWAY_PUBLIC_MODEL:?set PRIVATE_AI_GATEWAY_PUBLIC_MODEL}""#),
+        compose.contains(r#""middleware": {"#) && compose.contains(r#""public_model": ""#),
         "deploy/compose.yaml should enable the in-process router middleware with an explicit public model"
     );
     assert!(

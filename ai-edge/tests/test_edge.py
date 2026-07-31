@@ -22,6 +22,7 @@ os.environ.setdefault("AUTH_SERVICE_PROXY_TOKEN", "ptok")
 os.environ.setdefault("AUTH_SERVICE_VERIFY_TLS", "false")
 os.environ.setdefault("GATEWAY_URL", "https://gw.test")
 os.environ.setdefault("GATEWAY_API_TOKEN", "gtok")
+os.environ.setdefault("EDGE_TENANT_SECRET", "tsecret")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -57,12 +58,13 @@ class ConsumeMappingTest(unittest.TestCase):
             seen["auth"] = req.headers.get("authorization")
             import json
             seen["cred"] = json.loads(req.content)["credential_value"]
-            return httpx.Response(200, json={"success": True, "balance": 9})
+            return httpx.Response(200, json={"success": True, "balance": 9, "identity_id": 7})
 
         ac = _auth_with(handler)
         r = run(ac.consume("lev_abc", "edge:x"))
         self.assertEqual(r.status, edge.ALLOW)
         self.assertEqual(r.balance, 9)
+        self.assertEqual(r.identity_id, 7)
         self.assertEqual(seen["auth"], "Bearer ptok")                       # proxy-gated
         self.assertEqual(seen["cred"], hashlib.sha256(b"lev_abc").hexdigest())  # hash, not raw
 
@@ -91,12 +93,17 @@ class ConsumeMappingTest(unittest.TestCase):
 
 class ValidateMappingTest(unittest.TestCase):
     def test_valid(self):
-        ac = _auth_with(lambda r: httpx.Response(200, json={"valid": True, "balance": 5}))
-        self.assertEqual(run(ac.validate("k")).status, edge.ALLOW)
+        ac = _auth_with(lambda r: httpx.Response(200, json={"valid": True, "balance": 5, "identity_id": 3}))
+        res = run(ac.validate("k"))
+        self.assertEqual(res.status, edge.ALLOW)
+        self.assertEqual(res.identity_id, 3)
 
-    def test_known_but_empty_is_no_balance(self):
-        ac = _auth_with(lambda r: httpx.Response(200, json={"valid": False, "error": "insufficient balance"}))
-        self.assertEqual(run(ac.validate("k")).status, edge.DENY_NO_BALANCE)
+    def test_known_but_empty_is_no_balance_and_keeps_identity(self):
+        ac = _auth_with(lambda r: httpx.Response(
+            200, json={"valid": False, "error": "insufficient balance", "identity_id": 3}))
+        res = run(ac.validate("k"))
+        self.assertEqual(res.status, edge.DENY_NO_BALANCE)
+        self.assertEqual(res.identity_id, 3)
 
     def test_unknown_is_unauth(self):
         ac = _auth_with(lambda r: httpx.Response(200, json={"valid": False, "error": "credential not found"}))
@@ -114,24 +121,39 @@ class HelpersTest(unittest.TestCase):
 
     def test_fwd_request_headers_strip_and_inject(self):
         class R:
-            headers = {"authorization": "Bearer lev_user", "content-type": "application/json", "host": "x"}
-        h = edge._fwd_request_headers(R())
-        self.assertEqual(h["authorization"], "Bearer gtok")   # internal token, user bearer stripped
+            headers = {"authorization": "Bearer lev_user", "content-type": "application/json",
+                       "host": "x", "x-gateway-token": "smuggled", "x-user-tier": "vip"}
+        h = edge._fwd_request_headers(R(), identity_id=7)
+        # Service token rides x-gateway-token; authorization carries the
+        # per-user tenant bearer (never the raw user key, never the api token).
+        self.assertEqual(h["x-gateway-token"], "gtok")
+        self.assertEqual(h["authorization"], f"Bearer {edge._tenant_bearer(7)}")
+        self.assertNotIn("lev_user", str(h))
         self.assertNotIn("host", h)
+        self.assertNotIn("x-user-tier", h)                    # client can't smuggle tier
         self.assertEqual(h["content-type"], "application/json")
+
+    def test_tenant_bearer_is_hmac_per_identity(self):
+        import hmac as hmac_mod
+        expected = hmac_mod.new(b"tsecret", b"7", hashlib.sha256).hexdigest()
+        self.assertEqual(edge._tenant_bearer(7), f"lev_t_{expected}")
+        self.assertNotEqual(edge._tenant_bearer(7), edge._tenant_bearer(8))
 
 
 class EndToEndProxyTest(unittest.TestCase):
     """Drive the real FastAPI routes over ASGI with mocked auth-service +
     gateway, so the full path (auth gate -> forward -> deny/refund) is tested."""
 
-    def _run_chat(self, consume="allow", gateway=(200, b'{"ok":true}')):
-        state = {"refunds": 0, "gw_calls": 0}
+    def _run_chat(self, consume="allow", gateway=(200, b'{"ok":true}'), identity_id=7):
+        state = {"refunds": 0, "gw_calls": 0, "gw_headers": None}
 
         def auth_handler(req: httpx.Request) -> httpx.Response:
             if req.url.path == "/v1/consume":
                 if consume == "allow":
-                    return httpx.Response(200, json={"success": True, "balance": 9})
+                    payload = {"success": True, "balance": 9}
+                    if identity_id is not None:
+                        payload["identity_id"] = identity_id
+                    return httpx.Response(200, json=payload)
                 return httpx.Response(200, json={"success": False, "error": "insufficient balance"})
             if req.url.path == "/v1/refund":
                 state["refunds"] += 1
@@ -140,6 +162,7 @@ class EndToEndProxyTest(unittest.TestCase):
 
         def gw_handler(req: httpx.Request) -> httpx.Response:
             state["gw_calls"] += 1
+            state["gw_headers"] = dict(req.headers)
             code, body = gateway
             return httpx.Response(code, content=body, headers={"content-type": "application/json"})
 
@@ -166,6 +189,15 @@ class EndToEndProxyTest(unittest.TestCase):
         self.assertEqual(resp.content, b'{"ok":true}')
         self.assertEqual(state["gw_calls"], 1)
         self.assertEqual(state["refunds"], 0)
+        # The gateway saw the service token + THIS user's tenant bearer.
+        self.assertEqual(state["gw_headers"]["x-gateway-token"], "gtok")
+        self.assertEqual(state["gw_headers"]["authorization"], f"Bearer {edge._tenant_bearer(7)}")
+
+    def test_consume_without_identity_fails_closed_and_refunds(self):
+        resp, state = self._run_chat(consume="allow", identity_id=None)
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(state["gw_calls"], 0)      # never reached the gateway
+        self.assertEqual(state["refunds"], 1)       # debit was reversed
 
     def test_no_balance_returns_402_and_does_not_call_gateway(self):
         resp, state = self._run_chat(consume="no_balance")
@@ -189,6 +221,58 @@ class EndToEndProxyTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(state["gw_calls"], 1)
         self.assertEqual(state["refunds"], 1)       # debited then refunded
+
+
+class ReceiptRouteTest(unittest.TestCase):
+    """The receipt passthrough must authenticate the user and present the
+    SAME tenant bearer used at chat time, or the gateway 401/403s."""
+
+    def _get_receipt(self, validate_json, with_key=True):
+        state = {"gw_headers": None}
+
+        def auth_handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/v1/validate":
+                return httpx.Response(200, json=validate_json)
+            return httpx.Response(404)
+
+        def gw_handler(req: httpx.Request) -> httpx.Response:
+            state["gw_headers"] = dict(req.headers)
+            return httpx.Response(200, json={"receipt_id": "r-1"},
+                                  headers={"content-type": "application/json"})
+
+        ac = edge.AuthClient()
+        ac._c = httpx.AsyncClient(transport=httpx.MockTransport(auth_handler))
+        edge.app.state.auth = ac
+        edge.app.state.gw = httpx.AsyncClient(transport=httpx.MockTransport(gw_handler))
+
+        async def go():
+            transport = httpx.ASGITransport(app=edge.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://edge") as c:
+                headers = {"authorization": "Bearer lev_user"} if with_key else {}
+                return await c.get("/v1/aci/receipts/r-1", headers=headers)
+
+        return run(go()), state
+
+    def test_no_key_is_401(self):
+        resp, state = self._get_receipt({"valid": True, "identity_id": 7}, with_key=False)
+        self.assertEqual(resp.status_code, 401)
+        self.assertIsNone(state["gw_headers"])      # gateway never called
+
+    def test_valid_key_forwards_tenant_bearer(self):
+        resp, state = self._get_receipt({"valid": True, "balance": 5, "identity_id": 7})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(state["gw_headers"]["authorization"], f"Bearer {edge._tenant_bearer(7)}")
+
+    def test_empty_balance_can_still_read_own_receipts(self):
+        resp, state = self._get_receipt(
+            {"valid": False, "error": "insufficient balance", "identity_id": 7})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(state["gw_headers"]["authorization"], f"Bearer {edge._tenant_bearer(7)}")
+
+    def test_unknown_key_is_401_and_gateway_untouched(self):
+        resp, state = self._get_receipt({"valid": False, "error": "credential not found"})
+        self.assertEqual(resp.status_code, 401)
+        self.assertIsNone(state["gw_headers"])
 
 
 if __name__ == "__main__":

@@ -3,8 +3,14 @@
 End users hold ONE Leviathan API key (`lev_...`). This Edge:
   1. hashes the key and meters/debits credits via the Leviathan auth-service
      (the same ledger the TEE prover uses: api_key -> identity -> credit),
-  2. forwards the OpenAI-compatible request to the gateway using ONE internal
-     api_token (the gateway stays single-tenant; the Edge multiplexes users),
+  2. forwards the OpenAI-compatible request to the gateway with TWO headers:
+       x-gateway-token: <internal service token>   (passes the gateway's api gate)
+       authorization:   Bearer <per-user tenant bearer>
+     The tenant bearer is HMAC-SHA256(EDGE_TENANT_SECRET, identity_id), so the
+     gateway records each receipt as owned by THAT user
+     (`ReceiptOwner::from_bearer`) — per-user receipt isolation is enforced by
+     the gateway's own crypto-ownership, not by Edge bookkeeping — while the
+     user's raw key and the provider keys never reach the gateway logs.
   3. streams the response back; refunds the credit if the gateway rejects it.
 
 This hides Phala + the GPU-TEE provider keys behind Leviathan — users never
@@ -13,7 +19,8 @@ register with Phala or the providers; they only hold a Leviathan key.
 Endpoints (OpenAI-compatible):
   POST /v1/chat/completions | /v1/completions | /v1/embeddings  -> metered (1 credit)
   GET  /v1/models                                               -> requires a valid key, no debit
-  GET  /v1/attestation/report , /v1/aci/receipts/{id}           -> public passthrough (verifiability)
+  GET  /v1/aci/receipts/{id}   -> requires a valid key; only the receipt's owner gets it
+  GET  /v1/attestation/report  -> public passthrough (verifiability)
   GET  /health
 """
 
@@ -52,10 +59,18 @@ def _resolve_verify(raw: str) -> "bool | str":
 
 AUTH_SERVICE_VERIFY_TLS = _resolve_verify(os.getenv("AUTH_SERVICE_VERIFY_TLS", "true"))
 
-# The single-tenant gateway this Edge fronts, and its internal api_token.
+# The gateway this Edge fronts, and its internal service token (sent on
+# x-gateway-token so `authorization` stays free for the tenant bearer).
 GATEWAY_URL = os.getenv("GATEWAY_URL", "").rstrip("/")
 GATEWAY_API_TOKEN = os.getenv("GATEWAY_API_TOKEN", "")
 GATEWAY_TIMEOUT_SEC = float(os.getenv("GATEWAY_TIMEOUT_SEC", "600.0"))
+
+# Secret behind the per-user tenant bearers. Receipts at the gateway are owned
+# by SHA256(tenant bearer); anyone who can derive a user's bearer can read
+# that user's receipts, so this must stay as private as the api tokens.
+# Rotating it orphans receipts issued under the old bearers (they stay owned
+# by the old digest) — rotate only with that in mind.
+EDGE_TENANT_SECRET = os.getenv("EDGE_TENANT_SECRET", "")
 
 # Fail-closed: refuse to start misconfigured so we never bill/serve wrong.
 for _name, _val in (
@@ -63,6 +78,7 @@ for _name, _val in (
     ("AUTH_SERVICE_PROXY_TOKEN", AUTH_SERVICE_PROXY_TOKEN),
     ("GATEWAY_URL", GATEWAY_URL),
     ("GATEWAY_API_TOKEN", GATEWAY_API_TOKEN),
+    ("EDGE_TENANT_SECRET", EDGE_TENANT_SECRET),
 ):
     if not _val:
         raise RuntimeError(f"{_name} must be set")
@@ -77,9 +93,12 @@ if not AUTH_SERVICE_URL.startswith("https://") and not AUTH_SERVICE_ALLOW_HTTP:
     )
 
 # Hop-by-hop / auth headers we must NOT forward from the client to the gateway.
+# x-gateway-token and x-user-tier are Edge/operator-controlled channels a
+# client must never be able to smuggle through.
 _STRIP_REQ_HEADERS = {
     "host", "authorization", "content-length", "connection",
     "transfer-encoding", "keep-alive", "proxy-authorization",
+    "x-gateway-token", "x-user-tier",
 }
 
 
@@ -95,6 +114,10 @@ class AuthResult:
     status: str
     balance: Optional[int] = None
     error: Optional[str] = None
+    # Stable ledger identity behind the api key — the tenant. Set on ALLOW,
+    # and on DENY_NO_BALANCE from validate() (known key, empty balance), so
+    # receipt reads keep working after the user runs out of credit.
+    identity_id: Optional[int] = None
 
 
 class AuthClient:
@@ -129,7 +152,8 @@ class AuthClient:
             return AuthResult(DENY_DOWN, error=f"auth returned {r.status_code}")
         data = r.json()
         if data.get("success") is True:
-            return AuthResult(ALLOW, balance=data.get("balance"))
+            return AuthResult(ALLOW, balance=data.get("balance"),
+                              identity_id=data.get("identity_id"))
         err = str(data.get("error", "")).lower()
         if "balance" in err or "insufficient" in err:
             return AuthResult(DENY_NO_BALANCE, error=data.get("error"))
@@ -164,11 +188,13 @@ class AuthClient:
             return AuthResult(DENY_DOWN, error=f"auth returned {r.status_code}")
         data = r.json()
         if data.get("valid") is True:
-            return AuthResult(ALLOW, balance=data.get("balance"))
+            return AuthResult(ALLOW, balance=data.get("balance"),
+                              identity_id=data.get("identity_id"))
         err = str(data.get("error", "")).lower()
         if "balance" in err or "insufficient" in err:
-            # Known key, just empty — allow listing models.
-            return AuthResult(DENY_NO_BALANCE, error=data.get("error"))
+            # Known key, just empty — allow listing models / reading receipts.
+            return AuthResult(DENY_NO_BALANCE, error=data.get("error"),
+                              identity_id=data.get("identity_id"))
         return AuthResult(DENY_UNAUTH, error=data.get("error"))
 
 
@@ -207,9 +233,22 @@ def _deny_response(res: AuthResult) -> Response:
     return JSONResponse(status_code=code, content={"error": {"message": res.error or err, "type": res.status}})
 
 
-def _fwd_request_headers(request: Request) -> dict:
+def _tenant_bearer(identity_id: int) -> str:
+    """Deterministic, unguessable per-user bearer the gateway sees.
+
+    The gateway records receipt ownership as SHA256(bearer); deriving the
+    bearer as HMAC(secret, identity_id) gives every ledger identity its own
+    owner without the gateway ever learning the user's raw key.
+    """
+    mac = hmac.new(EDGE_TENANT_SECRET.encode("utf-8"),
+                   str(identity_id).encode("utf-8"), hashlib.sha256)
+    return f"lev_t_{mac.hexdigest()}"
+
+
+def _fwd_request_headers(request: Request, identity_id: int) -> dict:
     hdrs = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQ_HEADERS}
-    hdrs["authorization"] = f"Bearer {GATEWAY_API_TOKEN}"   # internal single-tenant token
+    hdrs["x-gateway-token"] = GATEWAY_API_TOKEN            # passes the gateway's api gate
+    hdrs["authorization"] = f"Bearer {_tenant_bearer(identity_id)}"  # owns the receipt
     return hdrs
 
 
@@ -240,10 +279,17 @@ async def _metered_proxy(request: Request, path: str) -> Response:
     res = await request.app.state.auth.consume(raw_key, idem)
     if res.status != ALLOW:
         return _deny_response(res)
+    if res.identity_id is None:
+        # Ledger allowed the debit but did not say WHO — without an identity
+        # we cannot assign receipt ownership. Fail closed and give it back.
+        await request.app.state.auth.refund(raw_key, idem, "auth_missing_identity")
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "billing service returned no identity, retry later", "type": DENY_DOWN}})
 
-    # Forward to the (single-tenant) gateway with the internal token, streaming.
+    # Forward to the gateway: service token + this user's tenant bearer, streaming.
     gw: httpx.AsyncClient = request.app.state.gw
-    req = gw.build_request("POST", f"{GATEWAY_URL}{path}", headers=_fwd_request_headers(request), content=body)
+    req = gw.build_request("POST", f"{GATEWAY_URL}{path}",
+                           headers=_fwd_request_headers(request, res.identity_id), content=body)
     try:
         resp = await gw.send(req, stream=True)
     except httpx.RequestError as e:
@@ -313,6 +359,22 @@ async def attestation_report(request: Request):
 
 @app.get("/v1/aci/receipts/{receipt_id}")
 async def receipt(request: Request, receipt_id: str):
+    # Receipts at the gateway are owned by the tenant bearer used at chat
+    # time, so we must present the SAME derived bearer here. A known key with
+    # an empty balance may still read receipts for requests it already paid
+    # for (validate is read-only, no debit).
+    raw_key = _bearer(request)
+    if not raw_key:
+        return JSONResponse(status_code=401, content={"error": {"message": "api key required", "type": "unauth"}})
+    res = await request.app.state.auth.validate(raw_key)
+    if res.status not in (ALLOW, DENY_NO_BALANCE):
+        return _deny_response(res)
+    if res.identity_id is None:
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "billing service returned no identity, retry later", "type": DENY_DOWN}})
     gw: httpx.AsyncClient = request.app.state.gw
-    r = await gw.get(f"{GATEWAY_URL}/v1/aci/receipts/{receipt_id}")
+    r = await gw.get(
+        f"{GATEWAY_URL}/v1/aci/receipts/{receipt_id}",
+        headers={"authorization": f"Bearer {_tenant_bearer(res.identity_id)}"},
+    )
     return Response(content=r.content, status_code=r.status_code, headers=_fwd_response_headers(r))

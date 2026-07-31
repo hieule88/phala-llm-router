@@ -17,7 +17,10 @@ use private_ai_gateway::aci::verifier::PreverifiedUpstreamVerifier;
 use private_ai_gateway::aggregator::service::{
     AciService, AciServiceConfig, FixedClock, InMemoryReceiptStore,
 };
-use private_ai_gateway::http::build_router;
+use private_ai_gateway::aggregator::upstream_config::{
+    UpstreamConfigManager, UpstreamRuntimeOptions, UpstreamVerifierMode,
+};
+use private_ai_gateway::http::{build_router, build_router_with_admin_and_api};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -79,6 +82,46 @@ impl private_ai_gateway::aggregator::service::Clock for TestClock {
 
 fn harness() -> Harness {
     harness_with_ttl(3600)
+}
+
+/// Like [`harness`], but the router is built with an `api_token` so
+/// `enforce_api` gates the inference surface. Chat still hits
+/// [`StubUpstream`] through the service; the temp upstream-config manager
+/// only backs the admin/catalog routes.
+fn harness_with_api_token(api_token: &str) -> Harness {
+    let mut h = harness_with_ttl(3600);
+    let path = std::env::temp_dir().join(format!(
+        "auth-retention-upstreams-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let manager = Arc::new(
+        UpstreamConfigManager::load(
+            &path,
+            UpstreamRuntimeOptions {
+                verifier_mode: UpstreamVerifierMode::Preverified,
+                accepted_workload_ids: vec![],
+                accepted_image_digests: vec![],
+                accepted_dstack_kms_root_public_keys: vec![],
+                pccs_url: None,
+                verifier_cache_seconds: 300,
+                connect_timeout_seconds: 10,
+                read_timeout_seconds: 600,
+                verifier_request_timeout_seconds: 60,
+            },
+        )
+        .unwrap(),
+    );
+    h.router = build_router_with_admin_and_api(
+        h.service.clone(),
+        manager,
+        None,
+        Some(api_token.to_string()),
+    );
+    h
 }
 
 fn harness_with_ttl(receipt_ttl_seconds: u64) -> Harness {
@@ -245,6 +288,136 @@ async fn owned_receipt_lookup_with_matching_bearer_returns_receipt() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json(&body)["receipt"]["receipt_id"], rid);
+}
+
+// ---------- Service token on x-gateway-token (multiplexing front) ----------
+
+/// A multiplexing front (the Edge) authenticates with `x-gateway-token` and
+/// keeps `Authorization` for the END USER's bearer — the receipt must be
+/// owned by that user bearer, not by the service token.
+#[tokio::test]
+async fn x_gateway_token_authenticates_and_bearer_owns_the_receipt() {
+    let h = harness_with_api_token("api-secret");
+
+    // No credentials at all → the api gate rejects.
+    let (status, _, body) = call(
+        &h.router,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(CHAT_REQUEST.to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json(&body)["error"]["type"], "unauthorized");
+
+    // Wrong x-gateway-token + a tenant bearer → falls through to the bearer
+    // check, which does not match the api token either.
+    let (status, _, _) = call(
+        &h.router,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-gateway-token", "wrong-secret")
+            .header("authorization", "Bearer tenant-a")
+            .body(Body::from(CHAT_REQUEST.to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Correct x-gateway-token + tenant bearer → served, receipt owned by tenant.
+    let (status, headers, _) = call(
+        &h.router,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-gateway-token", "api-secret")
+            .header("authorization", "Bearer tenant-a")
+            .body(Body::from(CHAT_REQUEST.to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rid = headers
+        .get("x-receipt-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // The tenant that chatted can fetch its receipt.
+    let (status, _, body) = call(
+        &h.router,
+        Request::builder()
+            .uri(format!("/v1/aci/receipts/{rid}"))
+            .header("authorization", "Bearer tenant-a")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["receipt_id"], rid.as_str());
+
+    // Another tenant cannot.
+    let (status, _, body) = call(
+        &h.router,
+        Request::builder()
+            .uri(format!("/v1/aci/receipts/{rid}"))
+            .header("authorization", "Bearer tenant-b")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json(&body)["error"]["type"], "redaction_required");
+
+    // Neither can the service token itself (it is NOT the owner).
+    let (status, _, _) = call(
+        &h.router,
+        Request::builder()
+            .uri(format!("/v1/aci/receipts/{rid}"))
+            .header("authorization", "Bearer api-secret")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Anonymous lookup of an owned receipt still 401s.
+    let (status, _, _) = call(
+        &h.router,
+        Request::builder()
+            .uri(format!("/v1/aci/receipts/{rid}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Classic single-tenant callers (token on Authorization) keep working
+/// unchanged after the x-gateway-token addition.
+#[tokio::test]
+async fn api_token_on_authorization_still_authenticates() {
+    let h = harness_with_api_token("api-secret");
+    let (status, headers, _) = call(
+        &h.router,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer api-secret")
+            .body(Body::from(CHAT_REQUEST.to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-receipt-id").is_some());
 }
 
 // ---------- Receipt TTL ----------

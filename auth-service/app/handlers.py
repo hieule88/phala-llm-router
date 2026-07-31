@@ -50,6 +50,19 @@ ALLOWED_PROVIDERS = frozenset({"manual", "stripe", "nowpayments", "onchain"})
 INTENT_TTL_SECONDS = int(os.getenv("INTENT_TTL_SECONDS", str(30 * 24 * 3600)))
 
 
+# How long an idempotency replay stays free. Covers genuine network-drop
+# retries (seconds to a couple of minutes), but a byte-identical request
+# re-sent after the window is a NEW debit — otherwise resending the same
+# prompt forever costs one credit total while every replay still buys a
+# fresh (non-deterministic) completion.
+CONSUME_DEDUP_TTL_SECONDS = int(os.getenv("CONSUME_DEDUP_TTL_SECONDS", "600"))
+
+if CONSUME_DEDUP_TTL_SECONDS <= 0:
+    raise RuntimeError(
+        f"CONSUME_DEDUP_TTL_SECONDS must be > 0 (got {CONSUME_DEDUP_TTL_SECONDS})",
+    )
+
+
 # Only credential types in this set can be used to authenticate a spend
 # (validate / consume). Public-identifier types like miden_wallet or
 # stripe_customer_id may exist on an identity for routing topups but must
@@ -206,7 +219,10 @@ async def validate(
         return {"valid": False, "error": "credential not found"}
     bal = await get_balance(conn, identity_id)
     if bal is None or bal["balance"] <= 0:
-        return {"valid": False, "error": "insufficient balance"}
+        # identity_id is included so a front can still resolve WHO this key
+        # is (e.g. to serve receipts for already-paid requests) even though
+        # new inference is denied.
+        return {"valid": False, "error": "insufficient balance", "identity_id": identity_id}
     return {
         "valid": True,
         "identity_id": identity_id,
@@ -239,6 +255,9 @@ async def consume(
     the same key on the same identity returns the previously-computed
     balance without debiting again. Guards against network-drop
     retries producing double-debit that no server-side lock can catch.
+    The replay is honoured only within CONSUME_DEDUP_TTL_SECONDS of the
+    original debit — after that the same key debits again (an identical
+    request replayed much later is new work, not a retry).
     """
     if credential_type not in AUTHENTICATOR_CREDENTIAL_TYPES:
         return {"success": False, "error": "credential not found"}
@@ -247,25 +266,27 @@ async def consume(
         if identity_id is None:
             return {"success": False, "error": "credential not found"}
 
-        # Existing dedup row for this (identity, key) can be in one of two
+        # Existing dedup row for this (identity, key) can be in one of three
         # states:
-        #   refunded_at IS NULL      → active debit, this is a retry
-        #                              → return cached balance, no debit
-        #   refunded_at IS NOT NULL  → previous cycle was refunded, this
-        #                              is a fresh debit that reuses the
-        #                              row (UPDATE) instead of INSERTing
-        #                              a duplicate that UNIQUE would reject
+        #   active + fresh   → this is a retry → return cached balance, no debit
+        #   active + stale   → past the replay TTL: same bytes, but new work
+        #                      → fresh debit that reuses the row (UPDATE)
+        #   refunded         → previous cycle was refunded → fresh debit that
+        #                      reuses the row (UPDATE) instead of INSERTing a
+        #                      duplicate that UNIQUE would reject
         existing_dedup: Optional[tuple[int, int, Optional[str]]] = None
         if idempotency_key:
             cur = await conn.execute(
-                "SELECT id, balance_after, refunded_at FROM consume_dedup "
+                "SELECT id, balance_after, refunded_at, "
+                "       created_at > datetime('now', ?) "
+                "FROM consume_dedup "
                 "WHERE identity_id = ? AND idempotency_key = ?",
-                (identity_id, idempotency_key),
+                (f"-{CONSUME_DEDUP_TTL_SECONDS} seconds", identity_id, idempotency_key),
             )
             row = await cur.fetchone()
             if row:
                 existing_dedup = (row[0], row[1], row[2])
-                if row[2] is None:
+                if row[2] is None and row[3]:
                     return {
                         "success": True,
                         "identity_id": identity_id,
@@ -287,9 +308,9 @@ async def consume(
 
         if idempotency_key:
             if existing_dedup is not None:
-                # Refunded row from a prior cycle — reactivate it in-place.
-                # created_at is refreshed so the audit trail reflects THIS
-                # debit's timestamp, not the original one.
+                # Refunded or TTL-stale row from a prior cycle — reactivate
+                # it in-place. created_at is refreshed so the audit trail
+                # (and the next replay window) starts at THIS debit.
                 await conn.execute(
                     "UPDATE consume_dedup "
                     "SET balance_after = ?, refunded_at = NULL, "

@@ -90,11 +90,14 @@ class ValidateTest(unittest.TestCase):
         async def go():
             conn = await init_db(":memory:")
             try:
-                await handlers.create_identity(conn, "api_key", "hash_a")
+                ident = await handlers.create_identity(conn, "api_key", "hash_a")
                 # Default balance is 0
                 r = await handlers.validate(conn, "api_key", "hash_a")
                 self.assertFalse(r["valid"])
                 self.assertIn("insufficient", r["error"])
+                # A front still learns WHO the key is, so it can serve
+                # receipts for already-paid requests.
+                self.assertEqual(r["identity_id"], ident)
             finally:
                 await conn.close()
         run(go())
@@ -110,6 +113,51 @@ class ValidateTest(unittest.TestCase):
                 self.assertEqual(r["balance"], 100)
                 self.assertEqual(r["tier"], "free")
                 self.assertEqual(r["identity_id"], ident)
+            finally:
+                await conn.close()
+        run(go())
+
+
+class ConsumeDedupTtlTest(unittest.TestCase):
+    """The idempotency replay is a retry-protection, not a season ticket:
+    it must expire after CONSUME_DEDUP_TTL_SECONDS."""
+
+    def test_replay_within_ttl_is_free(self):
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                ident = await handlers.create_identity(conn, "api_key", "k")
+                await handlers.topup(conn, ident, 5, source="test")
+                r1 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
+                r2 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
+                self.assertEqual(r1["balance"], 4)
+                self.assertTrue(r2.get("deduplicated"))
+                self.assertEqual(r2["balance"], 4)      # no second debit
+            finally:
+                await conn.close()
+        run(go())
+
+    def test_replay_after_ttl_debits_again(self):
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                ident = await handlers.create_identity(conn, "api_key", "k")
+                await handlers.topup(conn, ident, 5, source="test")
+                await handlers.consume(conn, "api_key", "k", idempotency_key="same")
+                # Age the dedup row past the replay window.
+                await conn.execute(
+                    "UPDATE consume_dedup SET created_at = datetime('now', ?)",
+                    (f"-{handlers.CONSUME_DEDUP_TTL_SECONDS + 60} seconds",),
+                )
+                await conn.commit()
+                r2 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
+                self.assertTrue(r2["success"])
+                self.assertFalse(r2.get("deduplicated"))
+                self.assertEqual(r2["balance"], 3)      # debited again
+                # And the refreshed row replays free again within the new window.
+                r3 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
+                self.assertTrue(r3.get("deduplicated"))
+                self.assertEqual(r3["balance"], 3)
             finally:
                 await conn.close()
         run(go())
