@@ -9,8 +9,8 @@ from ..types import AttestationReport
 def _near_auth_headers() -> Dict[str, str]:
     """cloud-api.near.ai now requires auth on the attestation endpoint.
     The upstream vendored provider predates that; read the key from env so the
-    bridge can fetch the report. Set NEAR_AI_API_KEY (or NEARAI_API_KEY)."""
-    key = (os.getenv("NEAR_AI_API_KEY") or os.getenv("NEARAI_API_KEY") or "").strip()
+    bridge can fetch the report. Set TEE_AI_API_KEY (or NEARAI_API_KEY)."""
+    key = (os.getenv("TEE_AI_API_KEY") or os.getenv("NEARAI_API_KEY") or "").strip()
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 

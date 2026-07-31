@@ -37,8 +37,8 @@ services:
 configs:
   gateway-pin:
     content: |
-      REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git
-      COMMIT_SHA=${PRIVATE_AI_GATEWAY_REPO_COMMIT:?set PRIVATE_AI_GATEWAY_REPO_COMMIT to the audited full commit SHA}
+      REPO_URL=https://github.com/hieule88/phala-llm-router.git
+      COMMIT_SHA=6dd8ec24480c66ad9adb20bf04f3512a7906b65a
       WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
 
   gateway-config:
@@ -51,7 +51,7 @@ configs:
         "api_token": "${PRIVATE_AI_GATEWAY_API_TOKEN:?set PRIVATE_AI_GATEWAY_API_TOKEN}",
         "dstack_endpoint": "unix:/var/run/dstack.sock",
         "middleware": {
-          "public_model": "${PRIVATE_AI_GATEWAY_PUBLIC_MODEL:?set PRIVATE_AI_GATEWAY_PUBLIC_MODEL}",
+          "public_model": "gpt-oss-120b",
           "cache_threshold": 0.3,
           "balance_abs_threshold": 64,
           "balance_rel_threshold": 1.5,
