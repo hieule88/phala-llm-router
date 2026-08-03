@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS identities (
 CREATE TABLE IF NOT EXISTS credentials (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     identity_id      INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
-    credential_type  TEXT NOT NULL,       -- 'api_key' | 'miden_wallet' | 'stripe_customer' | ...
+    credential_type  TEXT NOT NULL,       -- 'api_key' | 'miden_wallet' | ...
     credential_value TEXT NOT NULL,       -- hash for secrets (api_key), raw for public IDs (wallet)
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     revoked_at       TIMESTAMP
@@ -61,8 +61,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_credentials_active
     ON credentials(credential_type, credential_value)
     WHERE revoked_at IS NULL;
 
--- Topups are recorded with a caller-supplied `source` tag (e.g. Stripe
--- session id). Making it UNIQUE means a webhook retry with the same tag
+-- Topups are recorded with a caller-supplied `source` tag (e.g. NOWPayments
+-- payment id). Making it UNIQUE means a webhook retry with the same tag
 -- is a no-op — no double-credit.
 CREATE TABLE IF NOT EXISTS topups (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_topups_identity
 
 -- Payment intents: provider-agnostic representation of "user wants to
 -- buy N credits". The user pays via any channel (bank transfer, crypto,
--- Stripe, NOWPayments, on-chain) and references the intent by its
+-- NOWPayments, on-chain) and references the intent by its
 -- `memo` string. When ops or a webhook confirms the payment landed,
 -- the intent transitions pending → paid and the balance is credited.
 -- The memo doubles as the topup `source` so idempotency is trivial.
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     credits       INTEGER NOT NULL,               -- how many prove credits to mint on completion
     amount_cents  INTEGER NOT NULL,               -- expected USD-cents equivalent (for verification)
     memo          TEXT NOT NULL UNIQUE,           -- opaque public reference; used as topup source
-    provider      TEXT NOT NULL DEFAULT 'manual', -- 'manual' | 'stripe' | 'nowpayments' | 'onchain'
+    provider      TEXT NOT NULL DEFAULT 'manual', -- 'manual' | 'nowpayments' | 'onchain'
     provider_ref  TEXT,                            -- external reference filled at mark-paid time
     status        TEXT NOT NULL DEFAULT 'pending',-- 'pending' | 'paid' | 'expired' | 'cancelled'
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

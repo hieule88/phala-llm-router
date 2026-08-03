@@ -15,7 +15,6 @@ typing-inspection==0.4.2
 uvicorn==0.47.0
 aiosqlite==0.21.0
 slowapi==0.1.9
-stripe==14.1.0
 # Outbound HTTP client — used by nowpayments_client for invoice creation.
 # httpcore 1.0.9+ supports h11 0.16 (which uvicorn also pins to).
 httpx==0.28.1

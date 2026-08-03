@@ -39,7 +39,7 @@ if CENTS_PER_CREDIT <= 0:
 
 # Providers that create_intent is allowed to record. Anything else is a
 # routing-info lie or a log-injection attempt and is refused up front.
-ALLOWED_PROVIDERS = frozenset({"manual", "stripe", "nowpayments", "onchain"})
+ALLOWED_PROVIDERS = frozenset({"manual", "nowpayments", "onchain"})
 
 # Default lifetime of a pending intent. Long enough to comfortably span
 # a cross-border bank transfer or a slow on-chain confirmation (30 days).
@@ -65,7 +65,7 @@ if CONSUME_DEDUP_TTL_SECONDS <= 0:
 
 # Only credential types in this set can be used to authenticate a spend
 # (validate / consume). Public-identifier types like miden_wallet or
-# stripe_customer_id may exist on an identity for routing topups but must
+# miden_wallet may exist on an identity for routing topups but must
 # NEVER let an unauthenticated attacker drain the balance by presenting a
 # publicly-known value.
 AUTHENTICATOR_CREDENTIAL_TYPES = frozenset({"api_key"})
@@ -349,11 +349,11 @@ async def topup(
 ) -> dict:
     """Credit an identity's balance, idempotent on `source`.
 
-    `source` is a caller-supplied tag (e.g. "stripe_session_X",
+    `source` is a caller-supplied tag (e.g. "nowpayments:PAYMENT_ID",
     "miden_p2id_<note_id>", "lightning_invoice_Y") and is stored with a
     UNIQUE constraint in the `topups` table. A second call with the same
     tag returns the existing balance without applying the credit again —
-    essential so Stripe webhook retries don't double-credit the user.
+    essential so payment-webhook retries don't double-credit the user.
     """
     if amount <= 0:
         return {"success": False, "error": "amount must be positive"}
@@ -416,7 +416,7 @@ async def set_tier(
     identity_id: int,
     tier_name: str,
 ) -> dict:
-    """Change an identity's tier (e.g. when their Stripe subscription
+    """Change an identity's tier (e.g. when their subscription
     upgrades). Does not change current balance.
 
     Wrapped in a transaction so this write serialises with every other

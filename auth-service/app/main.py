@@ -16,7 +16,6 @@ Endpoints under `/v1`:
   GET  /v1/payment-intents/{memo}         → check intent status (public, opaque memo)
   POST /v1/payment-intents/{memo}/mark-paid → finalize intent (ADMIN or webhook)
   POST /v1/payment-intents/{memo}/cancel  → cancel pending intent (ADMIN)
-  POST /v1/webhooks/stripe                → Stripe payment events (HMAC-authenticated)
   POST /v1/webhooks/nowpayments           → NOWPayments IPN (HMAC-SHA512-authenticated)
   GET  /health                            → liveness probe (no DB hit)
 
@@ -31,8 +30,9 @@ Auth model:
     (users share it over chat/email), so an open consume would let anyone
     who learned a victim's hash drain their balance — only the TEE proxy,
     which holds the token, may debit.
-  - The Stripe webhook is authenticated by Stripe's HMAC signature — no
-    Bearer token is expected because the caller is Stripe's infra.
+  - The NOWPayments webhook is authenticated by the processor's HMAC
+    signature — no Bearer token is expected because the caller is the
+    payment processor's infra.
 """
 
 import hmac
@@ -46,7 +46,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import handlers, nowpayments_client, nowpayments_webhook, stripe_webhook
+from . import handlers, nowpayments_client, nowpayments_webhook
 from .db import init_db
 from .tier_limit import TierRateLimiter
 
@@ -95,15 +95,13 @@ RATE_LIMIT_VALIDATE = os.getenv("RATE_LIMIT_VALIDATE", "120/minute")
 RATE_LIMIT_ADMIN = os.getenv("RATE_LIMIT_ADMIN", "30/minute")
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "20/minute")
 # Payment processor retries are aggressive; a rate-limit-driven drop of
-# a paid event is a revenue bug. Keep these ceilings well above any
-# plausible retry burst. Shared across Stripe / NOWPayments / any future
-# processor that hits its own endpoint.
-RATE_LIMIT_STRIPE_WEBHOOK = os.getenv("RATE_LIMIT_STRIPE_WEBHOOK", "600/minute")
+# a paid event is a revenue bug. Keep this ceiling well above any
+# plausible retry burst.
 RATE_LIMIT_NOWPAYMENTS_WEBHOOK = os.getenv("RATE_LIMIT_NOWPAYMENTS_WEBHOOK", "600/minute")
 
 # Hard cap on webhook body size, applied at Content-Length inspection time
 # so an attacker announcing a huge payload never triggers a full-body read.
-# Real Stripe/NOWPayments events fit in a few kilobytes; 64KB gives comfortable
+# Real NOWPayments events fit in a few kilobytes; 64KB gives comfortable
 # headroom for future event shapes.
 WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", str(64 * 1024)))
 
@@ -196,8 +194,8 @@ class CreateIdentityRequest(BaseModel):
     credential_type: str = Field(..., examples=["api_key", "miden_wallet"])
     credential_value: str = Field(...,
         description="For secret credentials (api_key) this should be the hash, "
-                    "not the raw value. For public identifiers (miden_wallet, "
-                    "stripe_customer_id) the raw value is fine.")
+                    "not the raw value. For public identifiers (miden_wallet) "
+                    "the raw value is fine.")
     initial_tier: str = Field("free", examples=["free", "starter", "pro"])
 
 
@@ -239,7 +237,7 @@ class RefundRequest(BaseModel):
 class TopupRequest(BaseModel):
     identity_id: int
     amount: int = Field(..., gt=0)
-    source: str = Field(..., description="Provenance tag, e.g. 'stripe_session_X'.")
+    source: str = Field(..., description="Provenance tag, e.g. 'nowpayments:PAYMENT_ID'.")
 
 
 class SetTierRequest(BaseModel):
@@ -252,13 +250,13 @@ class CreatePaymentIntentRequest(BaseModel):
     credential_value: str
     credits: int = Field(..., gt=0)
     provider: str = Field("manual",
-        description="'manual', 'stripe', 'nowpayments', or 'onchain'. "
+        description="'manual', 'nowpayments', or 'onchain'. "
                     "amount_cents is derived server-side from credits × CENTS_PER_CREDIT.")
 
 
 class MarkIntentPaidRequest(BaseModel):
     provider_ref: Optional[str] = Field(None,
-        description="External reference for audit (bank tx id, Stripe session, etc.).")
+        description="External reference for audit (bank tx id, payment id, etc.).")
     actual_amount_cents: Optional[int] = Field(None, gt=0,
         description="If provided, must be >= intent's expected amount_cents.")
 
@@ -432,7 +430,7 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
     """User-facing: create a payment intent for a specific credit amount.
 
     Authenticated by the caller's api_key hash — public identifiers
-    like miden_wallet / stripe_customer_id are refused here because
+    like miden_wallet are refused here because
     they'd let anyone who learns Alice's public address create intents
     bound to Alice's identity. The returned `memo` is the reference
     the user must include when they actually pay.
@@ -518,7 +516,7 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
 @limiter.limit(RATE_LIMIT_VALIDATE)
 async def get_payment_intent(request: Request, memo: str):
     """Publicly readable — the memo is opaque BUT it travels in payment
-    channels that leak it (bank memo fields, on-chain calldata, Stripe
+    channels that leak it (bank memo fields, on-chain calldata, payment
     metadata). We return only the fields the caller needs to poll the
     payment status — identity_id, provider_ref, and other internal
     fields are only exposed via authenticated endpoints (not yet built).
@@ -567,26 +565,6 @@ async def cancel_payment_intent(request: Request, memo: str):
         status_code = 404 if "not found" in result.get("error", "") else 400
         raise HTTPException(status_code=status_code, detail=result.get("error", "cancel failed"))
     return result
-
-
-@app.post("/v1/webhooks/stripe")
-@limiter.limit(RATE_LIMIT_STRIPE_WEBHOOK)
-async def stripe_webhook_endpoint(request: Request):
-    """Stripe webhook receiver.
-
-    Authenticated by the Stripe-Signature header (HMAC over the raw body)
-    rather than by ADMIN_TOKEN — the caller is Stripe's infrastructure.
-    We ACK with 200 on any event we chose not to act on so Stripe stops
-    retrying; only signature failures / malformed events / handler errors
-    return 4xx/5xx.
-    """
-    raw_body = await _read_bounded_body(request, WEBHOOK_MAX_BODY_BYTES)
-    sig = request.headers.get("stripe-signature")
-    try:
-        event = stripe_webhook.verify_and_parse(raw_body, sig)
-        return await stripe_webhook.dispatch(app.state.db, event)
-    except stripe_webhook.WebhookError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
 
 
 @app.post("/v1/webhooks/nowpayments")

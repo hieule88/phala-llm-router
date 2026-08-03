@@ -238,7 +238,7 @@ class TopupTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                r = await handlers.topup(conn, ident, 500, source="stripe_x")
+                r = await handlers.topup(conn, ident, 500, source="nowpayments:x")
                 self.assertTrue(r["success"])
                 self.assertEqual(r["balance"], 500)
             finally:
@@ -533,7 +533,7 @@ class AtomicConsumeRaceTest(unittest.TestCase):
 
 
 class CredentialTypeAllowlistTest(unittest.TestCase):
-    """Regression: public identifiers (miden_wallet, stripe_customer_id) MUST
+    """Regression: public identifiers (miden_wallet) MUST
     NOT authenticate a consume/validate. Otherwise anyone who knows the
     victim's public wallet address can drain their balance."""
 
@@ -554,9 +554,9 @@ class CredentialTypeAllowlistTest(unittest.TestCase):
         async def go():
             conn = await init_db(":memory:")
             try:
-                ident = await handlers.create_identity(conn, "stripe_customer", "cus_x")
+                ident = await handlers.create_identity(conn, "miden_wallet", "wallet_x")
                 await handlers.topup(conn, ident, 10, "test")
-                r = await handlers.consume(conn, "stripe_customer", "cus_x")
+                r = await handlers.consume(conn, "miden_wallet", "wallet_x")
                 self.assertFalse(r["success"])
                 self.assertIn("credential not found", r["error"])
                 # Balance untouched.
@@ -568,7 +568,7 @@ class CredentialTypeAllowlistTest(unittest.TestCase):
 
 
 class TopupIdempotencyTest(unittest.TestCase):
-    """Regression: Stripe webhooks retry aggressively. Two calls with the
+    """Regression: payment webhooks retry aggressively. Two calls with the
     same source must credit exactly once."""
 
     def test_same_source_twice_only_credits_once(self):
@@ -576,8 +576,8 @@ class TopupIdempotencyTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "h")
-                r1 = await handlers.topup(conn, ident, 100, "stripe_session_ABC")
-                r2 = await handlers.topup(conn, ident, 100, "stripe_session_ABC")
+                r1 = await handlers.topup(conn, ident, 100, "nowpayments:ABC")
+                r2 = await handlers.topup(conn, ident, 100, "nowpayments:ABC")
                 self.assertTrue(r1["success"])
                 self.assertEqual(r1["balance"], 100)
                 self.assertTrue(r2["success"])
