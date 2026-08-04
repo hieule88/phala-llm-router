@@ -143,7 +143,7 @@ provenance from the dstack git-launcher pin at
 `/etc/git-launcher/gateway.conf`:
 
 ```text
-REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git
+REPO_URL=https://github.com/hieule88/phala-llm-router.git
 COMMIT_SHA=<audited-full-40-or-64-hex-commit-sha>
 WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
 ```

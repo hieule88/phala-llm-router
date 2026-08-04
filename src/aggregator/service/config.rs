@@ -62,7 +62,7 @@ impl AciServiceConfig {
             tee_type: "tdx".to_string(),
             source_provenance: SourceProvenance {
                 repo_url: Some(
-                    "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware"
+                    "https://github.com/hieule88/phala-llm-router"
                         .to_string(),
                 ),
                 repo_commit: Some("deadbeef".to_string()),

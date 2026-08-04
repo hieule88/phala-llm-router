@@ -363,20 +363,19 @@ fn deploy_readme_documents_one_command_deploy_and_seed_config() {
 fn deploy_examples_target_router_middleware_repo() {
     let compose = deploy_text("compose.yaml");
     let launcher = deploy_text("aggregator.conf");
-    // This fork deploys from its own repo, pinned by COMMIT_SHA in the
+    // This repo deploys from its own fork, pinned by COMMIT_SHA in the
     // compose file (hardcoded — not env-interpolated — so `phala cvms
-    // stop/start` works without re-supplying env).
-    let fork_repo_url = "https://github.com/hieule88/phala-llm-router.git";
-    let upstream_repo_url =
-        "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git";
+    // stop/start` works without re-supplying env). The old upstream
+    // Phala-Network repo is no longer referenced anywhere.
+    let repo_url = "https://github.com/hieule88/phala-llm-router.git";
 
     assert!(
-        compose.contains(fork_repo_url),
+        compose.contains(repo_url),
         "deploy/compose.yaml must pin this fork's repo"
     );
     assert!(
-        launcher.contains(fork_repo_url) || launcher.contains(upstream_repo_url),
-        "deploy/aggregator.conf must pin a router-middleware repo"
+        launcher.contains(repo_url),
+        "deploy/aggregator.conf must pin this fork's repo"
     );
     assert!(
         compose.contains(r#""middleware": {"#) && compose.contains(r#""public_model": ""#),

@@ -779,7 +779,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
             &config_path,
             r#"
                 # fetched by git-launcher before entrypoint.sh runs
-                REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git
+                REPO_URL=https://github.com/hieule88/phala-llm-router.git
                 COMMIT_SHA=0123456789abcdef0123456789abcdef01234567
                 WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
             "#,
@@ -792,7 +792,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
 
         assert_eq!(
             provenance.repo_url.as_deref(),
-            Some("https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git")
+            Some("https://github.com/hieule88/phala-llm-router.git")
         );
         assert_eq!(
             provenance.repo_commit.as_deref(),
@@ -807,7 +807,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         let config_path = temp_path("git-launcher-config-missing-commit");
         std::fs::write(
             &config_path,
-            "REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git\n",
+            "REPO_URL=https://github.com/hieule88/phala-llm-router.git\n",
         )
         .unwrap();
 
@@ -824,7 +824,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         std::fs::write(
             &config_path,
             r#"
-                REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git
+                REPO_URL=https://github.com/hieule88/phala-llm-router.git
                 COMMIT_SHA=main
             "#,
         )
