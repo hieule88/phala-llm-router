@@ -363,10 +363,6 @@ fn deploy_readme_documents_one_command_deploy_and_seed_config() {
 fn deploy_examples_target_router_middleware_repo() {
     let compose = deploy_text("compose.yaml");
     let launcher = deploy_text("aggregator.conf");
-    // This repo deploys from its own fork, pinned by COMMIT_SHA in the
-    // compose file (hardcoded — not env-interpolated — so `phala cvms
-    // stop/start` works without re-supplying env). The old upstream
-    // Phala-Network repo is no longer referenced anywhere.
     let repo_url = "https://github.com/hieule88/phala-llm-router.git";
 
     assert!(
