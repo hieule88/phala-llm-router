@@ -7,7 +7,7 @@
 # (/v1/consume, /v1/refund) stay private on the docker network — the Edge and
 # ops reach them internally; the internet gets 404.
 {$AUTH_PUBLIC_DOMAIN} {
-	@public path /v1/webhooks/nowpayments /v1/payment-intents /v1/payment-intents/*
+	@public path /v1/webhooks/nowpayments /v1/payment-intents /v1/payment-intents/* /v1/validate
 	handle @public {
 		reverse_proxy auth-service:8000
 	}
