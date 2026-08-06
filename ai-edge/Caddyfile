@@ -2,12 +2,12 @@
 # Domains come from .env via docker-compose (AUTH_PUBLIC_DOMAIN / EDGE_PUBLIC_DOMAIN).
 # Caddy fetches + renews Let's Encrypt certs automatically (needs 80+443 reachable).
 
-# Auth-service: expose ONLY the user payment surface and the NOWPayments IPN.
+# Auth-service: expose ONLY signup, the user payment surface, and the IPN.
 # Admin (/v1/identities, /v1/topup, /v1/tier, ...) and the metering gate
 # (/v1/consume, /v1/refund) stay private on the docker network — the Edge and
 # ops reach them internally; the internet gets 404.
 {$AUTH_PUBLIC_DOMAIN} {
-	@public path /v1/webhooks/nowpayments /v1/payment-intents /v1/payment-intents/* /v1/validate
+	@public path /v1/signup /v1/keys/rotate /v1/webhooks/nowpayments /v1/payment-intents /v1/payment-intents/* /v1/validate
 	handle @public {
 		reverse_proxy auth-service:8000 {
 			# Overwrite, never pass through: a client-supplied X-Real-IP would

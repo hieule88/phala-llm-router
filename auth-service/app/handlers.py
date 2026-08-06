@@ -10,6 +10,7 @@ so the atomic decrement here cannot race against a concurrent topup or
 another consume on the same identity.
 """
 
+import hashlib
 import os
 import secrets
 from typing import Optional
@@ -74,6 +75,128 @@ if CONSUME_DEDUP_TTL_SECONDS <= 0:
 # NEVER let an unauthenticated attacker drain the balance by presenting a
 # publicly-known value.
 AUTHENTICATOR_CREDENTIAL_TYPES = frozenset({"api_key"})
+
+API_KEY_PREFIX = "lev_"
+API_KEY_ENTROPY_BYTES = 32
+
+# How long a rotated-away api_key keeps working
+ROTATE_GRACE_SECONDS = int(os.getenv("ROTATE_GRACE_SECONDS", "900"))
+
+if ROTATE_GRACE_SECONDS < 0:
+    raise RuntimeError(
+        f"ROTATE_GRACE_SECONDS must be >= 0 (got {ROTATE_GRACE_SECONDS})",
+    )
+
+
+def new_api_key() -> str:
+    return API_KEY_PREFIX + secrets.token_urlsafe(API_KEY_ENTROPY_BYTES)
+
+
+def hash_api_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+async def signup(
+    conn: aiosqlite.Connection,
+    ip_fingerprint: Optional[str] = None,
+) -> dict:
+    raw_key = new_api_key()
+    key_hash = hash_api_key(raw_key)
+    identity_id = await create_identity(
+        conn, "api_key", key_hash, initial_tier="free",
+    )
+    async with transaction(conn):
+        await conn.execute(
+            "INSERT INTO usage_log (identity_id, operation, delta, balance_after, note) "
+            "VALUES (?, 'signup', 0, 0, ?)",
+            (identity_id, f"ip={ip_fingerprint}" if ip_fingerprint else None),
+        )
+    return {
+        "identity_id": identity_id,
+        "api_key": raw_key,
+        "api_key_hash": key_hash,
+    }
+
+
+async def rotate_api_key(
+    conn: aiosqlite.Connection,
+    current_raw_key: str,
+    ip_fingerprint: Optional[str] = None,
+    revoke_now: bool = False,
+) -> dict:
+    current_hash = hash_api_key(current_raw_key)
+    new_raw_key = new_api_key()
+    new_hash = hash_api_key(new_raw_key)
+
+    async with transaction(conn):
+        cur = await conn.execute(
+            "SELECT id, identity_id FROM credentials "
+            "WHERE credential_type = 'api_key' AND credential_value = ? "
+            "  AND revoked_at IS NULL "
+            "  AND (grace_until IS NULL OR grace_until > CURRENT_TIMESTAMP)",
+            (current_hash,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return {"success": False, "error": "invalid credential"}
+        current_id, identity_id = row
+
+        cur = await conn.execute(
+            "INSERT INTO credentials (identity_id, credential_type, credential_value) "
+            "VALUES (?, 'api_key', ?) RETURNING id",
+            (identity_id, new_hash),
+        )
+        new_id = (await cur.fetchone())[0]
+
+        if revoke_now:
+            await conn.execute(
+                "UPDATE credentials SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (current_id,),
+            )
+            old_key_valid_until = None
+        else:
+            grace = max(0, ROTATE_GRACE_SECONDS)
+            await conn.execute(
+                "UPDATE credentials "
+                "SET grace_until = datetime('now', ?) WHERE id = ?",
+                (f"{grace:+d} seconds", current_id),
+            )
+            cur = await conn.execute(
+                "SELECT grace_until FROM credentials WHERE id = ?", (current_id,),
+            )
+            old_key_valid_until = (await cur.fetchone())[0]
+
+        # Sweep everything else still authenticating on this identity.
+        await conn.execute(
+            "UPDATE credentials SET revoked_at = CURRENT_TIMESTAMP "
+            "WHERE identity_id = ? AND credential_type = 'api_key' "
+            "  AND revoked_at IS NULL AND id NOT IN (?, ?)",
+            (identity_id, current_id, new_id),
+        )
+
+        cur = await conn.execute(
+            "SELECT balance FROM balances WHERE identity_id = ?", (identity_id,),
+        )
+        bal_row = await cur.fetchone()
+        balance = bal_row[0] if bal_row else 0
+        await conn.execute(
+            "INSERT INTO usage_log (identity_id, operation, delta, balance_after, note) "
+            "VALUES (?, 'key_rotate', 0, ?, ?)",
+            (identity_id, balance,
+             ";".join(filter(None, [
+                 f"ip={ip_fingerprint}" if ip_fingerprint else None,
+                 "revoke_now" if revoke_now else f"grace={ROTATE_GRACE_SECONDS}s",
+             ])) or None),
+        )
+
+    return {
+        "success": True,
+        "identity_id": identity_id,
+        "api_key": new_raw_key,
+        "api_key_hash": new_hash,
+        "balance": balance,
+        "old_key_valid_until": old_key_valid_until,
+    }
 
 
 async def create_identity(
@@ -175,12 +298,16 @@ async def lookup_identity(
     credential_type: str,
     credential_value: str,
 ) -> Optional[int]:
-    """Return identity_id for a (type, value) credential, or None if not found
-    or revoked.
+    """Return identity_id for a (type, value) credential, or None if not found,
+    revoked, or superseded by a rotation whose grace window has run out.
+
+    The grace clause is evaluated on read rather than swept by a job, so an
+    expired key stops working the moment it expires with no write on this path.
     """
     cur = await conn.execute(
         "SELECT identity_id FROM credentials "
-        "WHERE credential_type=? AND credential_value=? AND revoked_at IS NULL",
+        "WHERE credential_type=? AND credential_value=? AND revoked_at IS NULL "
+        "  AND (grace_until IS NULL OR grace_until > CURRENT_TIMESTAMP)",
         (credential_type, credential_value),
     )
     row = await cur.fetchone()

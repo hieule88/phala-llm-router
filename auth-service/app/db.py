@@ -234,6 +234,16 @@ async def _run_light_migrations(conn: aiosqlite.Connection) -> None:
         # above. Rows predating this column have NULL and are therefore no
         # longer refundable — deliberate: those debits are long settled.
         "ALTER TABLE consume_dedup ADD COLUMN debit_token TEXT",
+        # Deadline after which a SUPERSEDED api_key stops authenticating.
+        # Set on the old key by a rotation instead of revoking it outright:
+        # revoking at commit means a rotation whose response never reaches the
+        # client (dropped connection, proxy timeout) leaves the caller holding
+        # a dead key while the live one exists only in a response nobody read —
+        # the account, and any credit on it, is then unreachable forever.
+        # A short overlap makes that failure retryable with the old key.
+        # NULL means "not superseded"; rows predating this column are NULL and
+        # so behave exactly as before.
+        "ALTER TABLE credentials ADD COLUMN grace_until TIMESTAMP",
     ]
     for stmt in migrations:
         try:

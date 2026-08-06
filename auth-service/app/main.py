@@ -4,6 +4,8 @@ Thin HTTP layer over `handlers.py` — keep validation here and let the
 business logic stay in handlers so tests can exercise it without a server.
 
 Endpoints under `/v1`:
+  POST /v1/signup                         → self-service identity + api_key (public)
+  POST /v1/keys/rotate                    → swap api_key, keep balance (auth: raw api_key)
   POST /v1/identities                     → create identity + first credential (ADMIN)
   POST /v1/credentials                    → add another credential to an identity (ADMIN)
   POST /v1/credentials/revoke             → revoke a credential (ADMIN)
@@ -25,6 +27,10 @@ Auth model:
   - `validate` (read-only, no debit) stays unauthenticated: the api_key
     hash IS the credential, and the worst a leaked hash allows here is
     reading a balance.
+  - `signup` is unauthenticated by definition — it is how a caller gets
+    their first credential. It hands out only a zero-balance identity on
+    the lowest tier, so the thing it mints has no spending power until it
+    is funded through the payment layer.
   - `consume` DEBITS, so it is gated by the proxy token (require_proxy_token:
     PROXY_REFUND_TOKEN or ADMIN_TOKEN). The api_key hash is semi-public
     (users share it over chat/email), so an open consume would let anyone
@@ -97,6 +103,15 @@ if PROXY_REFUND_TOKEN and len(PROXY_REFUND_TOKEN) < MIN_ADMIN_TOKEN_LEN:
 # the public, per-credential for the proxy (see `_validate_rate_key`), for the
 # same reason — otherwise one tenant's polling 429s every co-tenant.
 RATE_LIMIT_VALIDATE = os.getenv("RATE_LIMIT_VALIDATE", "120/minute")
+# Signup is public and every call writes a row, so it is limited far harder
+# than any authenticated route. A fresh key carries zero balance, so farming
+# them buys nothing but table growth — this ceiling is about that growth, not
+# about protecting anything of value.
+RATE_LIMIT_SIGNUP = os.getenv("RATE_LIMIT_SIGNUP", "20/hour")
+# Rotation is public and authenticated by the raw key, which is unguessable —
+# so this ceiling is about churn (each call writes two credential rows), not
+# about slowing an attacker down.
+RATE_LIMIT_ROTATE = os.getenv("RATE_LIMIT_ROTATE", "10/hour")
 RATE_LIMIT_ADMIN = os.getenv("RATE_LIMIT_ADMIN", "30/minute")
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "20/minute")
 # Payment processor retries are aggressive; a rate-limit-driven drop of
@@ -173,6 +188,18 @@ def _client_key(request: Request) -> str:
         if real_ip:
             return real_ip.strip()
     return peer
+
+# Optional pepper for the signup/rotation audit trail's client fingerprint.
+SIGNUP_IP_PEPPER = os.getenv("SIGNUP_IP_PEPPER", "")
+
+def _client_fingerprint(request: Request) -> Optional[str]:
+    if not SIGNUP_IP_PEPPER:
+        return None
+    return hmac.new(
+        SIGNUP_IP_PEPPER.encode("utf-8"),
+        _client_key(request).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:16]
 
 
 def _bearer_is_proxy_token(request: Request) -> bool:
@@ -389,6 +416,63 @@ async def health():
     return {
         "status": "ok",
         "db_identity_count": identity_count,
+    }
+
+#   api_key      → Authorization: Bearer, to the gateway. Secret.
+#   api_key_hash → credential_value, to this service. Derived, semi-public.
+KEY_USAGE_DETAIL = (
+    "Store api_key now — it is shown once and cannot be recovered. Send it as "
+    "`Authorization: Bearer <api_key>` when calling the gateway. Send "
+    "api_key_hash (NOT api_key) as `credential_value` to this service, e.g. "
+    "when funding via POST /v1/payment-intents."
+)
+
+
+@app.post("/v1/signup", status_code=201)
+@limiter.limit(RATE_LIMIT_SIGNUP)
+async def signup(request: Request, response: Response):
+    # Public self-service registration: mint an identity + its api_key.
+    result = await handlers.signup(app.state.db, _client_fingerprint(request))
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "identity_id": result["identity_id"],
+        "api_key": result["api_key"],
+        "api_key_hash": result["api_key_hash"],
+        "tier": "free",
+        "balance": 0,
+        "detail": KEY_USAGE_DETAIL,
+    }
+
+
+class RotateKeyRequest(BaseModel):
+    api_key: str = Field(..., min_length=1,
+        description="The CURRENT raw api_key — not its hash. Possession of the "
+                    "raw key is what proves ownership; the hash is semi-public.")
+    revoke_now: bool = Field(False,
+        description="Kill the old key immediately instead of leaving it valid "
+                    "for a short grace window. Use when the key leaked. The "
+                    "trade-off is that a lost response then costs the account: "
+                    "the old key is dead and the new one was never received.")
+
+
+@app.post("/v1/keys/rotate")
+@limiter.limit(RATE_LIMIT_ROTATE)
+async def rotate_key(request: Request, response: Response, req: RotateKeyRequest):
+    # Replace the caller's api_key with a new one, keeping identity + balance.
+    result = await handlers.rotate_api_key(
+        app.state.db, req.api_key, _client_fingerprint(request),
+        revoke_now=req.revoke_now,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=401, detail="invalid credential")
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "identity_id": result["identity_id"],
+        "api_key": result["api_key"],
+        "api_key_hash": result["api_key_hash"],
+        "balance": result["balance"],
+        "old_key_valid_until": result["old_key_valid_until"],
+        "detail": KEY_USAGE_DETAIL,
     }
 
 
