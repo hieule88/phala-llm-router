@@ -11,6 +11,7 @@ is deterministic.
 import asyncio
 import hashlib
 import os
+import re
 import sys
 import unittest
 
@@ -149,20 +150,81 @@ class HelpersTest(unittest.TestCase):
         self.assertNotIn("x-user-tier", h)                    # client can't smuggle tier
         self.assertEqual(h["content-type"], "application/json")
 
-    def test_fwd_request_headers_allowlist_drops_response_changing_headers(self):
-        # The idempotency key covers path+body only, so any client header that
-        # can change the gateway's answer would let a replay of an already-paid
-        # body produce a different outcome. Only the allowlist gets through.
+    def test_fwd_request_headers_allowlist_drops_unbound_headers(self):
+        # Anything that can steer the gateway but is NOT bound into the
+        # idempotency key stays out: otherwise a replay of an already-paid body
+        # could produce a different outcome than the debited request.
         class R:
             headers = {"content-type": "application/json", "accept": "*/*",
-                       "x-upstream-verification": "bogus", "x-e2ee-version": "99",
-                       "x-signing-algo": "ed25519", "x-anything-else": "1"}
+                       "x-upstream-verification": "bogus", "x-anything-else": "1"}
         h = edge._fwd_request_headers(R(), identity_id=7)
-        for smuggled in ("x-upstream-verification", "x-e2ee-version",
-                         "x-signing-algo", "x-anything-else"):
+        for smuggled in ("x-upstream-verification", "x-anything-else"):
             self.assertNotIn(smuggled, h)
         self.assertEqual(h["content-type"], "application/json")
         self.assertEqual(h["accept"], "*/*")
+
+    def test_fwd_request_headers_pass_e2ee_through(self):
+        # E2EE is the whole point of the bound set: the client encrypts to the
+        # gateway's attested keyset, so these MUST arrive or the enclave never
+        # learns the request was meant to be private and answers in plaintext.
+        class R:
+            headers = {"content-type": "application/json",
+                       "x-e2ee-version": "2", "x-e2ee-nonce": "ab" * 16,
+                       "x-e2ee-timestamp": "1700000000",
+                       "x-client-pub-key": "aa" * 32, "x-model-pub-key": "bb" * 32}
+        h = edge._fwd_request_headers(R(), identity_id=7)
+        for name in ("x-e2ee-version", "x-e2ee-nonce", "x-e2ee-timestamp",
+                     "x-client-pub-key", "x-model-pub-key"):
+            self.assertEqual(h[name], R.headers[name], f"{name} did not reach the gateway")
+
+    def test_bound_set_mirrors_the_gateways_e2ee_headers(self):
+        # Read the names out of the GATEWAY'S OWN source rather than restating
+        # them here. A hand-copied list makes this test agree with itself: it
+        # passes forever while someone adds a seventh header to util.rs, and
+        # the drift it exists to catch is exactly the drift it cannot see.
+        #
+        # Drift is silent and harmful in both directions: a name the gateway
+        # acts on but we drop is a privacy control that fails shut (E2EE
+        # ignored, request forwarded in plaintext); a name we forward but do
+        # not bind is a billing hole.
+        util_rs = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "src", "http", "app", "util.rs")
+        if not os.path.isfile(util_rs):
+            self.skipTest(f"gateway source not present at {util_rs} "
+                          "(ai-edge deployed standalone); nothing to compare against")
+        with open(util_rs, encoding="utf-8") as fh:
+            source = fh.read()
+        body = re.search(r"fn has_e2ee_headers\(.*?\n\}", source, re.S)
+        self.assertIsNotNone(body, "could not find has_e2ee_headers in util.rs")
+        gateway_names = set(re.findall(r'"(x-[a-z0-9-]+)"', body.group(0)))
+        self.assertTrue(gateway_names, "parsed no header names out of has_e2ee_headers")
+        self.assertEqual(
+            set(edge._BOUND_REQ_HEADERS), gateway_names,
+            "the Edge's bound-header set has drifted from the gateway's "
+            "has_e2ee_headers; forward AND bind every name the gateway acts on")
+
+    def test_bound_header_digest_is_stable_when_no_headers_are_sent(self):
+        # A plain request must keep exactly the ledger key it had before the
+        # binding existed, or every existing client's retries stop deduplicating.
+        class R:
+            headers = {}
+        self.assertEqual(edge._bound_header_digest(R()), edge._bound_header_digest(R()))
+
+    def test_fwd_response_headers_expose_the_e2ee_verdict(self):
+        # The gateway stamps x-e2ee-applied true/false on every completion.
+        # Swallowing it leaves a client unable to distinguish "encrypted to the
+        # enclave" from "the Edge read it" — both are a 200.
+        resp = httpx.Response(200, headers={
+            "content-type": "application/json", "x-receipt-id": "r-1",
+            "x-e2ee-applied": "true", "x-e2ee-version": "2", "x-e2ee-algo": "x25519",
+            "set-cookie": "nope", "server": "hide-me"})
+        h = {k.lower(): v for k, v in edge._fwd_response_headers(resp).items()}
+        self.assertEqual(h["x-e2ee-applied"], "true")
+        self.assertEqual(h["x-e2ee-version"], "2")
+        self.assertEqual(h["x-e2ee-algo"], "x25519")
+        self.assertEqual(h["x-receipt-id"], "r-1")
+        self.assertNotIn("set-cookie", h)
+        self.assertNotIn("server", h)
 
     def test_tenant_bearer_is_hmac_per_identity(self):
         import hmac as hmac_mod
@@ -332,6 +394,88 @@ class EndToEndProxyTest(unittest.TestCase):
         # ...while a genuine retry (same key, same bytes) still dedups.
         run(post({"model": "m", "messages": [{"role": "user", "content": "APPLE"}]}))
         self.assertEqual(seen[0], seen[2], "genuine retry no longer deduplicates")
+
+    def test_e2ee_headers_are_bound_into_the_ledger_key(self):
+        # E2EE headers reach the gateway, so they must also reach the ledger's
+        # notion of "the same request". Same key + same bytes but E2EE toggled
+        # is different work for the gateway; if the two shared a ledger key the
+        # second would be deduplicated (no debit) and still forwarded — the
+        # exact billing bypass the body-binding already closed for prompts.
+        seen = []
+
+        def auth_handler(req: httpx.Request) -> httpx.Response:
+            import json as _json
+            if req.url.path == "/v1/consume":
+                seen.append(_json.loads(req.content)["idempotency_key"])
+                return httpx.Response(200, json={"success": True, "balance": 9,
+                                                 "identity_id": 7, "debit_token": "t"})
+            return httpx.Response(404)
+
+        ac = edge.AuthClient()
+        ac._c = httpx.AsyncClient(transport=httpx.MockTransport(auth_handler))
+        edge.app.state.auth = ac
+        edge.app.state.gw = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, content=b'{"ok":true}',
+                                     headers={"content-type": "application/json"})))
+
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        e2ee = {"x-e2ee-version": "2", "x-e2ee-nonce": "ab" * 16,
+                "x-e2ee-timestamp": "1700000000",
+                "x-client-pub-key": "aa" * 32, "x-model-pub-key": "bb" * 32}
+
+        async def post(extra):
+            transport = httpx.ASGITransport(app=edge.app)
+            headers = {"authorization": "Bearer lev_user",
+                       "idempotency-key": "retry-1", **extra}
+            async with httpx.AsyncClient(transport=transport, base_url="http://edge") as c:
+                return await c.post("/v1/chat/completions", headers=headers, json=body)
+
+        run(post({}))                                  # plaintext
+        run(post(e2ee))                                # same bytes, now encrypted
+        self.assertNotEqual(seen[0], seen[1],
+                            "toggling E2EE reused one ledger key (free inference)")
+
+        run(post(e2ee))                                # a genuine retry of the E2EE one
+        self.assertEqual(seen[1], seen[2], "identical E2EE retry no longer deduplicates")
+
+        run(post({**e2ee, "x-e2ee-nonce": "cd" * 16}))  # fresh nonce = fresh request
+        self.assertNotEqual(seen[2], seen[3], "a changed E2EE nonce reused one ledger key")
+
+    def test_e2ee_verdict_survives_the_whole_round_trip(self):
+        # End-to-end: the client must be able to READ the gateway's verdict
+        # after the Edge has streamed the body back. A client that cannot see
+        # x-e2ee-applied has no way to distinguish a prompt encrypted to the
+        # enclave from one this Edge read in cleartext — both arrive as 200.
+        def auth_handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/v1/consume":
+                return httpx.Response(200, json={"success": True, "balance": 9,
+                                                 "identity_id": 7, "debit_token": "t"})
+            return httpx.Response(404)
+
+        def gw_handler(req: httpx.Request) -> httpx.Response:
+            # Echo the gateway's real response-header shape (backend.rs).
+            return httpx.Response(200, content=b'{"ok":true}', headers={
+                "content-type": "application/json", "x-receipt-id": "rcpt-1",
+                "x-e2ee-applied": "true", "x-e2ee-version": "2",
+                "x-e2ee-algo": "x25519-xsalsa20-poly1305"})
+
+        ac = edge.AuthClient()
+        ac._c = httpx.AsyncClient(transport=httpx.MockTransport(auth_handler))
+        edge.app.state.auth = ac
+        edge.app.state.gw = httpx.AsyncClient(transport=httpx.MockTransport(gw_handler))
+
+        async def go():
+            transport = httpx.ASGITransport(app=edge.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://edge") as c:
+                return await c.post("/v1/chat/completions",
+                                    headers={"authorization": "Bearer lev_user"},
+                                    json={"model": "m", "messages": []})
+
+        resp = run(go())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("x-e2ee-applied"), "true")
+        self.assertEqual(resp.headers.get("x-e2ee-version"), "2")
+        self.assertEqual(resp.headers.get("x-receipt-id"), "rcpt-1")
 
     def test_deduplicated_consume_never_refunds(self):
         # Regression for the credit-minting hole: a replayed request debits

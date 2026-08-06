@@ -44,8 +44,8 @@ services:
       # Derives per-user tenant bearers (receipt ownership at the gateway).
       # Rotating it orphans receipts issued under the old bearers.
       - EDGE_TENANT_SECRET=${EDGE_TENANT_SECRET:?set EDGE_TENANT_SECRET (openssl rand -hex 32)}
-    ports:
-      - "8090:8090"
+    expose:
+      - "8090"
     depends_on:
       - auth-service
     networks: [edge-net]

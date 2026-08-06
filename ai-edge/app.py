@@ -95,13 +95,20 @@ if not AUTH_SERVICE_URL.startswith("https://") and not AUTH_SERVICE_ALLOW_HTTP:
 
 # Allowlist, not a denylist: only these client headers reach the gateway.
 # Rationale — the idempotency key is derived from path+body, so any header
-# that can change the gateway's response (x-upstream-verification, the
-# x-e2ee-* set, ...) would let a replay of an already-charged body produce a
-# DIFFERENT outcome than the debited request. Auth/tenancy headers
-# (authorization, x-gateway-token, x-user-tier) are Edge-controlled and are
-# set explicitly in _fwd_request_headers; hop-by-hop headers must not be
-# proxied at all.
+# that can change the gateway's response would let a replay of an
+# already-charged body produce a DIFFERENT outcome than the debited request.
+# Auth/tenancy headers (authorization, x-gateway-token, x-user-tier) are
+# Edge-controlled and are set explicitly in _fwd_request_headers; hop-by-hop
+# headers must not be proxied at all.
 _FWD_REQ_HEADERS = {"content-type", "accept", "accept-encoding", "user-agent"}
+
+_BOUND_REQ_HEADERS = frozenset({
+    "x-signing-algo", "x-client-pub-key", "x-model-pub-key",
+    "x-e2ee-version", "x-e2ee-nonce", "x-e2ee-timestamp",
+})
+
+_FWD_RESP_HEADERS = {"content-type", "x-receipt-id"}
+_FWD_RESP_PREFIXES = ("x-e2ee-",)
 
 
 # ─── Auth-service client (credit ledger) ─────────────────────────────────────
@@ -263,8 +270,36 @@ def _tenant_bearer(identity_id: int) -> str:
     return f"lev_t_{mac.hexdigest()}"
 
 
+def _bound_header_digest(request: Request) -> bytes:
+    """Digest over the response-affecting headers this Edge forwards.
+
+    Mixed into the idempotency key so two requests differing only in these
+    headers get two ledger keys. Without it the ledger would deduplicate a pair
+    the gateway treats as different work — the same body sent once with E2EE
+    and once without — and the second would run unpaid inside the dedup window.
+
+    Absent headers hash as empty, so a request that sends none keeps exactly
+    the key it would have had before: the binding is invisible until used.
+    """
+    h = hashlib.sha256()
+    for name in sorted(_BOUND_REQ_HEADERS):
+        h.update(name.encode())
+        h.update(b"\0")
+        h.update((request.headers.get(name) or "").encode())
+        h.update(b"\0")
+    return h.digest()
+
+
 def _fwd_request_headers(request: Request, identity_id: int) -> dict:
     hdrs = {k: v for k, v in request.headers.items() if k.lower() in _FWD_REQ_HEADERS}
+    # Read these through .get() — the same accessor `_bound_header_digest`
+    # uses — so a client sending a header twice cannot have the digest cover
+    # one value while a different one reaches the gateway, which would collide
+    # two materially different requests onto a single ledger key.
+    for name in _BOUND_REQ_HEADERS:
+        value = request.headers.get(name)
+        if value is not None:
+            hdrs[name] = value
     hdrs["x-gateway-token"] = GATEWAY_API_TOKEN            # passes the gateway's api gate
     hdrs["authorization"] = f"Bearer {_tenant_bearer(identity_id)}"  # owns the receipt
     return hdrs
@@ -273,8 +308,10 @@ def _fwd_request_headers(request: Request, identity_id: int) -> dict:
 def _fwd_response_headers(resp: httpx.Response) -> dict:
     keep = {}
     for k, v in resp.headers.items():
-        # Pass content-type + the receipt id so users keep verifiability.
-        if k.lower() in ("content-type", "x-receipt-id"):
+        # content-type, the receipt id (verifiability), and the gateway's
+        # x-e2ee-* verdict on whether the prompt was really encrypted to it.
+        low = k.lower()
+        if low in _FWD_RESP_HEADERS or low.startswith(_FWD_RESP_PREFIXES):
             keep[k] = v
     return keep
 
@@ -299,14 +336,18 @@ async def _metered_proxy(request: Request, path: str) -> Response:
     #                later request carrying k is deduplicated (no debit) yet
     #                still forwarded, so an arbitrary NEW prompt runs free
     #                until the dedup window expires.
-    # A retry the client means as a retry re-sends the same bytes; the same key
-    # over different bytes is new, billable work and gets its own ledger key.
-    # (auth-service scopes the key per identity, so two users sending identical
-    # bodies never collide.)
+    # The same argument covers the headers we forward that steer the gateway
+    # (_BOUND_REQ_HEADERS), which is why the digest includes them: identical
+    # bytes asking for E2EE and asking for plaintext are different work.
+    # A retry the client means as a retry re-sends the same bytes AND the same
+    # steering headers; anything else is new, billable work with its own ledger
+    # key. (auth-service scopes the key per identity, so two users sending
+    # identical bodies never collide.)
     client_idem = request.headers.get("idempotency-key", "").strip()
     idem = ("edge:" + hashlib.sha256(
         path.encode() + b"\0" + client_idem.encode()
-        + b"\0" + hashlib.sha256(body).digest()).hexdigest()
+        + b"\0" + hashlib.sha256(body).digest()
+        + b"\0" + _bound_header_digest(request)).hexdigest()
         if client_idem else "edge:once:" + secrets.token_hex(16))
 
     res = await request.app.state.auth.consume(raw_key, idem)

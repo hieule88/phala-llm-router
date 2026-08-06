@@ -313,7 +313,7 @@ pub(super) async fn run(
                     let mut headers =
                         response_headers(&forward.upstream_headers, "application/json");
                     insert_header(&mut headers, "x-receipt-id", &finalized.receipt.receipt_id);
-                    apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), true);
+                    apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref());
                     (status, headers, finalized.wire_body).into_response()
                 }
                 Err(err) => {
@@ -376,9 +376,9 @@ pub(super) async fn run(
                     match &receipt_id {
                         Some(receipt_id) => {
                             insert_header(&mut headers, "x-receipt-id", receipt_id);
-                            apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), true);
+                            apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref());
                         }
-                        None => apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), false),
+                        None => apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref()),
                     }
                     headers.insert(
                         HeaderName::from_static("x-accel-buffering"),
@@ -551,7 +551,7 @@ fn finalize_generated(
         e2ee,
     ) {
         Ok(finalized) => {
-            apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), false);
+            apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref());
             (status_code, headers, finalized.wire_body).into_response()
         }
         Err(err) => {
@@ -616,11 +616,23 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-fn apply_e2ee_headers(
-    headers: &mut HeaderMap,
-    e2ee: Option<&E2eeResponseInfo>,
-    include_plain_false: bool,
-) {
+/// Stamp the E2EE verdict on every response this module returns.
+///
+/// `false` used to be omitted on two of these paths, and one of them is a
+/// SUCCESS path: a streaming response whose receipt id is not yet journaled
+/// returns 200 with no verdict at all. To a client that asked for E2EE, a
+/// missing header reads as "this service is too old to say" rather than "your
+/// request was NOT encrypted" — so one checking `!= "false"`, or treating the
+/// gap as inconclusive-but-probably-fine, accepts a plaintext answer as a
+/// protected one.
+///
+/// The safety property never depended on this: `true` is emitted if and only if
+/// E2EE was applied, so a client requiring `== "true"` was always correct, and
+/// still is. Saying `false` out loud just stops the silence from looking like
+/// an answer. Error passthroughs elsewhere in the gateway may still omit it;
+/// they carry an error status, so no caller can mistake one for a protected
+/// reply.
+fn apply_e2ee_headers(headers: &mut HeaderMap, e2ee: Option<&E2eeResponseInfo>) {
     match e2ee {
         Some(info) => {
             headers.insert(
@@ -630,13 +642,12 @@ fn apply_e2ee_headers(
             insert_header(headers, "x-e2ee-version", &info.version);
             insert_header(headers, "x-e2ee-algo", &info.algo);
         }
-        None if include_plain_false => {
+        None => {
             headers.insert(
                 HeaderName::from_static("x-e2ee-applied"),
                 HeaderValue::from_static("false"),
             );
         }
-        None => {}
     }
 }
 
