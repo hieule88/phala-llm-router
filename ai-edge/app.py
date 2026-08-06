@@ -190,10 +190,15 @@ class AuthClient:
 
     async def validate(self, raw_key: str) -> AuthResult:
         # Read-only: is this a known credential (with balance)? Used by /v1/models.
+        # The proxy token is not required here (validate is public) — it tells
+        # auth-service these calls come from the Edge, which relays every tenant
+        # from one IP, so it buckets them per credential instead of collapsing
+        # the whole deployment into one per-IP rate limit.
         try:
             r = await self._c.post(
                 f"{AUTH_SERVICE_URL}/v1/validate",
                 json={"credential_type": "api_key", "credential_value": self.hash_key(raw_key)},
+                headers={"Authorization": f"Bearer {AUTH_SERVICE_PROXY_TOKEN}"},
             )
         except httpx.RequestError as e:
             return AuthResult(DENY_DOWN, error=f"auth unreachable: {e}")
@@ -285,16 +290,23 @@ async def _metered_proxy(request: Request, path: str) -> Response:
         return JSONResponse(status_code=401, content={"error": {"message": "api key required", "type": "unauth"}})
 
     body = await request.body()
-    # Idempotency is OPT-IN, keyed by the client's own `Idempotency-Key`.
-    # Deriving it from the request content instead would make every re-send of
-    # the same prompt a free replay: the ledger would debit once and then serve
-    # unlimited further completions for it inside the dedup window. A retry the
-    # client means as a retry says so; anything else is new, billable work.
+    # Idempotency is OPT-IN (the client's own `Idempotency-Key`) AND bound to
+    # the body. Both halves are load-bearing:
+    #   opt-in     — deriving the key from content alone would make every
+    #                re-send of the same prompt a free replay.
+    #   body-bound — a key covering only the path is a billing bypass: the
+    #                ledger debits once for `Idempotency-Key: k`, and every
+    #                later request carrying k is deduplicated (no debit) yet
+    #                still forwarded, so an arbitrary NEW prompt runs free
+    #                until the dedup window expires.
+    # A retry the client means as a retry re-sends the same bytes; the same key
+    # over different bytes is new, billable work and gets its own ledger key.
     # (auth-service scopes the key per identity, so two users sending identical
     # bodies never collide.)
     client_idem = request.headers.get("idempotency-key", "").strip()
     idem = ("edge:" + hashlib.sha256(
-        path.encode() + b"\0" + client_idem.encode()).hexdigest()
+        path.encode() + b"\0" + client_idem.encode()
+        + b"\0" + hashlib.sha256(body).digest()).hexdigest()
         if client_idem else "edge:once:" + secrets.token_hex(16))
 
     res = await request.app.state.auth.consume(raw_key, idem)

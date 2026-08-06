@@ -35,6 +35,7 @@ Auth model:
     payment processor's infra.
 """
 
+import hashlib
 import hmac
 import ipaddress
 import os
@@ -88,12 +89,13 @@ if PROXY_REFUND_TOKEN and len(PROXY_REFUND_TOKEN) < MIN_ADMIN_TOKEN_LEN:
         "use `openssl rand -hex 32` for a secure value",
     )
 
-# Per-IP rate limits. Overridable via env for load tests. Consume/validate
-# get the higher tier because a single TEE proxy handles many end-users
-# from one source IP.
+# Per-IP rate limits. Overridable via env for load tests.
 # NOTE: consume/refund are deliberately NOT per-IP limited (see their route
 # definitions) — all users share the proxy's single source IP, so that bucket
 # would be a service-wide ceiling. They are limited per-identity by tiers.py.
+# /v1/validate applies this ceiling per CALLER rather than per IP: per-IP for
+# the public, per-credential for the proxy (see `_validate_rate_key`), for the
+# same reason — otherwise one tenant's polling 429s every co-tenant.
 RATE_LIMIT_VALIDATE = os.getenv("RATE_LIMIT_VALIDATE", "120/minute")
 RATE_LIMIT_ADMIN = os.getenv("RATE_LIMIT_ADMIN", "30/minute")
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "20/minute")
@@ -171,6 +173,63 @@ def _client_key(request: Request) -> str:
         if real_ip:
             return real_ip.strip()
     return peer
+
+
+def _bearer_is_proxy_token(request: Request) -> bool:
+    """Classify (never gate) a caller as the Edge/ops rather than the public.
+
+    Same tokens `require_proxy_token` accepts, but returns a bool instead of
+    raising: callers here are being routed to a rate-limit bucket, not
+    authorised. Compares as bytes because Starlette decodes headers as
+    latin-1 and `hmac.compare_digest` raises TypeError on non-ASCII `str`.
+    """
+    authorization = request.headers.get("authorization")
+    if not authorization or not authorization.startswith("Bearer "):
+        return False
+    token = authorization[len("Bearer "):].encode("utf-8", "replace")
+    for expected in (PROXY_REFUND_TOKEN, ADMIN_TOKEN):
+        if expected and hmac.compare_digest(token, expected.encode("utf-8")):
+            return True
+    return False
+
+
+async def tag_validate_rate_subject(request: Request) -> None:
+    """Pick the /v1/validate rate-limit bucket before the limiter reads it.
+
+    FastAPI resolves dependencies before calling the (limiter-wrapped)
+    endpoint, so whatever this stores on `request.state` is in place by the
+    time `_validate_rate_key` runs. Only proxy-token-authenticated callers get
+    a per-credential bucket — an untrusted caller must not be able to pick its
+    own bucket, which would let it rotate keys and defeat the limit outright.
+    """
+    if not _bearer_is_proxy_token(request):
+        return
+    try:
+        payload = await request.json()
+        value = str(payload.get("credential_value", "") or "")
+    except Exception:
+        return  # malformed body: fall through to the per-IP bucket
+    if value:
+        request.state.validate_rate_subject = "cred:" + hashlib.sha256(
+            value.encode("utf-8")).hexdigest()
+
+
+def _validate_rate_key(request: Request) -> str:
+    """Bucket for /v1/validate: per-IP for the public, per-credential for the Edge.
+
+    The Edge relays EVERY tenant from one container IP, so a per-IP bucket
+    there is a service-wide ceiling, not a per-user one: a single user polling
+    /v1/models exhausts it, and the Edge maps the resulting 429 to DENY_DOWN —
+    503 on /v1/models and /v1/aci/receipts for every other tenant. Chat keeps
+    working (consume is not per-IP limited), so what one user can knock out is
+    precisely the verification path. Bucketing the Edge's calls per credential
+    keeps the same per-user ceiling without the cross-tenant blast radius.
+
+    Public callers still reach this route through Caddy (it is in the public
+    path allowlist), which overwrites X-Real-IP with the real peer, so they
+    keep the per-IP bucket they have always had.
+    """
+    return getattr(request.state, "validate_rate_subject", None) or _client_key(request)
 
 
 limiter = Limiter(key_func=_client_key, default_limits=[RATE_LIMIT_DEFAULT])
@@ -364,8 +423,8 @@ async def revoke_credential(request: Request, req: RevokeCredentialRequest):
     return result
 
 
-@app.post("/v1/validate")
-@limiter.limit(RATE_LIMIT_VALIDATE)
+@app.post("/v1/validate", dependencies=[Depends(tag_validate_rate_subject)])
+@limiter.limit(RATE_LIMIT_VALIDATE, key_func=_validate_rate_key)
 async def validate(request: Request, req: ValidateRequest):
     result = await handlers.validate(
         app.state.db, req.credential_type, req.credential_value,

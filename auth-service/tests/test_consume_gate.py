@@ -78,5 +78,68 @@ class EndpointWiringTest(unittest.TestCase):
         self.assertNotIn("require_proxy_token", self._deps("/v1/validate"))
 
 
+class ValidateRateBucketTest(unittest.IsolatedAsyncioTestCase):
+    """The Edge fronts every tenant from ONE container IP, so /v1/validate must
+    not bucket its calls per-IP: exhausting that shared bucket 503s /v1/models
+    and receipt reads for all co-tenants (the verification path) while chat,
+    which is not per-IP limited, keeps working."""
+
+    @staticmethod
+    def _request(headers, body, peer="172.18.0.9"):
+        import json as _json
+        from starlette.requests import Request
+
+        raw = _json.dumps(body).encode()
+        scope = {
+            "type": "http", "method": "POST", "path": "/v1/validate",
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+            "client": (peer, 51234), "query_string": b"", "scheme": "http",
+            "server": ("auth", 8000), "root_path": "", "app": m.app,
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": raw, "more_body": False}
+
+        return Request(scope, receive)
+
+    async def _key(self, headers, body, peer="172.18.0.9"):
+        req = self._request(headers, body, peer)
+        await m.tag_validate_rate_subject(req)
+        return m._validate_rate_key(req)
+
+    async def test_proxy_calls_bucket_per_credential(self):
+        proxy = {"authorization": "Bearer " + "P" * 40}
+        a = await self._key(proxy, {"credential_type": "api_key", "credential_value": "hash-a"})
+        b = await self._key(proxy, {"credential_type": "api_key", "credential_value": "hash-b"})
+        self.assertNotEqual(a, b, "two tenants shared one bucket behind the Edge")
+        self.assertTrue(a.startswith("cred:"))
+        # Same tenant keeps ONE bucket, so the per-user ceiling still applies.
+        again = await self._key(proxy, {"credential_type": "api_key", "credential_value": "hash-a"})
+        self.assertEqual(a, again)
+
+    async def test_untrusted_caller_cannot_choose_its_bucket(self):
+        # No/!valid proxy token → per-IP, even when the body names a credential:
+        # otherwise a public caller rotates credential_value for a fresh bucket
+        # per request and the limit stops existing.
+        body = {"credential_type": "api_key", "credential_value": "hash-a"}
+        anon = await self._key({}, body, peer="203.0.113.7")
+        forged = await self._key({"authorization": "Bearer nope"}, body, peer="203.0.113.7")
+        rotated = await self._key({}, {"credential_type": "api_key", "credential_value": "hash-z"},
+                                  peer="203.0.113.7")
+        self.assertEqual(anon, "203.0.113.7")
+        self.assertEqual(forged, "203.0.113.7")
+        self.assertEqual(anon, rotated)
+
+    async def test_malformed_body_falls_back_to_per_ip(self):
+        req = self._request({"authorization": "Bearer " + "P" * 40}, {}, peer="203.0.113.8")
+
+        async def receive():
+            return {"type": "http.request", "body": b"not json", "more_body": False}
+
+        req = __import__("starlette.requests", fromlist=["Request"]).Request(req.scope, receive)
+        await m.tag_validate_rate_subject(req)
+        self.assertEqual(m._validate_rate_key(req), "203.0.113.8")
+
+
 if __name__ == "__main__":
     unittest.main()

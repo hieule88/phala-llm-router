@@ -111,6 +111,20 @@ class ValidateMappingTest(unittest.TestCase):
         ac = _auth_with(lambda r: httpx.Response(200, json={"valid": False, "error": "credential not found"}))
         self.assertEqual(run(ac.validate("k")).status, edge.DENY_UNAUTH)
 
+    def test_sends_proxy_token_so_auth_buckets_per_credential(self):
+        # validate is a public endpoint, but auth-service uses the proxy token to
+        # recognise OUR calls and rate-limit them per credential. Without it every
+        # tenant shares the Edge's single per-IP bucket, and one user polling
+        # /v1/models 429s -> 503s everyone else's model list and receipt reads.
+        seen = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["auth"] = req.headers.get("authorization")
+            return httpx.Response(200, json={"valid": True, "balance": 5, "identity_id": 3})
+
+        run(_auth_with(handler).validate("k"))
+        self.assertEqual(seen["auth"], f"Bearer {edge.AUTH_SERVICE_PROXY_TOKEN}")
+
 
 class HelpersTest(unittest.TestCase):
     def test_deny_status_codes(self):
@@ -281,6 +295,43 @@ class EndToEndProxyTest(unittest.TestCase):
         run(post({**auth, "idempotency-key": "retry-1"}))
         run(post({**auth, "idempotency-key": "retry-1"}))
         self.assertEqual(seen[2], seen[3], "explicit Idempotency-Key did not dedup")
+
+    def test_same_idempotency_key_different_body_is_a_new_debit(self):
+        # Regression for the billing bypass: reusing one Idempotency-Key with a
+        # DIFFERENT prompt used to reuse the ledger key, so auth-service
+        # deduplicated (no debit) while the Edge still forwarded the new prompt
+        # to the gateway — unlimited free inference for one credit.
+        seen = []
+
+        def auth_handler(req: httpx.Request) -> httpx.Response:
+            import json as _json
+            if req.url.path == "/v1/consume":
+                seen.append(_json.loads(req.content)["idempotency_key"])
+                return httpx.Response(200, json={"success": True, "balance": 9,
+                                                 "identity_id": 7, "debit_token": "t"})
+            return httpx.Response(404)
+
+        ac = edge.AuthClient()
+        ac._c = httpx.AsyncClient(transport=httpx.MockTransport(auth_handler))
+        edge.app.state.auth = ac
+        edge.app.state.gw = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, content=b'{"ok":true}',
+                                     headers={"content-type": "application/json"})))
+
+        async def post(body):
+            transport = httpx.ASGITransport(app=edge.app)
+            headers = {"authorization": "Bearer lev_user", "idempotency-key": "EXPLOIT-C1"}
+            async with httpx.AsyncClient(transport=transport, base_url="http://edge") as c:
+                return await c.post("/v1/chat/completions", headers=headers, json=body)
+
+        run(post({"model": "m", "messages": [{"role": "user", "content": "APPLE"}]}))
+        run(post({"model": "m", "messages": [{"role": "user", "content": "BANANA"}]}))
+        self.assertNotEqual(seen[0], seen[1],
+                            "same key + different prompt reused one ledger key (free inference)")
+
+        # ...while a genuine retry (same key, same bytes) still dedups.
+        run(post({"model": "m", "messages": [{"role": "user", "content": "APPLE"}]}))
+        self.assertEqual(seen[0], seen[2], "genuine retry no longer deduplicates")
 
     def test_deduplicated_consume_never_refunds(self):
         # Regression for the credit-minting hole: a replayed request debits
