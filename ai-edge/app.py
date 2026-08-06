@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional
@@ -92,14 +93,15 @@ if not AUTH_SERVICE_URL.startswith("https://") and not AUTH_SERVICE_ALLOW_HTTP:
         "set AUTH_SERVICE_ALLOW_HTTP=true only for a co-located/private-network deploy",
     )
 
-# Hop-by-hop / auth headers we must NOT forward from the client to the gateway.
-# x-gateway-token and x-user-tier are Edge/operator-controlled channels a
-# client must never be able to smuggle through.
-_STRIP_REQ_HEADERS = {
-    "host", "authorization", "content-length", "connection",
-    "transfer-encoding", "keep-alive", "proxy-authorization",
-    "x-gateway-token", "x-user-tier",
-}
+# Allowlist, not a denylist: only these client headers reach the gateway.
+# Rationale — the idempotency key is derived from path+body, so any header
+# that can change the gateway's response (x-upstream-verification, the
+# x-e2ee-* set, ...) would let a replay of an already-charged body produce a
+# DIFFERENT outcome than the debited request. Auth/tenancy headers
+# (authorization, x-gateway-token, x-user-tier) are Edge-controlled and are
+# set explicitly in _fwd_request_headers; hop-by-hop headers must not be
+# proxied at all.
+_FWD_REQ_HEADERS = {"content-type", "accept", "accept-encoding", "user-agent"}
 
 
 # ─── Auth-service client (credit ledger) ─────────────────────────────────────
@@ -118,6 +120,10 @@ class AuthResult:
     # and on DENY_NO_BALANCE from validate() (known key, empty balance), so
     # receipt reads keep working after the user runs out of credit.
     identity_id: Optional[int] = None
+    # One-shot capability to reverse THIS debit, returned by the ledger only
+    # when a credit was actually spent. Absent on an idempotent replay —
+    # which is exactly why a replay can never trigger a refund.
+    debit_token: Optional[str] = None
 
 
 class AuthClient:
@@ -153,21 +159,28 @@ class AuthClient:
         data = r.json()
         if data.get("success") is True:
             return AuthResult(ALLOW, balance=data.get("balance"),
-                              identity_id=data.get("identity_id"))
+                              identity_id=data.get("identity_id"),
+                              debit_token=data.get("debit_token"))
         err = str(data.get("error", "")).lower()
         if "balance" in err or "insufficient" in err:
             return AuthResult(DENY_NO_BALANCE, error=data.get("error"))
         return AuthResult(DENY_UNAUTH, error=data.get("error"))
 
-    async def refund(self, raw_key: str, idempotency_key: str, reason: str) -> None:
+    async def refund(self, raw_key: str, debit_token: Optional[str], reason: str) -> None:
         # Best-effort reversal when the gateway rejected the request post-debit.
+        # `debit_token` is None when this request's consume was an idempotent
+        # replay: it spent nothing, so there is nothing of ITS to reverse —
+        # refunding here would mint a credit against an earlier request's debit
+        # and turn one paid request into unlimited free inference.
+        if not debit_token:
+            return
         try:
             await self._c.post(
                 f"{AUTH_SERVICE_URL}/v1/refund",
                 json={
                     "credential_type": "api_key",
                     "credential_value": self.hash_key(raw_key),
-                    "idempotency_key": idempotency_key,
+                    "debit_token": debit_token,
                     "reason": reason,
                 },
                 headers={"Authorization": f"Bearer {AUTH_SERVICE_PROXY_TOKEN}"},
@@ -246,7 +259,7 @@ def _tenant_bearer(identity_id: int) -> str:
 
 
 def _fwd_request_headers(request: Request, identity_id: int) -> dict:
-    hdrs = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQ_HEADERS}
+    hdrs = {k: v for k, v in request.headers.items() if k.lower() in _FWD_REQ_HEADERS}
     hdrs["x-gateway-token"] = GATEWAY_API_TOKEN            # passes the gateway's api gate
     hdrs["authorization"] = f"Bearer {_tenant_bearer(identity_id)}"  # owns the receipt
     return hdrs
@@ -272,9 +285,17 @@ async def _metered_proxy(request: Request, path: str) -> Response:
         return JSONResponse(status_code=401, content={"error": {"message": "api key required", "type": "unauth"}})
 
     body = await request.body()
-    # Idempotency = content hash, so a client retry of the SAME request does not
-    # double-charge, while any different request debits exactly once.
-    idem = "edge:" + hashlib.sha256(path.encode() + b"\0" + body).hexdigest()
+    # Idempotency is OPT-IN, keyed by the client's own `Idempotency-Key`.
+    # Deriving it from the request content instead would make every re-send of
+    # the same prompt a free replay: the ledger would debit once and then serve
+    # unlimited further completions for it inside the dedup window. A retry the
+    # client means as a retry says so; anything else is new, billable work.
+    # (auth-service scopes the key per identity, so two users sending identical
+    # bodies never collide.)
+    client_idem = request.headers.get("idempotency-key", "").strip()
+    idem = ("edge:" + hashlib.sha256(
+        path.encode() + b"\0" + client_idem.encode()).hexdigest()
+        if client_idem else "edge:once:" + secrets.token_hex(16))
 
     res = await request.app.state.auth.consume(raw_key, idem)
     if res.status != ALLOW:
@@ -282,7 +303,7 @@ async def _metered_proxy(request: Request, path: str) -> Response:
     if res.identity_id is None:
         # Ledger allowed the debit but did not say WHO — without an identity
         # we cannot assign receipt ownership. Fail closed and give it back.
-        await request.app.state.auth.refund(raw_key, idem, "auth_missing_identity")
+        await request.app.state.auth.refund(raw_key, res.debit_token, "auth_missing_identity")
         return JSONResponse(status_code=503, content={"error": {
             "message": "billing service returned no identity, retry later", "type": DENY_DOWN}})
 
@@ -293,14 +314,14 @@ async def _metered_proxy(request: Request, path: str) -> Response:
     try:
         resp = await gw.send(req, stream=True)
     except httpx.RequestError as e:
-        await request.app.state.auth.refund(raw_key, idem, f"gateway_unreachable:{e}")
+        await request.app.state.auth.refund(raw_key, res.debit_token, f"gateway_unreachable:{e}")
         return JSONResponse(status_code=502, content={"error": {"message": "gateway unreachable", "type": "gateway"}})
 
     if resp.status_code >= 400:
         # Gateway rejected (e.g. upstream 404/429). Refund and surface the error.
         err_body = await resp.aread()
         await resp.aclose()
-        await request.app.state.auth.refund(raw_key, idem, f"gateway_status:{resp.status_code}")
+        await request.app.state.auth.refund(raw_key, res.debit_token, f"gateway_status:{resp.status_code}")
         return Response(content=err_body, status_code=resp.status_code, headers=_fwd_response_headers(resp))
 
     async def _stream():

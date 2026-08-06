@@ -25,6 +25,11 @@ from .tiers import get_tier
 # intent belonging to someone else. Not a secret, but not enumerable.
 INTENT_MEMO_ENTROPY_BYTES = 8
 
+# Entropy in the one-shot refund capability minted per debit. 16 bytes =
+# 128 bits: a caller cannot guess another request's token, so only the
+# request that actually spent a credit can reverse it.
+REFUND_TOKEN_ENTROPY_BYTES = 16
+
 # Server-side price per credit in USD cents. The intent's amount_cents
 # is derived from credits × this constant — never taken from the user.
 # Prevents a caller from creating an intent for 1_000_000 credits at 1¢.
@@ -306,17 +311,23 @@ async def consume(
             return {"success": False, "error": "insufficient balance"}
         new_balance = row[0]
 
+        # One-shot capability for reversing THIS debit. Only the caller that
+        # actually spent the credit receives it, so a later replay (which
+        # debits nothing) cannot reverse this debit and mint a credit.
+        debit_token = secrets.token_hex(REFUND_TOKEN_ENTROPY_BYTES)
+
         if idempotency_key:
             if existing_dedup is not None:
                 # Refunded or TTL-stale row from a prior cycle — reactivate
                 # it in-place. created_at is refreshed so the audit trail
-                # (and the next replay window) starts at THIS debit.
+                # (and the next replay window) starts at THIS debit, and the
+                # token is rotated so the previous cycle's token is dead.
                 await conn.execute(
                     "UPDATE consume_dedup "
                     "SET balance_after = ?, refunded_at = NULL, "
-                    "    created_at = CURRENT_TIMESTAMP "
+                    "    created_at = CURRENT_TIMESTAMP, debit_token = ? "
                     "WHERE id = ?",
-                    (new_balance, existing_dedup[0]),
+                    (new_balance, debit_token, existing_dedup[0]),
                 )
             else:
                 # Fresh key — UNIQUE(identity_id, idempotency_key) guarantees
@@ -326,9 +337,10 @@ async def consume(
                 # caller retries, then the second attempt finds the row in
                 # the SELECT above.
                 await conn.execute(
-                    "INSERT INTO consume_dedup (identity_id, idempotency_key, balance_after) "
-                    "VALUES (?, ?, ?)",
-                    (identity_id, idempotency_key, new_balance),
+                    "INSERT INTO consume_dedup "
+                    "  (identity_id, idempotency_key, balance_after, debit_token) "
+                    "VALUES (?, ?, ?, ?)",
+                    (identity_id, idempotency_key, new_balance, debit_token),
                 )
 
         await conn.execute(
@@ -338,7 +350,11 @@ async def consume(
             (identity_id, request_id, new_balance,
              f"idem={idempotency_key}" if idempotency_key else None),
         )
-        return {"success": True, "identity_id": identity_id, "balance": new_balance}
+        result = {"success": True, "identity_id": identity_id, "balance": new_balance}
+        if idempotency_key:
+            # Only a real debit hands back the reversal capability.
+            result["debit_token"] = debit_token
+        return result
 
 
 async def topup(
@@ -441,49 +457,53 @@ async def refund(
     conn: aiosqlite.Connection,
     credential_type: str,
     credential_value: str,
-    idempotency_key: str,
+    debit_token: str,
     reason: str = "",
 ) -> dict:
-    """Reverse a consume that has already been recorded for the given
-    (identity, idempotency_key).
+    """Reverse the specific consume that minted `debit_token`.
 
-    The TEE proxy calls this when it debited a credit but then failed
-    to return the proof to the client (upstream error, container SIGKILL
+    The proxy calls this when it debited a credit but then failed to
+    return the result to the client (upstream error, container SIGKILL
     mid-response, TLS write failure). Without a refund path the user
     silently loses the credit.
 
-    Idempotent on the same key: a second refund for a debit that has
-    already been refunded is a no-op.
+    Authorised by the one-shot `debit_token` that `consume` returns ONLY
+    when it actually debited — never on an idempotent replay. Keying the
+    reversal on the idempotency_key instead would let a caller whose
+    consume was deduplicated (and therefore paid nothing) reverse the
+    debit an earlier request made, minting a credit out of nothing and
+    turning one paid request into unlimited free work.
+
+    Idempotent: refunding an already-refunded debit is a no-op.
     """
     if credential_type not in AUTHENTICATOR_CREDENTIAL_TYPES:
         return {"success": False, "error": "credential not found"}
-    if not idempotency_key:
-        return {"success": False, "error": "idempotency_key required"}
+    if not debit_token:
+        return {"success": False, "error": "debit_token required"}
 
     async with transaction(conn):
         identity_id = await lookup_identity(conn, credential_type, credential_value)
         if identity_id is None:
             return {"success": False, "error": "credential not found"}
 
-        # Find the dedup row this key refers to. Whether it's live
-        # (refunded_at IS NULL) or already-refunded (refunded_at set)
-        # affects the branch below, but a missing row is unambiguous:
-        # nothing to reverse.
+        # The token identifies one debit of one identity. A token from a
+        # previous consume→refund cycle no longer matches (consume rotates
+        # it), so a stale token cannot reverse the current debit either.
         cur = await conn.execute(
-            "SELECT id, refunded_at FROM consume_dedup "
-            "WHERE identity_id = ? AND idempotency_key = ?",
-            (identity_id, idempotency_key),
+            "SELECT id, refunded_at, idempotency_key FROM consume_dedup "
+            "WHERE identity_id = ? AND debit_token = ?",
+            (identity_id, debit_token),
         )
         dedup = await cur.fetchone()
         if not dedup:
             return {"success": False, "error": "no matching debit to refund"}
-        dedup_id, already_refunded_at = dedup
+        dedup_id, already_refunded_at, idempotency_key = dedup
 
         if already_refunded_at is not None:
             # Idempotent replay: this specific debit's refund already ran.
-            # A separate consume(key) after the refund would have UPDATEd
-            # refunded_at back to NULL (see consume path), so seeing a
-            # non-NULL here means no fresh debit intervened.
+            # A separate consume after the refund would have rotated the
+            # token, so seeing this token still attached means no fresh
+            # debit intervened.
             bal = await get_balance(conn, identity_id)
             return {
                 "success": True,

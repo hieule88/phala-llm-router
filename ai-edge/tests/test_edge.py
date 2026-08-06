@@ -58,13 +58,15 @@ class ConsumeMappingTest(unittest.TestCase):
             seen["auth"] = req.headers.get("authorization")
             import json
             seen["cred"] = json.loads(req.content)["credential_value"]
-            return httpx.Response(200, json={"success": True, "balance": 9, "identity_id": 7})
+            return httpx.Response(200, json={"success": True, "balance": 9, "identity_id": 7,
+                                             "debit_token": "tok-1"})
 
         ac = _auth_with(handler)
         r = run(ac.consume("lev_abc", "edge:x"))
         self.assertEqual(r.status, edge.ALLOW)
         self.assertEqual(r.balance, 9)
         self.assertEqual(r.identity_id, 7)
+        self.assertEqual(r.debit_token, "tok-1")
         self.assertEqual(seen["auth"], "Bearer ptok")                       # proxy-gated
         self.assertEqual(seen["cred"], hashlib.sha256(b"lev_abc").hexdigest())  # hash, not raw
 
@@ -133,6 +135,21 @@ class HelpersTest(unittest.TestCase):
         self.assertNotIn("x-user-tier", h)                    # client can't smuggle tier
         self.assertEqual(h["content-type"], "application/json")
 
+    def test_fwd_request_headers_allowlist_drops_response_changing_headers(self):
+        # The idempotency key covers path+body only, so any client header that
+        # can change the gateway's answer would let a replay of an already-paid
+        # body produce a different outcome. Only the allowlist gets through.
+        class R:
+            headers = {"content-type": "application/json", "accept": "*/*",
+                       "x-upstream-verification": "bogus", "x-e2ee-version": "99",
+                       "x-signing-algo": "ed25519", "x-anything-else": "1"}
+        h = edge._fwd_request_headers(R(), identity_id=7)
+        for smuggled in ("x-upstream-verification", "x-e2ee-version",
+                         "x-signing-algo", "x-anything-else"):
+            self.assertNotIn(smuggled, h)
+        self.assertEqual(h["content-type"], "application/json")
+        self.assertEqual(h["accept"], "*/*")
+
     def test_tenant_bearer_is_hmac_per_identity(self):
         import hmac as hmac_mod
         expected = hmac_mod.new(b"tsecret", b"7", hashlib.sha256).hexdigest()
@@ -144,8 +161,9 @@ class EndToEndProxyTest(unittest.TestCase):
     """Drive the real FastAPI routes over ASGI with mocked auth-service +
     gateway, so the full path (auth gate -> forward -> deny/refund) is tested."""
 
-    def _run_chat(self, consume="allow", gateway=(200, b'{"ok":true}'), identity_id=7):
-        state = {"refunds": 0, "gw_calls": 0, "gw_headers": None}
+    def _run_chat(self, consume="allow", gateway=(200, b'{"ok":true}'), identity_id=7,
+                  debit_token="tok-1"):
+        state = {"refunds": 0, "gw_calls": 0, "gw_headers": None, "refund_bodies": []}
 
         def auth_handler(req: httpx.Request) -> httpx.Response:
             if req.url.path == "/v1/consume":
@@ -153,10 +171,14 @@ class EndToEndProxyTest(unittest.TestCase):
                     payload = {"success": True, "balance": 9}
                     if identity_id is not None:
                         payload["identity_id"] = identity_id
+                    if debit_token is not None:
+                        payload["debit_token"] = debit_token
                     return httpx.Response(200, json=payload)
                 return httpx.Response(200, json={"success": False, "error": "insufficient balance"})
             if req.url.path == "/v1/refund":
+                import json as _json
                 state["refunds"] += 1
+                state["refund_bodies"].append(_json.loads(req.content))
                 return httpx.Response(200, json={"success": True})
             return httpx.Response(404)
 
@@ -221,6 +243,55 @@ class EndToEndProxyTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(state["gw_calls"], 1)
         self.assertEqual(state["refunds"], 1)       # debited then refunded
+        # The refund names the debit it reverses, not the idempotency key.
+        self.assertEqual(state["refund_bodies"][0]["debit_token"], "tok-1")
+        self.assertNotIn("idempotency_key", state["refund_bodies"][0])
+
+    def test_idempotency_is_opt_in_not_derived_from_body(self):
+        # Two submissions of the same body must be two distinct debits;
+        # otherwise the second is a free replay inside the dedup window.
+        # Only an explicit client Idempotency-Key makes them one.
+        seen = []
+
+        def auth_handler(req: httpx.Request) -> httpx.Response:
+            import json as _json
+            if req.url.path == "/v1/consume":
+                seen.append(_json.loads(req.content)["idempotency_key"])
+                return httpx.Response(200, json={"success": True, "balance": 9,
+                                                 "identity_id": 7, "debit_token": "t"})
+            return httpx.Response(404)
+
+        ac = edge.AuthClient()
+        ac._c = httpx.AsyncClient(transport=httpx.MockTransport(auth_handler))
+        edge.app.state.auth = ac
+        edge.app.state.gw = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, content=b'{"ok":true}',
+                                     headers={"content-type": "application/json"})))
+
+        async def post(headers):
+            transport = httpx.ASGITransport(app=edge.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://edge") as c:
+                return await c.post("/v1/chat/completions", headers=headers,
+                                    json={"model": "m", "messages": []})
+
+        auth = {"authorization": "Bearer lev_user"}
+        run(post(auth)); run(post(auth))
+        self.assertNotEqual(seen[0], seen[1], "same body reused one idempotency key")
+
+        run(post({**auth, "idempotency-key": "retry-1"}))
+        run(post({**auth, "idempotency-key": "retry-1"}))
+        self.assertEqual(seen[2], seen[3], "explicit Idempotency-Key did not dedup")
+
+    def test_deduplicated_consume_never_refunds(self):
+        # Regression for the credit-minting hole: a replayed request debits
+        # nothing (auth-service returns no debit_token), so even when the
+        # gateway rejects it the Edge must NOT ask for a refund — doing so
+        # would reverse an earlier request's debit and mint a credit.
+        resp, state = self._run_chat(consume="allow", debit_token=None,
+                                     gateway=(400, b'{"error":"invalid_request_error"}'))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(state["gw_calls"], 1)
+        self.assertEqual(state["refunds"], 0)
 
 
 class ReceiptRouteTest(unittest.TestCase):

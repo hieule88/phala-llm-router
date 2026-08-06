@@ -9,7 +9,12 @@
 {$AUTH_PUBLIC_DOMAIN} {
 	@public path /v1/webhooks/nowpayments /v1/payment-intents /v1/payment-intents/* /v1/validate
 	handle @public {
-		reverse_proxy auth-service:8000
+		reverse_proxy auth-service:8000 {
+			# Overwrite, never pass through: a client-supplied X-Real-IP would
+			# let a caller mint a fresh rate-limit bucket per request, or pin
+			# everyone onto one bucket to lock the service out.
+			header_up X-Real-IP {remote_host}
+		}
 	}
 	handle {
 		respond 404
@@ -19,5 +24,7 @@
 # The Edge: the full OpenAI-compatible surface is user-facing by design
 # (per-key auth + metering happen inside the Edge itself).
 {$EDGE_PUBLIC_DOMAIN} {
-	reverse_proxy edge:8090
+	reverse_proxy edge:8090 {
+		header_up X-Real-IP {remote_host}
+	}
 }

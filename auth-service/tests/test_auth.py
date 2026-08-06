@@ -270,8 +270,8 @@ class TopupTest(unittest.TestCase):
 
 
 class RefundTest(unittest.TestCase):
-    """A refund reverses a consume identified by (identity, idempotency_key)
-    and lets the SAME prove request be retried without double-billing."""
+    """A refund reverses the specific consume that minted its debit_token
+    and lets the SAME request be retried without double-billing."""
 
     def test_refund_reverses_a_consume(self):
         async def go():
@@ -279,12 +279,12 @@ class RefundTest(unittest.TestCase):
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
                 await handlers.topup(conn, ident, 10, source="test")
-                await handlers.consume(conn, "api_key", "k", idempotency_key="idem_x")
+                c = await handlers.consume(conn, "api_key", "k", idempotency_key="idem_x")
                 self.assertEqual(
                     (await handlers.get_balance(conn, ident))["balance"], 9,
                 )
                 r = await handlers.refund(conn, "api_key", "k",
-                                          idempotency_key="idem_x",
+                                          debit_token=c["debit_token"],
                                           reason="upstream crash")
                 self.assertTrue(r["success"])
                 self.assertEqual(r["balance"], 10)
@@ -298,9 +298,9 @@ class RefundTest(unittest.TestCase):
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
                 await handlers.topup(conn, ident, 10, source="test")
-                await handlers.consume(conn, "api_key", "k", idempotency_key="ix")
-                await handlers.refund(conn, "api_key", "k", idempotency_key="ix")
-                r2 = await handlers.refund(conn, "api_key", "k", idempotency_key="ix")
+                c = await handlers.consume(conn, "api_key", "k", idempotency_key="ix")
+                await handlers.refund(conn, "api_key", "k", debit_token=c["debit_token"])
+                r2 = await handlers.refund(conn, "api_key", "k", debit_token=c["debit_token"])
                 self.assertTrue(r2["success"])
                 self.assertTrue(r2.get("deduplicated"))
                 # Still 10, not 11.
@@ -317,7 +317,7 @@ class RefundTest(unittest.TestCase):
             try:
                 await handlers.create_identity(conn, "api_key", "k")
                 r = await handlers.refund(conn, "api_key", "k",
-                                          idempotency_key="never_consumed")
+                                          debit_token="never_issued")
                 self.assertFalse(r["success"])
                 self.assertIn("no matching debit", r["error"])
             finally:
@@ -332,8 +332,8 @@ class RefundTest(unittest.TestCase):
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
                 await handlers.topup(conn, ident, 10, source="test")
-                await handlers.consume(conn, "api_key", "k", idempotency_key="i")
-                await handlers.refund(conn, "api_key", "k", idempotency_key="i")
+                c = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
+                await handlers.refund(conn, "api_key", "k", debit_token=c["debit_token"])
                 r = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
                 self.assertTrue(r["success"])
                 self.assertFalse(r.get("deduplicated"))
@@ -352,25 +352,99 @@ class RefundTest(unittest.TestCase):
                 ident = await handlers.create_identity(conn, "api_key", "k")
                 await handlers.topup(conn, ident, 10, source="test")
                 # Cycle 1: consume then refund.
-                await handlers.consume(conn, "api_key", "k", idempotency_key="k1")
-                r1 = await handlers.refund(conn, "api_key", "k", idempotency_key="k1")
+                c1 = await handlers.consume(conn, "api_key", "k", idempotency_key="k1")
+                r1 = await handlers.refund(conn, "api_key", "k", debit_token=c1["debit_token"])
                 self.assertTrue(r1["success"])
                 self.assertFalse(r1.get("deduplicated"))
                 self.assertEqual(
                     (await handlers.get_balance(conn, ident))["balance"], 10,
                 )
                 # Cycle 2: same key, consume+refund again. Must credit back.
-                await handlers.consume(conn, "api_key", "k", idempotency_key="k1")
+                c2 = await handlers.consume(conn, "api_key", "k", idempotency_key="k1")
                 self.assertEqual(
                     (await handlers.get_balance(conn, ident))["balance"], 9,
                 )
-                r2 = await handlers.refund(conn, "api_key", "k", idempotency_key="k1")
+                r2 = await handlers.refund(conn, "api_key", "k", debit_token=c2["debit_token"])
                 self.assertTrue(r2["success"])
                 self.assertFalse(r2.get("deduplicated"),
                                  "second cycle's refund was silently deduped")
                 self.assertEqual(
                     (await handlers.get_balance(conn, ident))["balance"], 10,
                 )
+            finally:
+                await conn.close()
+        run(go())
+
+
+class RefundCapabilityTest(unittest.TestCase):
+    """Regression for the credit-minting hole: a consume that was
+    deduplicated spent nothing, so it must not be able to reverse the debit
+    an earlier request made. Only the request that actually paid gets a
+    debit_token, and a token dies once spent or superseded."""
+
+    def test_deduplicated_consume_gets_no_token_and_cannot_mint(self):
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                ident = await handlers.create_identity(conn, "api_key", "k")
+                await handlers.topup(conn, ident, 5, source="test")
+                first = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
+                self.assertEqual(first["balance"], 4)
+                self.assertTrue(first.get("debit_token"))
+
+                replay = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
+                self.assertTrue(replay.get("deduplicated"))
+                # The replay debited nothing, so it holds no reversal capability.
+                self.assertIsNone(replay.get("debit_token"))
+
+                # With no token there is nothing to refund with; and the
+                # idempotency key alone must not work as one.
+                bad = await handlers.refund(conn, "api_key", "k", debit_token="same")
+                self.assertFalse(bad["success"])
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4)
+            finally:
+                await conn.close()
+        run(go())
+
+    def test_spent_token_cannot_refund_twice_across_cycles(self):
+        # Refund with cycle 1's token, debit again, then replay the OLD token:
+        # it must not credit a second time (consume rotates the token).
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                ident = await handlers.create_identity(conn, "api_key", "k")
+                await handlers.topup(conn, ident, 5, source="test")
+                c1 = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
+                await handlers.refund(conn, "api_key", "k", debit_token=c1["debit_token"])
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 5)
+
+                c2 = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
+                self.assertNotEqual(c1["debit_token"], c2["debit_token"])
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4)
+
+                stale = await handlers.refund(conn, "api_key", "k",
+                                              debit_token=c1["debit_token"])
+                self.assertFalse(stale["success"])
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4)
+            finally:
+                await conn.close()
+        run(go())
+
+    def test_another_identity_token_cannot_refund_mine(self):
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                a = await handlers.create_identity(conn, "api_key", "ka")
+                b = await handlers.create_identity(conn, "api_key", "kb")
+                # Distinct sources: `source` is UNIQUE (topup idempotency).
+                await handlers.topup(conn, a, 5, source="test-a")
+                await handlers.topup(conn, b, 5, source="test-b")
+                ca = await handlers.consume(conn, "api_key", "ka", idempotency_key="x")
+                # B presents A's token: scoped per identity, so it must miss.
+                r = await handlers.refund(conn, "api_key", "kb",
+                                          debit_token=ca["debit_token"])
+                self.assertFalse(r["success"])
+                self.assertEqual((await handlers.get_balance(conn, b))["balance"], 5)
             finally:
                 await conn.close()
         run(go())

@@ -140,6 +140,11 @@ CREATE TABLE IF NOT EXISTS consume_dedup (
     balance_after   INTEGER NOT NULL,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     refunded_at     TIMESTAMP,   -- non-NULL means /v1/refund reversed this debit
+    -- One-shot capability for reversing THIS debit. Minted fresh on every
+    -- real debit, returned only to the caller that caused it, and cleared
+    -- once spent. A replayed consume debits nothing and therefore gets no
+    -- token, so it cannot reverse a debit some earlier request made.
+    debit_token     TEXT,
     UNIQUE(identity_id, idempotency_key)
 );
 
@@ -225,6 +230,10 @@ async def _run_light_migrations(conn: aiosqlite.Connection) -> None:
         # so idempotent refund replays still find the row and return
         # a `deduplicated: true` response instead of "not found".
         "ALTER TABLE consume_dedup ADD COLUMN refunded_at TIMESTAMP",
+        # One-shot refund capability minted per real debit; see the CREATE
+        # above. Rows predating this column have NULL and are therefore no
+        # longer refundable — deliberate: those debits are long settled.
+        "ALTER TABLE consume_dedup ADD COLUMN debit_token TEXT",
     ]
     for stmt in migrations:
         try:

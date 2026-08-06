@@ -36,6 +36,7 @@ Auth model:
 """
 
 import hmac
+import ipaddress
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -90,7 +91,9 @@ if PROXY_REFUND_TOKEN and len(PROXY_REFUND_TOKEN) < MIN_ADMIN_TOKEN_LEN:
 # Per-IP rate limits. Overridable via env for load tests. Consume/validate
 # get the higher tier because a single TEE proxy handles many end-users
 # from one source IP.
-RATE_LIMIT_CONSUME = os.getenv("RATE_LIMIT_CONSUME", "60/minute")
+# NOTE: consume/refund are deliberately NOT per-IP limited (see their route
+# definitions) — all users share the proxy's single source IP, so that bucket
+# would be a service-wide ceiling. They are limited per-identity by tiers.py.
 RATE_LIMIT_VALIDATE = os.getenv("RATE_LIMIT_VALIDATE", "120/minute")
 RATE_LIMIT_ADMIN = os.getenv("RATE_LIMIT_ADMIN", "30/minute")
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "20/minute")
@@ -137,11 +140,37 @@ async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
 # so a client-supplied "X-Forwarded-For: 1.2.3.4" reaches us as
 # "1.2.3.4, <real>". Reading either the first or last entry lets the
 # attacker rotate keys and defeat per-IP rate limits.
+# `X-Real-IP` is only meaningful when set by a reverse proxy we control (the
+# Caddyfile overwrites it with the real peer). Honouring a CLIENT-supplied
+# value destroys rate limiting entirely: rotate the header for a fresh bucket
+# per request, or pin one value to share — and lock out — every other user.
+#
+# This service is never published to the host (compose uses `expose`, not
+# `ports`), so a private-range peer is by construction one of our own
+# containers. Set TRUSTED_PROXY_IPS explicitly to narrow that further if the
+# service is ever exposed directly.
+TRUSTED_PROXY_IPS = frozenset(
+    ip.strip() for ip in os.getenv("TRUSTED_PROXY_IPS", "").split(",") if ip.strip()
+)
+
+
+def _peer_is_trusted_proxy(peer: str) -> bool:
+    if TRUSTED_PROXY_IPS:
+        return peer in TRUSTED_PROXY_IPS
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return addr.is_private or addr.is_loopback
+
+
 def _client_key(request: Request) -> str:
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return get_remote_address(request)
+    peer = get_remote_address(request)
+    if _peer_is_trusted_proxy(peer):
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            return real_ip.strip()
+    return peer
 
 
 limiter = Limiter(key_func=_client_key, default_limits=[RATE_LIMIT_DEFAULT])
@@ -229,8 +258,9 @@ class ConsumeRequest(BaseModel):
 class RefundRequest(BaseModel):
     credential_type: str
     credential_value: str
-    idempotency_key: str = Field(..., min_length=1,
-        description="The same key the failed consume was recorded under.")
+    debit_token: str = Field(..., min_length=1,
+        description="The one-shot token the debiting consume returned. A "
+                    "deduplicated consume returns none and cannot refund.")
     reason: str = Field("", description="Free-form audit note.")
 
 
@@ -346,57 +376,53 @@ async def validate(request: Request, req: ValidateRequest):
     return result
 
 
+# NO per-IP limit here on purpose. Every user's traffic arrives through the
+# one proxy container, so a per-IP bucket is really a service-wide ceiling:
+# it would cap the whole multi-tenant deployment at RATE_LIMIT_CONSUME
+# requests/minute in total and let one user starve everyone else. The
+# endpoint is already gated by the proxy token, and fairness between users
+# is enforced per-identity by `tier_limiter` below.
 @app.post("/v1/consume", dependencies=[Depends(require_proxy_token)])
-@limiter.limit(RATE_LIMIT_CONSUME)
 async def consume(request: Request, req: ConsumeRequest):
-    # Per-identity rate limit — applies to genuinely new debits only.
-    # Idempotent replays skip the limit because they're not new work
-    # (a network hiccup causing a retry shouldn't burn a legit user's
-    # quota). Resolving identity is cheap; the check happens BEFORE
-    # the DB write path so a rate-storm can't monopolise writes.
+    # Per-identity rate limit. Applies to replays too: a replay still costs
+    # the deployment a full upstream request, so exempting it would leave an
+    # unmetered, unlimited path for one identity to monopolise the queue.
     if req.credential_type in handlers.AUTHENTICATOR_CREDENTIAL_TYPES:
         identity_id = await handlers.lookup_identity(
             app.state.db, req.credential_type, req.credential_value,
         )
         if identity_id is not None:
-            already_debited = False
-            if req.idempotency_key:
-                cur = await app.state.db.execute(
-                    "SELECT 1 FROM consume_dedup "
-                    "WHERE identity_id = ? AND idempotency_key = ?",
-                    (identity_id, req.idempotency_key),
+            bal = await handlers.get_balance(app.state.db, identity_id)
+            tier = bal["tier"] if bal else "free"
+            allowed = await tier_limiter.check(identity_id, tier)
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"rate limit exceeded for identity (tier={tier})",
                 )
-                already_debited = await cur.fetchone() is not None
-
-            if not already_debited:
-                bal = await handlers.get_balance(app.state.db, identity_id)
-                tier = bal["tier"] if bal else "free"
-                allowed = await tier_limiter.check(identity_id, tier)
-                if not allowed:
-                    raise HTTPException(
-                        status_code=429,
-                        detail=f"rate limit exceeded for identity (tier={tier})",
-                    )
     return await handlers.consume(
         app.state.db, req.credential_type, req.credential_value,
         request_id=req.request_id, idempotency_key=req.idempotency_key,
     )
 
 
+# Same reasoning as /v1/consume: proxy-token gated, and a per-IP bucket here
+# would be a service-wide ceiling on refunds (which must never be dropped —
+# a lost refund is a user's credit lost).
 @app.post("/v1/refund", dependencies=[Depends(require_proxy_token)])
-@limiter.limit(RATE_LIMIT_CONSUME)
 async def refund(request: Request, req: RefundRequest):
-    """Reverse a prior consume identified by (credential, idempotency_key).
+    """Reverse the specific consume that minted `debit_token`.
 
-    Gated by PROXY_REFUND_TOKEN (TEE proxy's crash-recovery path) or
-    ADMIN_TOKEN (manual ops reversal) — NOT by knowledge of the api_key
-    hash, because a paying user knows their own hash + can compute the
-    deterministic idempotency_key from their own tx inputs and would then
-    refund-and-retry to unlimited free proofs.
+    Gated by PROXY_REFUND_TOKEN (proxy crash-recovery path) or ADMIN_TOKEN
+    (manual ops reversal) — NOT by knowledge of the api_key hash, because a
+    paying user knows their own hash and would refund-and-retry to unlimited
+    free work. The `debit_token` adds the second half of that guarantee:
+    even the trusted proxy can only reverse a debit it actually caused, so
+    a replayed request (which debits nothing) cannot mint a credit.
     """
     result = await handlers.refund(
         app.state.db, req.credential_type, req.credential_value,
-        req.idempotency_key, req.reason,
+        req.debit_token, req.reason,
     )
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "refund failed"))
