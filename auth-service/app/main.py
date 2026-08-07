@@ -10,7 +10,8 @@ Endpoints under `/v1`:
   POST /v1/credentials                    → add another credential to an identity (ADMIN)
   POST /v1/credentials/revoke             → revoke a credential (ADMIN)
   POST /v1/validate                       → check credential has balance (no debit)
-  POST /v1/consume                        → atomic debit of 1 credit (proxy token)
+  POST /v1/consume                        → atomic debit/hold of N millicredits (proxy token)
+  POST /v1/settle                         → finalize a hold at actual usage (proxy token)
   POST /v1/refund                         → reverse a prior consume (TEE proxy on crash)
   POST /v1/topup                          → credit a balance (ADMIN, payment layer)
   POST /v1/tier                           → change an identity's tier (ADMIN)
@@ -339,6 +340,25 @@ class ConsumeRequest(BaseModel):
         description="Deterministic client-side hash of the prove request. "
                     "Same key on the same identity returns cached balance "
                     "without debiting a second time.")
+    amount: int | None = Field(None, gt=0,
+        description="Millicredits to hold (1 credit = 1000 mc). Omit for the "
+                    "legacy flat rate of 1000 mc. Follow up with /v1/settle "
+                    "once actual usage is known.")
+
+
+class SettleRequest(BaseModel):
+    credential_type: str
+    credential_value: str
+    debit_token: str = Field(..., min_length=1,
+        description="The one-shot token the debiting consume returned. A "
+                    "deduplicated consume returns none and cannot settle.")
+    final_mc: int = Field(..., gt=0,
+        description="Final charge in millicredits, priced from actual token "
+                    "usage. The balance moves by (held − final).")
+    request_id: str | None = Field(None,
+        description="Optional correlation ID for the usage_log row.")
+    note: str = Field("",
+        description="Audit note — token counts and receipt id go here.")
 
 
 class RefundRequest(BaseModel):
@@ -352,7 +372,8 @@ class RefundRequest(BaseModel):
 
 class TopupRequest(BaseModel):
     identity_id: int
-    amount: int = Field(..., gt=0)
+    amount: int = Field(..., gt=0,
+        description="Millicredits to add (1 credit = 1000 mc).")
     source: str = Field(..., description="Provenance tag, e.g. 'nowpayments:PAYMENT_ID'.")
 
 
@@ -546,7 +567,37 @@ async def consume(request: Request, req: ConsumeRequest):
     return await handlers.consume(
         app.state.db, req.credential_type, req.credential_value,
         request_id=req.request_id, idempotency_key=req.idempotency_key,
+        amount=req.amount,
     )
+
+
+# Same reasoning as /v1/consume: proxy-token gated, no per-IP bucket — a
+# dropped settle either overcharges (estimate > actual) or undercharges
+# (actual > estimate) a real user, so it must never be rate-limited away.
+@app.post("/v1/settle", dependencies=[Depends(require_proxy_token)])
+async def settle(request: Request, req: SettleRequest):
+    """Finalize the hold that minted `debit_token` at the actual cost.
+
+    Gated like /v1/refund: only the Edge (proxy token) or ops (admin token)
+    may settle, and only with the one-shot token of a debit they actually
+    caused. Settle and refund are mutually exclusive per debit; replaying
+    the same settle is an idempotent no-op.
+    """
+    result = await handlers.settle(
+        app.state.db, req.credential_type, req.credential_value,
+        req.debit_token, req.final_mc,
+        request_id=req.request_id, note=req.note,
+    )
+    if not result.get("success"):
+        err = result.get("error", "settle failed")
+        if "no matching debit" in err or "credential not found" in err:
+            status_code = 404
+        elif "refunded" in err or "different amount" in err:
+            status_code = 409
+        else:
+            status_code = 400
+        raise HTTPException(status_code=status_code, detail=err)
+    return result
 
 
 # Same reasoning as /v1/consume: proxy-token gated, and a per-IP bucket here
