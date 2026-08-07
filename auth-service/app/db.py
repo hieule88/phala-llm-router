@@ -150,7 +150,21 @@ CREATE TABLE IF NOT EXISTS consume_dedup (
 
 CREATE INDEX IF NOT EXISTS idx_consume_dedup_identity
     ON consume_dedup(identity_id, created_at DESC);
+
+-- Tiny key-value store for schema-level facts that CREATE/ALTER replay
+-- can't express — currently just `ledger_unit`, which guards the one-shot
+-- credit→millicredit rescale (see _run_unit_rescale).
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+# The ledger's integer unit. 1 credit = 1000 millicredits (mc); the USDT peg
+# is unchanged (1 USDT = 100 credits = 100_000 mc, so 1 mc = $0.00001).
+# Guarded by schema_meta['ledger_unit'] — a DB whose row says anything else
+# (or predates the row) gets rescaled exactly once at startup.
+LEDGER_UNIT = "millicredit"
 
 
 async def init_db(path: str = DEFAULT_DB_PATH) -> aiosqlite.Connection:
@@ -196,22 +210,31 @@ async def init_db(path: str = DEFAULT_DB_PATH) -> aiosqlite.Connection:
     # Attach a serialisation lock so concurrent callers can't try to BEGIN
     # while another BEGIN/COMMIT block is in flight on the same connection.
     conn._tx_lock = asyncio.Lock()  # type: ignore[attr-defined]
-    # WAL mode allows concurrent readers while a write is in flight.
-    # Skip on in-memory DBs (not supported).
-    if path != ":memory:":
-        await conn.execute("PRAGMA journal_mode = WAL")
-        # busy_timeout tells SQLite to retry SQLITE_BUSY errors rather than
-        # surfacing them to the caller as 500s. Essential if the DB is ever
-        # opened by more than one process (a future multi-worker uvicorn
-        # deploy or an ops shell running side-by-side).
-        await conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-        # NORMAL synchronous mode is safe with WAL and materially faster
-        # than the default FULL — a crash may lose the last committed
-        # transaction but never corrupts the file.
-        await conn.execute("PRAGMA synchronous = NORMAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
-    await conn.executescript(SCHEMA)
-    await _run_light_migrations(conn)
+    # If anything past this point fails (bad schema, refused migration),
+    # close the connection before re-raising: aiosqlite connections are
+    # non-daemon threads, so a leaked one keeps the process alive forever
+    # after the startup error.
+    try:
+        # WAL mode allows concurrent readers while a write is in flight.
+        # Skip on in-memory DBs (not supported).
+        if path != ":memory:":
+            await conn.execute("PRAGMA journal_mode = WAL")
+            # busy_timeout tells SQLite to retry SQLITE_BUSY errors rather than
+            # surfacing them to the caller as 500s. Essential if the DB is ever
+            # opened by more than one process (a future multi-worker uvicorn
+            # deploy or an ops shell running side-by-side).
+            await conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            # NORMAL synchronous mode is safe with WAL and materially faster
+            # than the default FULL — a crash may lose the last committed
+            # transaction but never corrupts the file.
+            await conn.execute("PRAGMA synchronous = NORMAL")
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.executescript(SCHEMA)
+        await _run_light_migrations(conn)
+        await _run_unit_rescale(conn)
+    except BaseException:
+        await conn.close()
+        raise
     return conn
 
 
@@ -244,6 +267,13 @@ async def _run_light_migrations(conn: aiosqlite.Connection) -> None:
         # NULL means "not superseded"; rows predating this column are NULL and
         # so behave exactly as before.
         "ALTER TABLE credentials ADD COLUMN grace_until TIMESTAMP",
+        # Token-based billing (hold → settle). `amount_mc` is what this
+        # debit held (millicredits); `settled_mc`/`settled_at` record the
+        # final charge once actual usage is known. A row is exactly one of:
+        # held (both NULL), refunded (refunded_at set), or settled.
+        "ALTER TABLE consume_dedup ADD COLUMN amount_mc INTEGER",
+        "ALTER TABLE consume_dedup ADD COLUMN settled_mc INTEGER",
+        "ALTER TABLE consume_dedup ADD COLUMN settled_at TIMESTAMP",
     ]
     for stmt in migrations:
         try:
@@ -253,6 +283,56 @@ async def _run_light_migrations(conn: aiosqlite.Connection) -> None:
             # anything else is a real problem worth surfacing.
             if "duplicate column name" not in str(e).lower():
                 raise
+
+
+async def _run_unit_rescale(conn: aiosqlite.Connection) -> None:
+    """One-shot credit → millicredit rescale (×1000), guarded by
+    schema_meta['ledger_unit'].
+
+    Unlike the ALTER TABLE patches above, multiplying every amount by 1000
+    is NOT replay-safe, so it runs exactly once: the guard row is written in
+    the same transaction as the rescale, and a fresh (empty) DB just gets
+    the row with nothing to rescale.
+
+    Every amount column is rescaled — including usage_log history — so
+    SUM(usage_log.delta) per identity still reconciles against the live
+    balance, and the whole ledger speaks ONE unit. payment_intents.credits
+    is rescaled for all statuses for the same single-unit reason;
+    amount_cents is money, not credits, and is untouched. Pre-existing
+    consume_dedup rows are backfilled with amount_mc = 1000 (the old flat
+    1 credit) so a post-migration /v1/refund of a pre-migration debit
+    reverses exactly what was held.
+    """
+    cur = await conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'ledger_unit'",
+    )
+    row = await cur.fetchone()
+    if row is not None and row[0] == LEDGER_UNIT:
+        return
+    if row is not None:
+        raise RuntimeError(
+            f"schema_meta.ledger_unit = {row[0]!r} is unknown to this build "
+            f"(expected absent or {LEDGER_UNIT!r}) — refusing to guess a "
+            "conversion; the DB was written by a newer/foreign version.",
+        )
+    async with transaction(conn):
+        await conn.execute("UPDATE balances SET balance = balance * 1000")
+        await conn.execute(
+            "UPDATE usage_log SET delta = delta * 1000, "
+            "balance_after = balance_after * 1000",
+        )
+        await conn.execute(
+            "UPDATE consume_dedup SET balance_after = balance_after * 1000, "
+            "amount_mc = COALESCE(amount_mc, 1000)",
+        )
+        await conn.execute("UPDATE topups SET amount = amount * 1000")
+        await conn.execute(
+            "UPDATE payment_intents SET credits = credits * 1000",
+        )
+        await conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('ledger_unit', ?)",
+            (LEDGER_UNIT,),
+        )
 
 
 @asynccontextmanager

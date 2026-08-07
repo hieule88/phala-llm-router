@@ -43,6 +43,28 @@ if CENTS_PER_CREDIT <= 0:
         f"CENTS_PER_CREDIT must be > 0 (got {CENTS_PER_CREDIT})",
     )
 
+# The ledger stores millicredits: 1 credit = 1000 mc (see db.LEDGER_UNIT).
+# User-facing surfaces (payment intents, docs) keep whole credits; this is
+# the only conversion constant between the two.
+MC_PER_CREDIT = 1000
+
+# A consume without an explicit amount debits exactly the old flat rate
+# (1 credit), so callers that predate token billing — the deployed Edge,
+# the TEE prover — keep working unchanged against a rescaled ledger.
+DEFAULT_CONSUME_AMOUNT_MC = 1 * MC_PER_CREDIT
+
+# Ceiling on a single hold. Caps the damage of an Edge estimator bug or a
+# compromised proxy token to $1/request (at the 1 mc = $0.00001 peg) rather
+# than an entire balance. The settle ceiling is higher because a final
+# charge may legitimately exceed the hold when the estimate ran low.
+CONSUME_MAX_MC = int(os.getenv("CONSUME_MAX_MC", "100000"))
+SETTLE_MAX_MC = int(os.getenv("SETTLE_MAX_MC", str(10 * CONSUME_MAX_MC)))
+
+if CONSUME_MAX_MC <= 0:
+    raise RuntimeError(f"CONSUME_MAX_MC must be > 0 (got {CONSUME_MAX_MC})")
+if SETTLE_MAX_MC <= 0:
+    raise RuntimeError(f"SETTLE_MAX_MC must be > 0 (got {SETTLE_MAX_MC})")
+
 # Providers that create_intent is allowed to record. Anything else is a
 # routing-info lie or a log-injection attempt and is refused up front.
 ALLOWED_PROVIDERS = frozenset({"manual", "nowpayments", "onchain"})
@@ -359,6 +381,7 @@ async def validate(
         "valid": True,
         "identity_id": identity_id,
         "balance": bal["balance"],
+        "unit": "millicredit",
         "tier": bal["tier"],
     }
 
@@ -369,18 +392,26 @@ async def consume(
     credential_value: str,
     request_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    amount: Optional[int] = None,
 ) -> dict:
-    """Atomically decrement balance by 1.
+    """Atomically decrement balance by `amount` millicredits (a HOLD).
+
+    `amount` defaults to DEFAULT_CONSUME_AMOUNT_MC (= the old flat 1 credit)
+    so pre-token-billing callers keep their exact semantics. The hold must
+    be fully covered (`balance >= amount`) — a later `settle()` converts it
+    into the final charge and returns the difference.
 
     Returns:
-        {success: True, identity_id, balance}  on success (balance is the
-                                                value AFTER the decrement)
+        {success: True, identity_id, balance, amount, unit}  on success
+                                    (balance is the value AFTER the decrement)
         {success: True, ..., deduplicated: True} on idempotent replay
-        {success: False, error: <reason>}      otherwise
+        {success: False, error: <reason>}      otherwise; an insufficient
+                                    balance also reports required_mc/balance_mc
+                                    so the caller can render a useful 402.
 
-    Atomicity: the UPDATE with `balance > 0` filter ensures that two
-    concurrent consume calls on the same identity with balance=1 cannot
-    both succeed — exactly one wins, the other sees zero rows updated.
+    Atomicity: the UPDATE with `balance >= amount` filter ensures that two
+    concurrent consume calls on the same identity cannot overdraw —
+    a loser sees zero rows updated.
 
     Idempotency: when the caller passes `idempotency_key` (typically a
     deterministic hash of the prove request the client is retrying),
@@ -393,6 +424,11 @@ async def consume(
     """
     if credential_type not in AUTHENTICATOR_CREDENTIAL_TYPES:
         return {"success": False, "error": "credential not found"}
+    if amount is None:
+        amount = DEFAULT_CONSUME_AMOUNT_MC
+    if not (0 < amount <= CONSUME_MAX_MC):
+        return {"success": False,
+                "error": f"amount must be in 1..{CONSUME_MAX_MC} mc (got {amount})"}
     async with transaction(conn):
         identity_id = await lookup_identity(conn, credential_type, credential_value)
         if identity_id is None:
@@ -428,14 +464,19 @@ async def consume(
 
         cur = await conn.execute(
             "UPDATE balances "
-            "SET balance = balance - 1, updated_at = CURRENT_TIMESTAMP "
-            "WHERE identity_id = ? AND balance > 0 "
+            "SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE identity_id = ? AND balance >= ? "
             "RETURNING balance",
-            (identity_id,),
+            (amount, identity_id, amount),
         )
         row = await cur.fetchone()
         if not row:
-            return {"success": False, "error": "insufficient balance"}
+            # Report how much was needed vs available so the front can
+            # render an actionable 402 instead of a bare denial.
+            bal = await get_balance(conn, identity_id)
+            return {"success": False, "error": "insufficient balance",
+                    "required_mc": amount,
+                    "balance_mc": bal["balance"] if bal else 0}
         new_balance = row[0]
 
         # One-shot capability for reversing THIS debit. Only the caller that
@@ -447,14 +488,17 @@ async def consume(
             if existing_dedup is not None:
                 # Refunded or TTL-stale row from a prior cycle — reactivate
                 # it in-place. created_at is refreshed so the audit trail
-                # (and the next replay window) starts at THIS debit, and the
-                # token is rotated so the previous cycle's token is dead.
+                # (and the next replay window) starts at THIS debit, the
+                # token is rotated so the previous cycle's token is dead,
+                # and the settle state is cleared so THIS cycle's settle
+                # isn't short-circuited by the previous cycle's.
                 await conn.execute(
                     "UPDATE consume_dedup "
                     "SET balance_after = ?, refunded_at = NULL, "
-                    "    created_at = CURRENT_TIMESTAMP, debit_token = ? "
+                    "    created_at = CURRENT_TIMESTAMP, debit_token = ?, "
+                    "    amount_mc = ?, settled_mc = NULL, settled_at = NULL "
                     "WHERE id = ?",
-                    (new_balance, debit_token, existing_dedup[0]),
+                    (new_balance, debit_token, amount, existing_dedup[0]),
                 )
             else:
                 # Fresh key — UNIQUE(identity_id, idempotency_key) guarantees
@@ -465,23 +509,132 @@ async def consume(
                 # the SELECT above.
                 await conn.execute(
                     "INSERT INTO consume_dedup "
-                    "  (identity_id, idempotency_key, balance_after, debit_token) "
-                    "VALUES (?, ?, ?, ?)",
-                    (identity_id, idempotency_key, new_balance, debit_token),
+                    "  (identity_id, idempotency_key, balance_after, "
+                    "   debit_token, amount_mc) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (identity_id, idempotency_key, new_balance,
+                     debit_token, amount),
                 )
 
         await conn.execute(
             "INSERT INTO usage_log "
             "  (identity_id, operation, request_id, delta, balance_after, note) "
-            "VALUES (?, 'prove', ?, -1, ?, ?)",
-            (identity_id, request_id, new_balance,
+            "VALUES (?, 'prove', ?, ?, ?, ?)",
+            (identity_id, request_id, -amount, new_balance,
              f"idem={idempotency_key}" if idempotency_key else None),
         )
-        result = {"success": True, "identity_id": identity_id, "balance": new_balance}
+        result = {"success": True, "identity_id": identity_id,
+                  "balance": new_balance, "amount": amount,
+                  "unit": "millicredit"}
         if idempotency_key:
             # Only a real debit hands back the reversal capability.
             result["debit_token"] = debit_token
         return result
+
+
+async def settle(
+    conn: aiosqlite.Connection,
+    credential_type: str,
+    credential_value: str,
+    debit_token: str,
+    final_mc: int,
+    request_id: Optional[str] = None,
+    note: str = "",
+) -> dict:
+    """Convert the hold that minted `debit_token` into its final charge.
+
+    The Edge holds an estimate at consume time, then calls this once actual
+    token usage is known (from the gateway's signed receipt): the balance
+    moves by `amount_mc - final_mc` — back to the user when the estimate ran
+    high, a further debit when it ran low. A low estimate may push the
+    balance negative; that identity is then blocked by consume's
+    `balance >= amount` gate until they top up, so the exposure is bounded
+    by one in-flight request per idempotency cycle.
+
+    Authorised by the same one-shot `debit_token` as refund, and for the
+    same reason: an idempotent consume replay received no token, so it can
+    neither settle work it never paid for nor re-settle someone else's.
+
+    State machine per dedup row: settle and refund are mutually exclusive
+    and each terminal — a refunded debit cannot be settled (the failure
+    paths that refund all happen before usage exists), and a settled debit
+    cannot be refunded or re-settled at a different amount. Replaying the
+    SAME settle is an idempotent no-op (`deduplicated: true`).
+
+    `note` lands in usage_log — the Edge puts the token counts and receipt
+    id there, making usage_log the durable per-request usage record.
+    """
+    if credential_type not in AUTHENTICATOR_CREDENTIAL_TYPES:
+        return {"success": False, "error": "credential not found"}
+    if not debit_token:
+        return {"success": False, "error": "debit_token required"}
+    if not (0 < final_mc <= SETTLE_MAX_MC):
+        return {"success": False,
+                "error": f"final_mc must be in 1..{SETTLE_MAX_MC} mc (got {final_mc})"}
+
+    async with transaction(conn):
+        identity_id = await lookup_identity(conn, credential_type, credential_value)
+        if identity_id is None:
+            return {"success": False, "error": "credential not found"}
+
+        cur = await conn.execute(
+            "SELECT id, amount_mc, refunded_at, settled_mc, settled_at, "
+            "       idempotency_key "
+            "FROM consume_dedup "
+            "WHERE identity_id = ? AND debit_token = ?",
+            (identity_id, debit_token),
+        )
+        dedup = await cur.fetchone()
+        if not dedup:
+            return {"success": False, "error": "no matching debit to settle"}
+        dedup_id, amount_mc, refunded_at, settled_mc, settled_at, idem = dedup
+
+        if refunded_at is not None:
+            return {"success": False, "error": "debit was refunded"}
+        if settled_at is not None:
+            if settled_mc == final_mc:
+                # Idempotent replay of the same settle.
+                bal = await get_balance(conn, identity_id)
+                return {"success": True, "identity_id": identity_id,
+                        "balance": bal["balance"] if bal else 0,
+                        "final_mc": final_mc, "deduplicated": True}
+            return {"success": False,
+                    "error": f"already settled with different amount "
+                             f"({settled_mc} mc, got {final_mc} mc)"}
+
+        # Rows predating the amount_mc column were backfilled by the unit
+        # rescale; COALESCE is belt-and-braces for a DB that somehow skipped it.
+        held_mc = amount_mc if amount_mc is not None else DEFAULT_CONSUME_AMOUNT_MC
+        delta = held_mc - final_mc
+
+        cur = await conn.execute(
+            "UPDATE balances "
+            "SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE identity_id = ? RETURNING balance",
+            (delta, identity_id),
+        )
+        row = await cur.fetchone()
+        new_balance = row[0] if row else 0
+
+        await conn.execute(
+            "UPDATE consume_dedup "
+            "SET settled_mc = ?, settled_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (final_mc, dedup_id),
+        )
+        await conn.execute(
+            "INSERT INTO usage_log "
+            "  (identity_id, operation, request_id, delta, balance_after, note) "
+            "VALUES (?, 'settle', ?, ?, ?, ?)",
+            (identity_id, request_id, delta, new_balance,
+             ";".join(filter(None, [f"idem={idem}" if idem else None,
+                                    f"held={held_mc}", f"final={final_mc}",
+                                    note or None]))),
+        )
+        return {"success": True, "identity_id": identity_id,
+                "balance": new_balance, "held_mc": held_mc,
+                "final_mc": final_mc, "delta_mc": delta,
+                "unit": "millicredit"}
 
 
 async def topup(
@@ -617,14 +770,22 @@ async def refund(
         # previous consume→refund cycle no longer matches (consume rotates
         # it), so a stale token cannot reverse the current debit either.
         cur = await conn.execute(
-            "SELECT id, refunded_at, idempotency_key FROM consume_dedup "
+            "SELECT id, refunded_at, idempotency_key, amount_mc, settled_at "
+            "FROM consume_dedup "
             "WHERE identity_id = ? AND debit_token = ?",
             (identity_id, debit_token),
         )
         dedup = await cur.fetchone()
         if not dedup:
             return {"success": False, "error": "no matching debit to refund"}
-        dedup_id, already_refunded_at, idempotency_key = dedup
+        dedup_id, already_refunded_at, idempotency_key, amount_mc, settled_at = dedup
+
+        if settled_at is not None:
+            # A settled debit is final — every failure path that refunds
+            # (gateway unreachable, ≥400, missing identity) happens before
+            # usage exists, so a refund arriving after settle is a logic
+            # error or a replay, never a legitimate reversal.
+            return {"success": False, "error": "debit already settled"}
 
         if already_refunded_at is not None:
             # Idempotent replay: this specific debit's refund already ran.
@@ -650,10 +811,14 @@ async def refund(
             (dedup_id,),
         )
 
+        # Reverse exactly what the consume held. Rows predating amount_mc
+        # were backfilled to 1000 by the unit rescale; COALESCE guards a DB
+        # that somehow skipped it.
+        refund_mc = amount_mc if amount_mc is not None else DEFAULT_CONSUME_AMOUNT_MC
         cur = await conn.execute(
-            "UPDATE balances SET balance = balance + 1, updated_at = CURRENT_TIMESTAMP "
+            "UPDATE balances SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE identity_id = ? RETURNING balance",
-            (identity_id,),
+            (refund_mc, identity_id),
         )
         row = await cur.fetchone()
         new_balance = row[0] if row else 0
@@ -661,8 +826,9 @@ async def refund(
         await conn.execute(
             "INSERT INTO usage_log "
             "  (identity_id, operation, delta, balance_after, note) "
-            "VALUES (?, 'refund', +1, ?, ?)",
-            (identity_id, new_balance, f"idem={idempotency_key} reason={reason}"),
+            "VALUES (?, 'refund', ?, ?, ?)",
+            (identity_id, refund_mc, new_balance,
+             f"idem={idempotency_key} reason={reason}"),
         )
         return {
             "success": True,
@@ -693,6 +859,10 @@ async def create_intent(
     from `credits × CENTS_PER_CREDIT` — the client never picks the
     price. Otherwise a user could ask for 1M credits at 1¢.
 
+    `credits` is in WHOLE credits (the user-facing unit); the row stores
+    millicredits (`credits × MC_PER_CREDIT`) because mark_paid mints the
+    stored value straight into the mc ledger.
+
     Returns a random opaque `memo` the user must include as a
     reference/tag when they pay. Deduplication at mark_paid time
     piggybacks on `topups.source` UNIQUE (memo == source).
@@ -703,6 +873,7 @@ async def create_intent(
         return {"success": False, "error": f"unknown provider {provider!r}"}
 
     amount_cents = credits * CENTS_PER_CREDIT
+    credits_mc = credits * MC_PER_CREDIT
 
     async with transaction(conn):
         cur = await conn.execute(
@@ -722,7 +893,7 @@ async def create_intent(
             "VALUES (?, ?, ?, ?, ?, 'pending', "
             "        datetime(CURRENT_TIMESTAMP, ?)) "
             "RETURNING id, expires_at",
-            (identity_id, credits, amount_cents, memo, provider, expires_modifier),
+            (identity_id, credits_mc, amount_cents, memo, provider, expires_modifier),
         )
         row = await cur.fetchone()
         return {
@@ -730,6 +901,7 @@ async def create_intent(
             "intent_id": row[0],
             "identity_id": identity_id,
             "credits": credits,
+            "credits_mc": credits_mc,
             "amount_cents": amount_cents,
             "memo": memo,
             "provider": provider,
@@ -741,7 +913,12 @@ async def create_intent(
 async def get_intent_by_memo(
     conn: aiosqlite.Connection, memo: str,
 ) -> Optional[dict]:
-    """Look up an intent by its opaque memo. Returns None if not found."""
+    """Look up an intent by its opaque memo. Returns None if not found.
+
+    The stored `credits` column is millicredits (see create_intent);
+    `credits` in the returned dict stays the user-facing whole-credit
+    number so HTTP responses built from it keep their historical meaning.
+    """
     cur = await conn.execute(
         "SELECT id, identity_id, credits, amount_cents, memo, provider, "
         "       provider_ref, status, created_at, paid_at, expires_at "
@@ -754,7 +931,8 @@ async def get_intent_by_memo(
     return {
         "intent_id": row[0],
         "identity_id": row[1],
-        "credits": row[2],
+        "credits": row[2] // MC_PER_CREDIT,
+        "credits_mc": row[2],
         "amount_cents": row[3],
         "memo": row[4],
         "provider": row[5],
@@ -802,7 +980,9 @@ async def mark_paid_by_memo(
         row = await cur.fetchone()
         if not row:
             return {"success": False, "error": "intent not found"}
-        intent_id, identity_id, credits, expected_cents, status, _exp, is_expired = row
+        # `credits` column stores millicredits (see create_intent) — it is
+        # minted 1:1 into the mc ledger below.
+        intent_id, identity_id, credits_mc, expected_cents, status, _exp, is_expired = row
 
         # Lazy expiry sweep: flip the row to 'expired' the first time
         # anyone tries to mark it paid after the deadline. Webhook path
@@ -840,7 +1020,7 @@ async def mark_paid_by_memo(
         cur = await conn.execute(
             "INSERT OR IGNORE INTO topups (identity_id, amount, source) "
             "VALUES (?, ?, ?)",
-            (identity_id, credits, memo),
+            (identity_id, credits_mc, memo),
         )
         credited_now = cur.rowcount > 0
         if credited_now:
@@ -848,7 +1028,7 @@ async def mark_paid_by_memo(
                 "UPDATE balances "
                 "SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP "
                 "WHERE identity_id = ?",
-                (credits, identity_id),
+                (credits_mc, identity_id),
             )
             await conn.execute(
                 "INSERT INTO usage_log "
@@ -856,7 +1036,7 @@ async def mark_paid_by_memo(
                 "VALUES (?, 'topup', ?, "
                 "        (SELECT balance FROM balances WHERE identity_id = ?), "
                 "        ?)",
-                (identity_id, credits, identity_id, f"intent={memo}"),
+                (identity_id, credits_mc, identity_id, f"intent={memo}"),
             )
 
         await conn.execute(
@@ -876,7 +1056,8 @@ async def mark_paid_by_memo(
             "success": True,
             "intent_id": intent_id,
             "identity_id": identity_id,
-            "credits": credits,
+            "credits": credits_mc // MC_PER_CREDIT,
+            "credits_mc": credits_mc,
             "balance": bal_row[0] if bal_row else 0,
             "status": "paid",
         }

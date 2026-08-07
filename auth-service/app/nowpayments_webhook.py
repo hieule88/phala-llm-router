@@ -228,5 +228,8 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
     identity_id = _extract_identity_id(payload)
     credits = _usd_to_credits(price_amount, price_currency)
     source = f"nowpayments:{payment_id}"
-    result = await handlers.topup(conn, identity_id, credits, source)
+    # The ledger stores millicredits; _usd_to_credits works in whole credits.
+    result = await handlers.topup(
+        conn, identity_id, credits * handlers.MC_PER_CREDIT, source,
+    )
     return {"handled": True, "payment_status": status, "result": result}

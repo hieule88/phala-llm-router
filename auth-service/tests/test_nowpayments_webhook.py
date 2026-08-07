@@ -131,7 +131,7 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         result = self._run({"order_id": "identity:1", "price_amount": 10.0})
         self.assertTrue(result["handled"])
         self.assertTrue(result["result"]["success"])
-        self.assertEqual(result["result"]["balance"], 1000)  # $10 * 100 = 1000 credits
+        self.assertEqual(result["result"]["balance"], 1000 * 1000)  # $10 = 1000 credits = 1M mc
 
     def test_replay_deduplicates(self):
         from app.db import init_db
@@ -149,8 +149,8 @@ class DispatchTest(SetupMixin, unittest.TestCase):
                 await conn.close()
 
         r1, r2 = run(go())
-        self.assertEqual(r1["result"]["balance"], 1000)
-        self.assertEqual(r2["result"]["balance"], 1000)
+        self.assertEqual(r1["result"]["balance"], 1000 * 1000)
+        self.assertEqual(r2["result"]["balance"], 1000 * 1000)
         self.assertTrue(r2["result"].get("deduplicated"))
 
     def test_waiting_status_is_acknowledged_not_credited(self):

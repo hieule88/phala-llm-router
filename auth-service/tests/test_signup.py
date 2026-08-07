@@ -26,6 +26,9 @@ os.environ.setdefault("AUTH_DB_PATH", ":memory:")
 from app import handlers  # noqa: E402
 from app.db import init_db  # noqa: E402
 
+# The ledger stores millicredits (1 credit = 1000 mc).
+MC = handlers.MC_PER_CREDIT
+
 
 def run(coro):
     loop = asyncio.new_event_loop()
@@ -108,10 +111,10 @@ class SignupHandlerTest(unittest.TestCase):
                 self.assertFalse(spent["success"])
                 self.assertIn("balance", spent["error"])
 
-                await handlers.topup(conn, res["identity_id"], 2, source="test")
+                await handlers.topup(conn, res["identity_id"], 2 * MC, source="test")
                 spent = await handlers.consume(conn, "api_key", key_hash)
                 self.assertTrue(spent["success"])
-                self.assertEqual(spent["balance"], 1)
+                self.assertEqual(spent["balance"], 1 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -135,19 +138,19 @@ class RotateKeyHandlerTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 first = await handlers.signup(conn)
-                await handlers.topup(conn, first["identity_id"], 250, source="paid")
+                await handlers.topup(conn, first["identity_id"], 250 * MC, source="paid")
 
                 rotated = await handlers.rotate_api_key(conn, first["api_key"])
                 self.assertTrue(rotated["success"])
                 self.assertEqual(rotated["identity_id"], first["identity_id"])
-                self.assertEqual(rotated["balance"], 250)
+                self.assertEqual(rotated["balance"], 250 * MC)
                 self.assertNotEqual(rotated["api_key"], first["api_key"])
 
                 # New key spends the money the old key paid for.
                 spent = await handlers.consume(
                     conn, "api_key", handlers.hash_api_key(rotated["api_key"]))
                 self.assertTrue(spent["success"])
-                self.assertEqual(spent["balance"], 249)
+                self.assertEqual(spent["balance"], 249 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -157,7 +160,7 @@ class RotateKeyHandlerTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 first = await handlers.signup(conn)
-                await handlers.topup(conn, first["identity_id"], 10, source="paid")
+                await handlers.topup(conn, first["identity_id"], 10 * MC, source="paid")
                 with patch.object(handlers, "ROTATE_GRACE_SECONDS", 0):
                     await handlers.rotate_api_key(conn, first["api_key"])
 
@@ -228,7 +231,7 @@ class RotationGraceTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 first = await handlers.signup(conn)
-                await handlers.topup(conn, first["identity_id"], 500, source="paid")
+                await handlers.topup(conn, first["identity_id"], 500 * MC, source="paid")
                 res = await handlers.rotate_api_key(conn, first["api_key"])
                 self.assertIsNotNone(res["old_key_valid_until"])
 
@@ -247,12 +250,12 @@ class RotationGraceTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 first = await handlers.signup(conn)
-                await handlers.topup(conn, first["identity_id"], 500, source="paid")
+                await handlers.topup(conn, first["identity_id"], 500 * MC, source="paid")
                 lost = await handlers.rotate_api_key(conn, first["api_key"])
 
                 retry = await handlers.rotate_api_key(conn, first["api_key"])
                 self.assertTrue(retry["success"])
-                self.assertEqual(retry["balance"], 500)
+                self.assertEqual(retry["balance"], 500 * MC)
 
                 # The key from the lost response is an orphan nobody holds; it
                 # must not stay in the authenticating set.

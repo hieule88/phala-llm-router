@@ -19,6 +19,10 @@ from app.db import init_db  # noqa: E402
 from app.tier_limit import TierRateLimiter  # noqa: E402
 from app.tiers import TIERS, get_tier  # noqa: E402
 
+# The ledger stores millicredits (1 credit = 1000 mc); a consume without
+# an explicit amount debits the legacy flat rate of 1 credit = 1 * MC.
+MC = handlers.MC_PER_CREDIT
+
 
 def run(coro):
     """Run a coroutine on a fresh event loop and clean up.
@@ -127,12 +131,12 @@ class ConsumeDedupTtlTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 5, source="test")
+                await handlers.topup(conn, ident, 5 * MC, source="test")
                 r1 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
                 r2 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
-                self.assertEqual(r1["balance"], 4)
+                self.assertEqual(r1["balance"], 4 * MC)
                 self.assertTrue(r2.get("deduplicated"))
-                self.assertEqual(r2["balance"], 4)      # no second debit
+                self.assertEqual(r2["balance"], 4 * MC)  # no second debit
             finally:
                 await conn.close()
         run(go())
@@ -142,7 +146,7 @@ class ConsumeDedupTtlTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 5, source="test")
+                await handlers.topup(conn, ident, 5 * MC, source="test")
                 await handlers.consume(conn, "api_key", "k", idempotency_key="same")
                 # Age the dedup row past the replay window.
                 await conn.execute(
@@ -153,11 +157,11 @@ class ConsumeDedupTtlTest(unittest.TestCase):
                 r2 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
                 self.assertTrue(r2["success"])
                 self.assertFalse(r2.get("deduplicated"))
-                self.assertEqual(r2["balance"], 3)      # debited again
+                self.assertEqual(r2["balance"], 3 * MC)  # debited again
                 # And the refreshed row replays free again within the new window.
                 r3 = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
                 self.assertTrue(r3.get("deduplicated"))
-                self.assertEqual(r3["balance"], 3)
+                self.assertEqual(r3["balance"], 3 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -169,10 +173,10 @@ class ConsumeTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 5, source="test")
+                await handlers.topup(conn, ident, 5 * MC, source="test")
                 r = await handlers.consume(conn, "api_key", "k")
                 self.assertTrue(r["success"])
-                self.assertEqual(r["balance"], 4)
+                self.assertEqual(r["balance"], 4 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -182,8 +186,8 @@ class ConsumeTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 3, source="test")
-                for expected in (2, 1, 0):
+                await handlers.topup(conn, ident, 3 * MC, source="test")
+                for expected in (2 * MC, 1 * MC, 0):
                     r = await handlers.consume(conn, "api_key", "k")
                     self.assertTrue(r["success"])
                     self.assertEqual(r["balance"], expected)
@@ -210,7 +214,7 @@ class ConsumeTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 await handlers.consume(conn, "api_key", "k", request_id="req-001")
 
                 cur = await conn.execute(
@@ -222,11 +226,11 @@ class ConsumeTest(unittest.TestCase):
                 # 1 topup + 1 prove
                 self.assertEqual(len(rows), 2)
                 self.assertEqual(rows[0][0], "topup")
-                self.assertEqual(rows[0][1], 10)
+                self.assertEqual(rows[0][1], 10 * MC)
                 self.assertEqual(rows[1][0], "prove")
-                self.assertEqual(rows[1][1], -1)
+                self.assertEqual(rows[1][1], -1 * MC)
                 self.assertEqual(rows[1][2], "req-001")
-                self.assertEqual(rows[1][3], 9)
+                self.assertEqual(rows[1][3], 9 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -278,16 +282,16 @@ class RefundTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 c = await handlers.consume(conn, "api_key", "k", idempotency_key="idem_x")
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 9,
+                    (await handlers.get_balance(conn, ident))["balance"], 9 * MC,
                 )
                 r = await handlers.refund(conn, "api_key", "k",
                                           debit_token=c["debit_token"],
                                           reason="upstream crash")
                 self.assertTrue(r["success"])
-                self.assertEqual(r["balance"], 10)
+                self.assertEqual(r["balance"], 10 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -297,7 +301,7 @@ class RefundTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 c = await handlers.consume(conn, "api_key", "k", idempotency_key="ix")
                 await handlers.refund(conn, "api_key", "k", debit_token=c["debit_token"])
                 r2 = await handlers.refund(conn, "api_key", "k", debit_token=c["debit_token"])
@@ -305,7 +309,7 @@ class RefundTest(unittest.TestCase):
                 self.assertTrue(r2.get("deduplicated"))
                 # Still 10, not 11.
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 10,
+                    (await handlers.get_balance(conn, ident))["balance"], 10 * MC,
                 )
             finally:
                 await conn.close()
@@ -331,13 +335,13 @@ class RefundTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 c = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
                 await handlers.refund(conn, "api_key", "k", debit_token=c["debit_token"])
                 r = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
                 self.assertTrue(r["success"])
                 self.assertFalse(r.get("deduplicated"))
-                self.assertEqual(r["balance"], 9)
+                self.assertEqual(r["balance"], 9 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -350,26 +354,26 @@ class RefundTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 # Cycle 1: consume then refund.
                 c1 = await handlers.consume(conn, "api_key", "k", idempotency_key="k1")
                 r1 = await handlers.refund(conn, "api_key", "k", debit_token=c1["debit_token"])
                 self.assertTrue(r1["success"])
                 self.assertFalse(r1.get("deduplicated"))
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 10,
+                    (await handlers.get_balance(conn, ident))["balance"], 10 * MC,
                 )
                 # Cycle 2: same key, consume+refund again. Must credit back.
                 c2 = await handlers.consume(conn, "api_key", "k", idempotency_key="k1")
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 9,
+                    (await handlers.get_balance(conn, ident))["balance"], 9 * MC,
                 )
                 r2 = await handlers.refund(conn, "api_key", "k", debit_token=c2["debit_token"])
                 self.assertTrue(r2["success"])
                 self.assertFalse(r2.get("deduplicated"),
                                  "second cycle's refund was silently deduped")
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 10,
+                    (await handlers.get_balance(conn, ident))["balance"], 10 * MC,
                 )
             finally:
                 await conn.close()
@@ -387,9 +391,9 @@ class RefundCapabilityTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 5, source="test")
+                await handlers.topup(conn, ident, 5 * MC, source="test")
                 first = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
-                self.assertEqual(first["balance"], 4)
+                self.assertEqual(first["balance"], 4 * MC)
                 self.assertTrue(first.get("debit_token"))
 
                 replay = await handlers.consume(conn, "api_key", "k", idempotency_key="same")
@@ -401,7 +405,7 @@ class RefundCapabilityTest(unittest.TestCase):
                 # idempotency key alone must not work as one.
                 bad = await handlers.refund(conn, "api_key", "k", debit_token="same")
                 self.assertFalse(bad["success"])
-                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4)
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -413,19 +417,19 @@ class RefundCapabilityTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 5, source="test")
+                await handlers.topup(conn, ident, 5 * MC, source="test")
                 c1 = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
                 await handlers.refund(conn, "api_key", "k", debit_token=c1["debit_token"])
-                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 5)
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 5 * MC)
 
                 c2 = await handlers.consume(conn, "api_key", "k", idempotency_key="i")
                 self.assertNotEqual(c1["debit_token"], c2["debit_token"])
-                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4)
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4 * MC)
 
                 stale = await handlers.refund(conn, "api_key", "k",
                                               debit_token=c1["debit_token"])
                 self.assertFalse(stale["success"])
-                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4)
+                self.assertEqual((await handlers.get_balance(conn, ident))["balance"], 4 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -437,14 +441,14 @@ class RefundCapabilityTest(unittest.TestCase):
                 a = await handlers.create_identity(conn, "api_key", "ka")
                 b = await handlers.create_identity(conn, "api_key", "kb")
                 # Distinct sources: `source` is UNIQUE (topup idempotency).
-                await handlers.topup(conn, a, 5, source="test-a")
-                await handlers.topup(conn, b, 5, source="test-b")
+                await handlers.topup(conn, a, 5 * MC, source="test-a")
+                await handlers.topup(conn, b, 5 * MC, source="test-b")
                 ca = await handlers.consume(conn, "api_key", "ka", idempotency_key="x")
                 # B presents A's token: scoped per identity, so it must miss.
                 r = await handlers.refund(conn, "api_key", "kb",
                                           debit_token=ca["debit_token"])
                 self.assertFalse(r["success"])
-                self.assertEqual((await handlers.get_balance(conn, b))["balance"], 5)
+                self.assertEqual((await handlers.get_balance(conn, b))["balance"], 5 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -459,19 +463,19 @@ class ConsumeIdempotencyTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 r1 = await handlers.consume(conn, "api_key", "k",
                                             idempotency_key="idem_abc")
                 r2 = await handlers.consume(conn, "api_key", "k",
                                             idempotency_key="idem_abc")
                 self.assertTrue(r1["success"])
                 self.assertTrue(r2["success"])
-                self.assertEqual(r1["balance"], 9)
-                self.assertEqual(r2["balance"], 9)
+                self.assertEqual(r1["balance"], 9 * MC)
+                self.assertEqual(r2["balance"], 9 * MC)
                 self.assertTrue(r2.get("deduplicated"))
                 # Real balance in the DB is 9 (single debit).
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 9,
+                    (await handlers.get_balance(conn, ident))["balance"], 9 * MC,
                 )
             finally:
                 await conn.close()
@@ -482,11 +486,11 @@ class ConsumeIdempotencyTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 await handlers.consume(conn, "api_key", "k", idempotency_key="a")
                 r = await handlers.consume(conn, "api_key", "k", idempotency_key="b")
                 self.assertTrue(r["success"])
-                self.assertEqual(r["balance"], 8)
+                self.assertEqual(r["balance"], 8 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -498,11 +502,11 @@ class ConsumeIdempotencyTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="test")
+                await handlers.topup(conn, ident, 10 * MC, source="test")
                 r1 = await handlers.consume(conn, "api_key", "k")
                 r2 = await handlers.consume(conn, "api_key", "k")
-                self.assertEqual(r1["balance"], 9)
-                self.assertEqual(r2["balance"], 8)
+                self.assertEqual(r1["balance"], 9 * MC)
+                self.assertEqual(r2["balance"], 8 * MC)
             finally:
                 await conn.close()
         run(go())
@@ -515,14 +519,14 @@ class ConsumeIdempotencyTest(unittest.TestCase):
             try:
                 a = await handlers.create_identity(conn, "api_key", "ka")
                 b = await handlers.create_identity(conn, "api_key", "kb")
-                await handlers.topup(conn, a, 10, source="ta")
-                await handlers.topup(conn, b, 10, source="tb")
+                await handlers.topup(conn, a, 10 * MC, source="ta")
+                await handlers.topup(conn, b, 10 * MC, source="tb")
                 ra = await handlers.consume(conn, "api_key", "ka",
                                             idempotency_key="shared")
                 rb = await handlers.consume(conn, "api_key", "kb",
                                             idempotency_key="shared")
-                self.assertEqual(ra["balance"], 9)
-                self.assertEqual(rb["balance"], 9)
+                self.assertEqual(ra["balance"], 9 * MC)
+                self.assertEqual(rb["balance"], 9 * MC)
                 self.assertFalse(ra.get("deduplicated"))
                 self.assertFalse(rb.get("deduplicated"))
             finally:
@@ -537,11 +541,11 @@ class ConsumeIdempotencyTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 10, source="t1")
+                await handlers.topup(conn, ident, 10 * MC, source="t1")
                 r1 = await handlers.consume(conn, "api_key", "k",
                                             idempotency_key="key")
                 # Later topup — new balance is 15.
-                await handlers.topup(conn, ident, 6, source="t2")
+                await handlers.topup(conn, ident, 6 * MC, source="t2")
                 r2 = await handlers.consume(conn, "api_key", "k",
                                             idempotency_key="key")
                 self.assertEqual(r2["balance"], r1["balance"])  # 9 not 15
@@ -565,7 +569,7 @@ class AtomicConsumeRaceTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, 1, source="test")
+                await handlers.topup(conn, ident, 1 * MC, source="test")
 
                 # Fire 10 concurrent consumes
                 results = await asyncio.gather(*[
@@ -594,7 +598,7 @@ class AtomicConsumeRaceTest(unittest.TestCase):
             N = 20
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                await handlers.topup(conn, ident, N, source="test")
+                await handlers.topup(conn, ident, N * MC, source="test")
                 results = await asyncio.gather(*[
                     handlers.consume(conn, "api_key", "k") for _ in range(N)
                 ])

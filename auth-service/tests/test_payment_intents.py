@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import handlers  # noqa: E402
 from app.db import init_db  # noqa: E402
 
+# mark_paid mints into the millicredit ledger (1 credit = 1000 mc).
+MC = handlers.MC_PER_CREDIT
+
 
 def run(coro):
     loop = asyncio.new_event_loop()
@@ -78,9 +81,9 @@ class MarkPaidTest(unittest.TestCase):
                 )
                 self.assertTrue(result["success"])
                 self.assertEqual(result["status"], "paid")
-                self.assertEqual(result["balance"], 100)
+                self.assertEqual(result["balance"], 100 * MC)
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 100,
+                    (await handlers.get_balance(conn, ident))["balance"], 100 * MC,
                 )
             finally:
                 await conn.close()
@@ -101,7 +104,7 @@ class MarkPaidTest(unittest.TestCase):
                 self.assertTrue(r2.get("deduplicated"))
                 # Balance stays at 100 (not 200) after replay.
                 self.assertEqual(
-                    (await handlers.get_balance(conn, ident))["balance"], 100,
+                    (await handlers.get_balance(conn, ident))["balance"], 100 * MC,
                 )
             finally:
                 await conn.close()
@@ -170,8 +173,8 @@ class MarkPaidTest(unittest.TestCase):
                     actual_amount_cents=intent["amount_cents"] * 10,
                 )
                 self.assertTrue(r["success"])
-                # Still 100 credits.
-                self.assertEqual(r["balance"], 100)
+                # Still 100 credits (minted as mc).
+                self.assertEqual(r["balance"], 100 * MC)
             finally:
                 await conn.close()
         run(go())
