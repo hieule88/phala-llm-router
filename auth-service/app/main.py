@@ -325,6 +325,19 @@ class RevokeCredentialRequest(BaseModel):
     credential_value: str
 
 
+class WalletBindRequest(BaseModel):
+    wallet_pub_key: str = Field(..., min_length=2, max_length=4096,
+        description="Miden account public key (Falcon), lowercase hex. The "
+                    "proven identity of the wallet.")
+    api_key_hash: str = Field(..., min_length=64, max_length=64,
+        description="SHA-256 hex of the spending credential the Edge derives "
+                    "for this wallet. The raw key never reaches this service.")
+    account_id: str | None = Field(None, max_length=256,
+        description="Bech32 Miden address. A public label for topup routing — "
+                    "never an authenticator.")
+    initial_tier: str = Field("free", examples=["free", "starter", "pro"])
+
+
 class ValidateRequest(BaseModel):
     credential_type: str
     credential_value: str
@@ -504,6 +517,26 @@ async def revoke_credential(request: Request, req: RevokeCredentialRequest):
     )
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "revoke failed"))
+    return result
+
+
+@app.post("/v1/wallet/bind", dependencies=[Depends(require_proxy_token)])
+@limiter.limit(RATE_LIMIT_ADMIN)
+async def wallet_bind(request: Request, req: WalletBindRequest):
+    """Resolve a Miden wallet to its ledger identity (get-or-create).
+
+    Proxy-token gated, not admin: the AI Edge calls this on every successful
+    bind, and it must not need a credential that can also mint credits. The
+    Edge has already verified the wallet's Falcon signature (this service has
+    no Falcon implementation); what it asks for here is only "which identity is
+    this wallet, and let me spend for it".
+    """
+    result = await handlers.wallet_bind(
+        app.state.db, req.wallet_pub_key, req.api_key_hash,
+        account_id=req.account_id, initial_tier=req.initial_tier,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=409, detail=result.get("error", "wallet bind failed"))
     return result
 
 

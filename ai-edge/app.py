@@ -16,18 +16,35 @@ End users hold ONE Leviathan API key (`lev_...`). This Edge:
 This hides Phala + the GPU-TEE provider keys behind Leviathan — users never
 register with Phala or the providers; they only hold a Leviathan key.
 
+Authentication comes in two flavours, side by side:
+
+  Authorization: Bearer lev_...     the api key described above
+  Authorization: Wallet lev_s_...   a Leviathan wallet session (wallet_auth.py)
+
+In the wallet flavour the user's Miden wallet IS the account: no api key
+exists, the ledger identity hangs off the wallet's public key, and every call
+carries a fresh Ed25519 signature from a session key the wallet's Falcon
+account key delegated to. See ../docs/wallet-bound-aci.md.
+
 Endpoints (OpenAI-compatible):
   POST /v1/chat/completions | /v1/completions | /v1/embeddings  -> metered (1 credit)
   GET  /v1/models                                               -> requires a valid key, no debit
   GET  /v1/aci/receipts/{id}   -> requires a valid key; only the receipt's owner gets it
   GET  /v1/attestation/report  -> public passthrough (verifiability)
   GET  /health
+
+Wallet endpoints (only when WALLET_AUTH_ENABLED=true):
+  POST /v1/wallet/challenge            -> single-use nonce
+  POST /v1/wallet/bind                 -> Falcon-verified session
+  POST /v1/wallet/session/revoke       -> end this session (sent on wallet lock)
+  POST /v1/wallet/sessions/revoke-all  -> end every session of this wallet
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -37,6 +54,9 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+import wallet_auth
+from wallet_auth import WalletAuthError, WalletSession
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -72,6 +92,16 @@ GATEWAY_TIMEOUT_SEC = float(os.getenv("GATEWAY_TIMEOUT_SEC", "600.0"))
 # Rotating it orphans receipts issued under the old bearers (they stay owned
 # by the old digest) — rotate only with that in mind.
 EDGE_TENANT_SECRET = os.getenv("EDGE_TENANT_SECRET", "")
+
+# Wallet-bound auth (../docs/wallet-bound-aci.md). Reads its own env; when
+# disabled the whole wallet surface is absent and only api keys work, exactly
+# as before this feature existed.
+WALLET_CFG = wallet_auth.WalletAuthConfig.from_env()
+
+# What one metered request books against a session's signed spend cap. Matches
+# the ledger's flat hold (auth-service DEFAULT_CONSUME_AMOUNT_MC) so the cap
+# the user signed is denominated in the same units they see billed.
+WALLET_REQUEST_COST_MC = int(os.getenv("WALLET_REQUEST_COST_MC", "1000"))
 
 # Fail-closed: refuse to start misconfigured so we never bill/serve wrong.
 for _name, _val in (
@@ -144,13 +174,27 @@ class AuthClient:
     def hash_key(raw_key: str) -> str:
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
+    # The `*_hashed` variants take the credential hash directly. Wallet
+    # sessions have no raw api key to hash — the Edge derives their hash from
+    # the wallet public key — so the ledger calls are expressed in terms of the
+    # hash, and the raw-key entry points below are thin wrappers.
+
     async def consume(self, raw_key: str, idempotency_key: str) -> AuthResult:
+        return await self.consume_hashed(self.hash_key(raw_key), idempotency_key)
+
+    async def refund(self, raw_key: str, debit_token: Optional[str], reason: str) -> None:
+        await self.refund_hashed(self.hash_key(raw_key), debit_token, reason)
+
+    async def validate(self, raw_key: str) -> AuthResult:
+        return await self.validate_hashed(self.hash_key(raw_key))
+
+    async def consume_hashed(self, key_hash: str, idempotency_key: str) -> AuthResult:
         try:
             r = await self._c.post(
                 f"{AUTH_SERVICE_URL}/v1/consume",
                 json={
                     "credential_type": "api_key",
-                    "credential_value": self.hash_key(raw_key),
+                    "credential_value": key_hash,
                     "idempotency_key": idempotency_key,
                 },
                 headers={"Authorization": f"Bearer {AUTH_SERVICE_PROXY_TOKEN}"},
@@ -173,7 +217,7 @@ class AuthClient:
             return AuthResult(DENY_NO_BALANCE, error=data.get("error"))
         return AuthResult(DENY_UNAUTH, error=data.get("error"))
 
-    async def refund(self, raw_key: str, debit_token: Optional[str], reason: str) -> None:
+    async def refund_hashed(self, key_hash: str, debit_token: Optional[str], reason: str) -> None:
         # Best-effort reversal when the gateway rejected the request post-debit.
         # `debit_token` is None when this request's consume was an idempotent
         # replay: it spent nothing, so there is nothing of ITS to reverse —
@@ -186,7 +230,7 @@ class AuthClient:
                 f"{AUTH_SERVICE_URL}/v1/refund",
                 json={
                     "credential_type": "api_key",
-                    "credential_value": self.hash_key(raw_key),
+                    "credential_value": key_hash,
                     "debit_token": debit_token,
                     "reason": reason,
                 },
@@ -195,7 +239,7 @@ class AuthClient:
         except httpx.RequestError:
             pass  # refund miss is logged upstream; don't mask the original error
 
-    async def validate(self, raw_key: str) -> AuthResult:
+    async def validate_hashed(self, key_hash: str) -> AuthResult:
         # Read-only: is this a known credential (with balance)? Used by /v1/models.
         # The proxy token is not required here (validate is public) — it tells
         # auth-service these calls come from the Edge, which relays every tenant
@@ -204,7 +248,7 @@ class AuthClient:
         try:
             r = await self._c.post(
                 f"{AUTH_SERVICE_URL}/v1/validate",
-                json={"credential_type": "api_key", "credential_value": self.hash_key(raw_key)},
+                json={"credential_type": "api_key", "credential_value": key_hash},
                 headers={"Authorization": f"Bearer {AUTH_SERVICE_PROXY_TOKEN}"},
             )
         except httpx.RequestError as e:
@@ -222,6 +266,34 @@ class AuthClient:
                               identity_id=data.get("identity_id"))
         return AuthResult(DENY_UNAUTH, error=data.get("error"))
 
+    async def wallet_bind(self, wallet_pub_key: str, api_key_hash: str,
+                          account_id: Optional[str]) -> AuthResult:
+        """Resolve a verified wallet to its ledger identity (get-or-create).
+
+        Only ever called after the Falcon signature verified: this is the step
+        that turns a proven wallet into something the credit ledger can bill.
+        """
+        try:
+            r = await self._c.post(
+                f"{AUTH_SERVICE_URL}/v1/wallet/bind",
+                json={
+                    "wallet_pub_key": wallet_pub_key,
+                    "api_key_hash": api_key_hash,
+                    "account_id": account_id,
+                },
+                headers={"Authorization": f"Bearer {AUTH_SERVICE_PROXY_TOKEN}"},
+            )
+        except httpx.RequestError as e:
+            return AuthResult(DENY_DOWN, error=f"auth unreachable: {e}")
+        if r.status_code == 409:
+            # The wallet or its derived credential collides with another
+            # identity. Not retryable, and not the caller's to fix silently.
+            return AuthResult(DENY_UNAUTH, error=str(r.json().get("detail", "wallet bind conflict")))
+        if not (200 <= r.status_code < 300):
+            return AuthResult(DENY_DOWN, error=f"auth returned {r.status_code}")
+        data = r.json()
+        return AuthResult(ALLOW, balance=data.get("balance"), identity_id=data.get("identity_id"))
+
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
@@ -230,22 +302,88 @@ class AuthClient:
 async def lifespan(app: FastAPI):
     app.state.auth = AuthClient()
     app.state.gw = httpx.AsyncClient(timeout=GATEWAY_TIMEOUT_SEC)
+    app.state.wallet = None
+    if WALLET_CFG.enabled:
+        app.state.wallet = wallet_auth.WalletAuthenticator(
+            WALLET_CFG,
+            wallet_auth.WalletStore(WALLET_CFG.state_db),
+            wallet_auth.FalconVerifier(WALLET_CFG),
+        )
     try:
         yield
     finally:
         await app.state.auth._c.aclose()
         await app.state.gw.aclose()
+        if app.state.wallet is not None:
+            await app.state.wallet.verifier.aclose()
+            app.state.wallet.store.close()
 
 
 app = FastAPI(title="Leviathan AI Edge", lifespan=lifespan)
 
 
 def _bearer(request: Request) -> Optional[str]:
+    return _authorization(request, "bearer")
+
+
+def _authorization(request: Request, scheme: str) -> Optional[str]:
     h = request.headers.get("authorization", "")
-    for pfx in ("Bearer ", "bearer "):
-        if h.startswith(pfx):
-            return h[len(pfx):].strip()
-    return None
+    prefix, _, rest = h.partition(" ")
+    if prefix.lower() != scheme.lower() or not rest.strip():
+        return None
+    return rest.strip()
+
+
+@dataclass
+class Principal:
+    """Whoever is making this request, reduced to what the ledger needs.
+
+    Both auth flavours converge here: the ledger only ever sees a credential
+    hash, so nothing downstream needs to know whether a wallet or an api key
+    produced it. `session` is set only for wallet principals, and only so the
+    spend cap the user signed can be booked and released.
+    """
+
+    credential_hash: str
+    session: Optional[WalletSession] = None
+
+    @property
+    def is_wallet(self) -> bool:
+        return self.session is not None
+
+
+def _wallet_error(exc: WalletAuthError) -> Response:
+    return JSONResponse(
+        status_code=exc.status,
+        content={"error": {"message": exc.message, "type": exc.code}},
+    )
+
+
+async def _resolve_principal(
+    request: Request, path: str, body: bytes, required_scope: str,
+) -> Principal:
+    """Authenticate the caller, api key or wallet session.
+
+    Raises WalletAuthError for every failure — including the api-key ones — so
+    a caller has exactly one error path to handle and cannot forget one.
+    """
+    session_id = _authorization(request, "wallet")
+    if session_id:
+        wallet: Optional[wallet_auth.WalletAuthenticator] = request.app.state.wallet
+        if wallet is None:
+            raise WalletAuthError("wallet_disabled", "wallet authentication is not enabled", status=501)
+        session = wallet.authenticate_request(
+            session_id, request.method, path, body, request.headers, required_scope,
+        )
+        return Principal(
+            credential_hash=wallet.spend_credential_hash(session.wallet_pub_key),
+            session=session,
+        )
+
+    raw_key = _bearer(request)
+    if not raw_key:
+        raise WalletAuthError("unauth", "api key or wallet session required")
+    return Principal(credential_hash=AuthClient.hash_key(raw_key))
 
 
 def _deny_response(res: AuthResult) -> Response:
@@ -318,15 +456,124 @@ def _fwd_response_headers(resp: httpx.Response) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "wallet_auth": WALLET_CFG.enabled}
+
+
+# ─── Wallet-bound auth (../docs/wallet-bound-aci.md) ─────────────────────────
+
+
+def _wallet_or_501(request: Request) -> "wallet_auth.WalletAuthenticator":
+    wallet = request.app.state.wallet
+    if wallet is None:
+        raise WalletAuthError("wallet_disabled", "wallet authentication is not enabled", status=501)
+    return wallet
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        payload = json.loads(await request.body() or b"{}")
+    except ValueError:
+        raise WalletAuthError("wallet_invalid_request", "body must be JSON") from None
+    if not isinstance(payload, dict):
+        raise WalletAuthError("wallet_invalid_request", "body must be a JSON object")
+    return payload
+
+
+@app.post("/v1/wallet/challenge")
+async def wallet_challenge(request: Request):
+    """Hand out a single-use nonce for a bind statement.
+
+    Public: a nonce is worthless without the wallet's signature, and requiring
+    a credential here would be circular — this is how a user with no
+    credential gets one.
+    """
+    try:
+        wallet = _wallet_or_501(request)
+        payload = await _json_body(request)
+        return wallet.challenge(payload.get("wallet_pub_key"))
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+
+
+@app.post("/v1/wallet/bind")
+async def wallet_bind(request: Request):
+    """Verify a Falcon-signed bind statement and open a session."""
+    try:
+        wallet = _wallet_or_501(request)
+        payload = await _json_body(request)
+        statement = await wallet.verify_bind(payload.get("statement"), payload.get("signature"))
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+
+    # Verified. Now (and only now) resolve the wallet to a billable identity.
+    res = await request.app.state.auth.wallet_bind(
+        statement["wallet_pub_key"],
+        wallet.spend_credential_hash(statement["wallet_pub_key"]),
+        statement.get("account_id"),
+    )
+    if res.status != ALLOW or res.identity_id is None:
+        return _deny_response(res if res.status != ALLOW else AuthResult(
+            DENY_DOWN, error="billing service returned no identity, retry later"))
+
+    session = wallet.store.create_session(
+        res.identity_id, statement, statement["scope"], wallet.now(),
+    )
+    return {
+        "session_id": session.session_id,
+        "identity_id": session.identity_id,
+        "expires_at": session.expires_at,
+        "scope": list(session.scope),
+        "max_spend_mc": session.max_spend_mc,
+        "balance_mc": res.balance,
+    }
+
+
+@app.post("/v1/wallet/session/revoke")
+async def wallet_session_revoke(request: Request):
+    """End this session. The extension calls it when the wallet locks — and
+    drops its keys either way, so a failure here costs the user nothing."""
+    body = await request.body()
+    try:
+        principal = await _resolve_principal(
+            request, "/v1/wallet/session/revoke", body, "inference",
+        )
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+    if principal.session is None:
+        return _wallet_error(WalletAuthError(
+            "wallet_required", "only a wallet session can be revoked", status=400))
+    wallet = request.app.state.wallet
+    return {"revoked": wallet.store.revoke_session(principal.session.session_id, wallet.now())}
+
+
+@app.post("/v1/wallet/sessions/revoke-all")
+async def wallet_sessions_revoke_all(request: Request):
+    """Kill every session of this wallet — the lost-device button. Reachable
+    from any device holding the mnemonic, since binding is all it takes."""
+    body = await request.body()
+    try:
+        principal = await _resolve_principal(
+            request, "/v1/wallet/sessions/revoke-all", body, "inference",
+        )
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+    if principal.session is None:
+        return _wallet_error(WalletAuthError(
+            "wallet_required", "only a wallet session can revoke sessions", status=400))
+    wallet = request.app.state.wallet
+    return {"revoked": wallet.store.revoke_all_for_wallet(
+        principal.session.wallet_pub_key, wallet.now())}
 
 
 async def _metered_proxy(request: Request, path: str) -> Response:
-    raw_key = _bearer(request)
-    if not raw_key:
-        return JSONResponse(status_code=401, content={"error": {"message": "api key required", "type": "unauth"}})
-
+    # Body first: a wallet signature covers the exact bytes, so it cannot be
+    # checked before they are read.
     body = await request.body()
+    try:
+        principal = await _resolve_principal(request, path, body, "inference")
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+
     # Idempotency is OPT-IN (the client's own `Idempotency-Key`) AND bound to
     # the body. Both halves are load-bearing:
     #   opt-in     — deriving the key from content alone would make every
@@ -350,13 +597,38 @@ async def _metered_proxy(request: Request, path: str) -> Response:
         + b"\0" + _bound_header_digest(request)).hexdigest()
         if client_idem else "edge:once:" + secrets.token_hex(16))
 
-    res = await request.app.state.auth.consume(raw_key, idem)
+    # Book the request against the spend cap the wallet signed BEFORE debiting
+    # the ledger: the cap is the user's own authorization, and a request that
+    # exceeds it must not cost them anything.
+    if principal.session is not None:
+        try:
+            request.app.state.wallet.store.charge(
+                principal.session.session_id, WALLET_REQUEST_COST_MC,
+                request.app.state.wallet.now(),
+            )
+        except WalletAuthError as exc:
+            return _wallet_error(exc)
+
+    async def _release(reason: str, debit_token: Optional[str]) -> None:
+        """Undo everything this request booked. The ledger refund and the
+        session cap are separate books; a failure must reverse both."""
+        await request.app.state.auth.refund_hashed(principal.credential_hash, debit_token, reason)
+        if principal.session is not None:
+            request.app.state.wallet.store.uncharge(
+                principal.session.session_id, WALLET_REQUEST_COST_MC,
+            )
+
+    res = await request.app.state.auth.consume_hashed(principal.credential_hash, idem)
     if res.status != ALLOW:
+        if principal.session is not None:
+            request.app.state.wallet.store.uncharge(
+                principal.session.session_id, WALLET_REQUEST_COST_MC,
+            )
         return _deny_response(res)
     if res.identity_id is None:
         # Ledger allowed the debit but did not say WHO — without an identity
         # we cannot assign receipt ownership. Fail closed and give it back.
-        await request.app.state.auth.refund(raw_key, res.debit_token, "auth_missing_identity")
+        await _release("auth_missing_identity", res.debit_token)
         return JSONResponse(status_code=503, content={"error": {
             "message": "billing service returned no identity, retry later", "type": DENY_DOWN}})
 
@@ -367,14 +639,14 @@ async def _metered_proxy(request: Request, path: str) -> Response:
     try:
         resp = await gw.send(req, stream=True)
     except httpx.RequestError as e:
-        await request.app.state.auth.refund(raw_key, res.debit_token, f"gateway_unreachable:{e}")
+        await _release(f"gateway_unreachable:{e}", res.debit_token)
         return JSONResponse(status_code=502, content={"error": {"message": "gateway unreachable", "type": "gateway"}})
 
     if resp.status_code >= 400:
         # Gateway rejected (e.g. upstream 404/429). Refund and surface the error.
         err_body = await resp.aread()
         await resp.aclose()
-        await request.app.state.auth.refund(raw_key, res.debit_token, f"gateway_status:{resp.status_code}")
+        await _release(f"gateway_status:{resp.status_code}", res.debit_token)
         return Response(content=err_body, status_code=resp.status_code, headers=_fwd_response_headers(resp))
 
     async def _stream():
@@ -406,10 +678,11 @@ async def embeddings(request: Request):
 
 @app.get("/v1/models")
 async def models(request: Request):
-    raw_key = _bearer(request)
-    if not raw_key:
-        return JSONResponse(status_code=401, content={"error": {"message": "api key required", "type": "unauth"}})
-    res = await request.app.state.auth.validate(raw_key)
+    try:
+        principal = await _resolve_principal(request, "/v1/models", b"", "models")
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+    res = await request.app.state.auth.validate_hashed(principal.credential_hash)
     if res.status in (DENY_UNAUTH, DENY_DOWN):   # allow DENY_NO_BALANCE (known key, empty)
         return _deny_response(res)
     gw: httpx.AsyncClient = request.app.state.gw
@@ -437,10 +710,13 @@ async def receipt(request: Request, receipt_id: str):
     # time, so we must present the SAME derived bearer here. A known key with
     # an empty balance may still read receipts for requests it already paid
     # for (validate is read-only, no debit).
-    raw_key = _bearer(request)
-    if not raw_key:
-        return JSONResponse(status_code=401, content={"error": {"message": "api key required", "type": "unauth"}})
-    res = await request.app.state.auth.validate(raw_key)
+    try:
+        principal = await _resolve_principal(
+            request, f"/v1/aci/receipts/{receipt_id}", b"", "receipts",
+        )
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+    res = await request.app.state.auth.validate_hashed(principal.credential_hash)
     if res.status not in (ALLOW, DENY_NO_BALANCE):
         return _deny_response(res)
     if res.identity_id is None:

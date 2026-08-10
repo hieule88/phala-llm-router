@@ -2,7 +2,7 @@ FROM python:3.11-slim
 WORKDIR /edge
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
+COPY app.py wallet_auth.py ./
 # Drop privileges.
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin edge
 USER edge

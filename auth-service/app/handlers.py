@@ -271,6 +271,108 @@ async def add_credential(
         return {"success": True, "credential_id": row[0], "identity_id": identity_id}
 
 
+async def wallet_bind(
+    conn: aiosqlite.Connection,
+    wallet_pub_key: str,
+    api_key_hash: str,
+    account_id: Optional[str] = None,
+    initial_tier: str = "free",
+) -> dict:
+    """Resolve a Miden wallet to its ledger identity, creating it on first use.
+
+    Called by the AI Edge (proxy token) after it has cryptographically verified
+    that the holder of `wallet_pub_key` signed a bind statement — see
+    docs/wallet-bound-aci.md. This service does not and cannot verify Falcon
+    signatures; it trusts the Edge to have done so, exactly as it trusts the
+    Edge's `consume` calls today.
+
+    Three effects, all idempotent, all in one transaction:
+      1. get-or-create the identity holding ('miden_wallet', wallet_pub_key),
+      2. attach ('miden_account', account_id) as a public label for topup
+         routing — never an authenticator (it is a public address, and a public
+         value that can spend is a public balance),
+      3. attach ('api_key', api_key_hash) to THAT identity. This is how the
+         wallet spends through the ordinary consume/settle/refund path with no
+         changes to it; the Edge derives the raw key from the wallet public key
+         and never stores it.
+
+    The api-key attachment refuses to move an existing hash between identities:
+    without that check a bind could graft a wallet onto someone else's balance.
+    """
+    async with transaction(conn):
+        cur = await conn.execute(
+            "SELECT identity_id FROM credentials "
+            "WHERE credential_type='miden_wallet' AND credential_value=? AND revoked_at IS NULL",
+            (wallet_pub_key,),
+        )
+        row = await cur.fetchone()
+        created = row is None
+        if row:
+            identity_id = row[0]
+        else:
+            cur = await conn.execute("INSERT INTO identities DEFAULT VALUES")
+            identity_id = cur.lastrowid
+            assert identity_id is not None
+            await conn.execute(
+                "INSERT INTO credentials (identity_id, credential_type, credential_value) "
+                "VALUES (?, 'miden_wallet', ?)",
+                (identity_id, wallet_pub_key),
+            )
+            await conn.execute(
+                "INSERT INTO balances (identity_id, balance, tier) VALUES (?, 0, ?)",
+                (identity_id, get_tier(initial_tier).name),
+            )
+
+        if account_id:
+            cur = await conn.execute(
+                "SELECT identity_id FROM credentials "
+                "WHERE credential_type='miden_account' AND credential_value=? "
+                "  AND revoked_at IS NULL",
+                (account_id,),
+            )
+            owner = await cur.fetchone()
+            if owner and owner[0] != identity_id:
+                # The address is claimed by another identity. Refuse rather
+                # than silently binding a wallet to an address that routes
+                # someone else's topups.
+                return {"success": False, "error": "account_id belongs to another identity"}
+            if not owner:
+                await conn.execute(
+                    "INSERT INTO credentials (identity_id, credential_type, credential_value) "
+                    "VALUES (?, 'miden_account', ?)",
+                    (identity_id, account_id),
+                )
+
+        cur = await conn.execute(
+            "SELECT identity_id FROM credentials "
+            "WHERE credential_type='api_key' AND credential_value=? AND revoked_at IS NULL",
+            (api_key_hash,),
+        )
+        owner = await cur.fetchone()
+        if owner and owner[0] != identity_id:
+            return {"success": False, "error": "api_key_hash belongs to another identity"}
+        if not owner:
+            await conn.execute(
+                "INSERT INTO credentials (identity_id, credential_type, credential_value) "
+                "VALUES (?, 'api_key', ?)",
+                (identity_id, api_key_hash),
+            )
+
+        cur = await conn.execute(
+            "SELECT balance, tier FROM balances WHERE identity_id=?", (identity_id,),
+        )
+        bal = await cur.fetchone()
+
+    return {
+        "success": True,
+        "identity_id": identity_id,
+        "created": created,
+        "balance": bal[0] if bal else 0,
+        "unit": "millicredit",
+        "tier": bal[1] if bal else get_tier(initial_tier).name,
+    }
+
+
 async def revoke_credential(
     conn: aiosqlite.Connection,
     credential_type: str,

@@ -615,6 +615,8 @@ tests/                         unit and integration coverage
 
 - [Deployment guide](deploy/README.md)
 - [Router middleware](docs/router-middleware.md)
+- [Wallet-bound ACI](docs/wallet-bound-aci.md) — the Leviathan wallet as the AI
+  account: no api key, wallet lock gates access, every call signed
 - [Configuration reference](docs/configuration-reference.md)
 - [Live E2E test suite](docs/live-e2e-test-suite.md)
 - [Providers (verification + audit)](docs/providers/README.md)

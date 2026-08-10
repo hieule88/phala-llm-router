@@ -1,0 +1,33 @@
+{
+  "name": "@leviathan/wallet-aci",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-dependency wallet-side client for wallet-bound ACI — the Leviathan wallet as the AI account.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "clean": "rm -rf dist dist-test"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.6.0"
+  }
+}
