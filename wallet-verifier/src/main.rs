@@ -82,7 +82,30 @@ fn parse_word(hex_str: &str) -> Result<Word, BadRequest> {
     Word::try_from(limbs).map_err(|e| BadRequest(format!("message_word is not a valid Word: {e}")))
 }
 
-/// Which of the two accepted spellings of the account key we were given.
+/// The wallet's `@miden-sdk` serializes public keys and signatures behind a
+/// one-byte auth-scheme discriminant; 2 is Falcon-512/Poseidon2 — the only
+/// scheme this verifier speaks. `vault.signData` returns the tagged form
+/// verbatim, so production traffic carries it. Bare `miden-crypto` encodings
+/// (no tag) are accepted too; any other scheme tag is refused rather than
+/// guessed at.
+const SDK_SCHEME_TAG_FALCON512_POSEIDON2: u8 = 2;
+
+/// Parse `bytes` as `T`, first as-is, then — if that fails and the first byte
+/// is the Falcon/Poseidon2 scheme tag — with the tag stripped. At most one of
+/// the two parses can succeed (both encodings are self-describing), so this
+/// introduces no ambiguity about what was signed.
+fn read_bare_or_tagged<T: Deserializable>(bytes: &[u8], what: &str) -> Result<T, BadRequest> {
+    match T::read_from_bytes(bytes) {
+        Ok(v) => Ok(v),
+        Err(direct_err) => match bytes.split_first() {
+            Some((&SDK_SCHEME_TAG_FALCON512_POSEIDON2, rest)) => T::read_from_bytes(rest)
+                .map_err(|e| BadRequest(format!("{what} does not deserialize (tagged): {e}"))),
+            _ => Err(BadRequest(format!("{what} does not deserialize: {direct_err}"))),
+        },
+    }
+}
+
+/// Which of the accepted spellings of the account key we were given.
 enum ClaimedKey {
     Full(PublicKey),
     Commitment(Word),
@@ -93,9 +116,7 @@ fn parse_claimed_key(hex_str: &str) -> Result<ClaimedKey, BadRequest> {
     if bytes.len() == 32 {
         return Ok(ClaimedKey::Commitment(parse_word(hex_str)?));
     }
-    PublicKey::read_from_bytes(&bytes)
-        .map(ClaimedKey::Full)
-        .map_err(|e| BadRequest(format!("public_key does not deserialize: {e}")))
+    read_bare_or_tagged::<PublicKey>(&bytes, "public_key").map(ClaimedKey::Full)
 }
 
 async fn verify(Json(req): Json<VerifyRequest>) -> Result<Json<VerifyResponse>, BadRequest> {
@@ -105,8 +126,7 @@ async fn verify(Json(req): Json<VerifyRequest>) -> Result<Json<VerifyResponse>, 
     let sig_bytes = B64
         .decode(req.signature.as_bytes())
         .map_err(|_| BadRequest("signature is not base64".into()))?;
-    let signature = Signature::read_from_bytes(&sig_bytes)
-        .map_err(|e| BadRequest(format!("signature does not deserialize: {e}")))?;
+    let signature: Signature = read_bare_or_tagged(&sig_bytes, "signature")?;
 
     // A Miden `Signature` carries its own copy of the public key, and
     // `Signature::verify` would happily check against THAT one. Verifying
@@ -230,6 +250,95 @@ mod tests {
             signature: B64.encode(sig.to_bytes()),
         };
         assert!(!verify(Json(mismatched)).await.unwrap().0.valid);
+    }
+
+    /// The §10 release gate: signatures captured from the REAL wallet SDK
+    /// build must parse and verify here. A `miden-crypto` pin that cannot
+    /// read the wallet's serialization fails closed on every bind — safe but
+    /// total — so this test failing (or having no vectors to run) must block
+    /// a release, not be shrugged off.
+    ///
+    /// Vectors are produced by `tests/capture-vector/capture.mjs`, which
+    /// creates a throwaway Leviathan wallet with the same `@miden-sdk`
+    /// version the extension ships and signs with its Falcon account key.
+    #[tokio::test]
+    async fn real_wallet_vector_gate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !entries.is_empty(),
+            "no vector files in {} — run tests/capture-vector/capture.mjs with the \
+             wallet's @miden-sdk build first (docs/wallet-bound-aci.md §10); a verifier \
+             never tested against the wallet's real signature encoding must not ship",
+            dir.display(),
+        );
+
+        for path in entries {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let file: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{}: not JSON: {e}", path.display()));
+            let sdk = file["sdk"].as_str().unwrap_or("<unknown sdk>");
+
+            // Every vector must verify under every public-key spelling the
+            // wallet may present (full serialization and/or Word commitment).
+            let mut key_forms: Vec<(&str, &str)> = Vec::new();
+            if let Some(k) = file["public_keys"]["full_hex"].as_str() {
+                key_forms.push(("full", k));
+            }
+            if let Some(k) = file["public_keys"]["commitment_hex"].as_str() {
+                key_forms.push(("commitment", k));
+            }
+            assert!(!key_forms.is_empty(), "{}: no public_keys", path.display());
+
+            for vector in file["vectors"].as_array().expect("vectors array") {
+                let name = vector["name"].as_str().unwrap_or("<unnamed>");
+                let word_hex = vector["message_word_hex"].as_str().expect("message_word_hex");
+                let sig_b64 = vector["signature_b64"].as_str().expect("signature_b64");
+
+                for (form, key_hex) in &key_forms {
+                    let res = verify(Json(VerifyRequest {
+                        public_key: key_hex.to_string(),
+                        message_word: word_hex.to_string(),
+                        signature: sig_b64.to_string(),
+                    }))
+                    .await;
+                    match res {
+                        Ok(Json(VerifyResponse { valid: true })) => {}
+                        Ok(Json(VerifyResponse { valid: false })) => panic!(
+                            "{sdk} vector '{name}' ({form} key): signature parsed but did NOT \
+                             verify — key binding or Word mapping mismatch with this wallet build",
+                        ),
+                        Err(bad) => panic!(
+                            "{sdk} vector '{name}' ({form} key): verifier cannot parse the \
+                             wallet's encoding ({}) — the miden-crypto pin does not match the \
+                             wallet's @miden-sdk generation (docs §10)",
+                            bad.0,
+                        ),
+                    }
+                }
+
+                // Guard against a vacuous pass: the same signature over a
+                // different word must NOT verify.
+                let mut tampered = hex::decode(word_hex).unwrap();
+                tampered[0] ^= 0x01;
+                if let Ok(Json(VerifyResponse { valid })) = verify(Json(VerifyRequest {
+                    public_key: key_forms[0].1.to_string(),
+                    message_word: hex::encode(&tampered),
+                    signature: sig_b64.to_string(),
+                }))
+                .await
+                {
+                    assert!(!valid, "{sdk} vector '{name}': tampered word still verified");
+                }
+            }
+        }
     }
 
     #[tokio::test]

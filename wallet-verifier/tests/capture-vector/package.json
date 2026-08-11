@@ -1,0 +1,15 @@
+{
+  "name": "wallet-verifier-capture-vector",
+  "private": true,
+  "type": "module",
+  "description": "Creates a throwaway Leviathan wallet with the SAME SDK build the extension ships, signs test words with its Falcon account key, and writes the (public_key, word, signature) vectors that gate wallet-verifier releases (docs/wallet-bound-aci.md §10).",
+  "scripts": {
+    "capture": "node capture.mjs",
+    "install:wallet-build": "npm install @miden-sdk/miden-sdk@0.15.0-node.5e72c326 --@miden-sdk:registry=https://git.softly.com/api/packages/leviathan/npm/"
+  },
+  "dependencies": {
+    "@demox-labs/aleo-hd-key": "^0.0.1",
+    "@miden-sdk/miden-sdk": "0.15.0",
+    "bip39": "^3.1.0"
+  }
+}

@@ -1,0 +1,49 @@
+# Wallet-bound ACI overlay — OPT-IN by design.
+#
+# The base docker-compose.yml alone keeps the wallet surface absent (the
+# /v1/wallet/* endpoints answer 501, api keys work exactly as before), so the
+# currently running deployment is untouched until you deliberately deploy with
+# BOTH files:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.wallet.yml up -d --build
+#
+# Prerequisites (docs/wallet-bound-aci.md §9.1, §10):
+#   1. The verifier image only builds if the §10 vector gate passes — run
+#      wallet-verifier/tests/capture-vector first so tests/vectors/ holds a
+#      signature from the wallet's real @miden-sdk build.
+#   2. Add to .env:  EDGE_WALLET_KEY_SECRET=$(openssl rand -hex 32)
+#      As sensitive as EDGE_TENANT_SECRET: it derives every wallet's spending
+#      credential. Rotating it mints new credentials (balances unaffected).
+
+services:
+  wallet-verifier:
+    build: ../wallet-verifier
+    container_name: leviathan-wallet-verifier
+    restart: always
+    environment:
+      - WALLET_VERIFIER_BIND=0.0.0.0:8091
+    # Stateless and secretless: no volumes, not exposed through Caddy — only
+    # the Edge reaches it, on the private network.
+    expose:
+      - "8091"
+    networks: [edge-net]
+
+  edge:
+    environment:
+      - WALLET_AUTH_ENABLED=true
+      - WALLET_VERIFIER_URL=http://wallet-verifier:8091
+      # The origin users see — bind statements MUST name it verbatim.
+      - WALLET_SERVICE_ORIGIN=https://${EDGE_PUBLIC_DOMAIN:?}
+      - EDGE_WALLET_KEY_SECRET=${EDGE_WALLET_KEY_SECRET:?set EDGE_WALLET_KEY_SECRET (openssl rand -hex 32)}
+      # Challenges + sessions + per-session spend accounting. State, not
+      # cache: losing it mid-session drops live sessions' spend tallies
+      # (docs §9), hence the named volume.
+      - WALLET_STATE_DB=/edge/state/wallet-state.db
+    volumes:
+      - edge_wallet_state:/edge/state
+    depends_on:
+      - auth-service
+      - wallet-verifier
+
+volumes:
+  edge_wallet_state:

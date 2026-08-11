@@ -1,4 +1,10 @@
-/target
+target/
+node_modules/
+dist/
+dist-test/
+*.tsbuildinfo
+.pytest_cache/
+
 /.venv
 .env
 .env.*

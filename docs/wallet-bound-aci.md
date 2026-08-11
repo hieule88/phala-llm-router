@@ -150,12 +150,15 @@ attempt that references it, successful or not.
 }
 ```
 
-`wallet_pub_key` may be either spelling of the account key: the full
-serialized Falcon `PublicKey` (897 bytes) or its 32-byte `Word` commitment —
-the form a Miden keystore keys its entries by, and therefore the form the
-extension has on hand. The verifier accepts both and binds the signature to
-whichever was claimed. Whatever spelling a wallet first binds with becomes its
-ledger identity, so a wallet MUST NOT alternate between them.
+`wallet_pub_key` may be any spelling of the account key the wallet has on
+hand: the bare Falcon `PublicKey` serialization (897 bytes), the SDK's tagged
+form (898 bytes — a one-byte auth-scheme discriminant, `0x02` =
+Falcon-512/Poseidon2, followed by the bare key; this is what
+`publicKey().serialize()` actually returns in `@miden-sdk` 0.15.x), or the
+32-byte `Word` commitment a Miden keystore keys its entries by. The verifier
+accepts all three and binds the signature to whichever was claimed. Whatever
+spelling a wallet first binds with becomes its ledger identity, so a wallet
+MUST NOT alternate between them.
 
 `account_id` is the bech32 Miden address. It is an **unverified claim**: the
 proven identity is `wallet_pub_key`, because that is what the signature attests
@@ -352,23 +355,31 @@ alongside `Authorization: Wallet lev_s_…`, so this ships without a migration.
 ### 9.1 Deploying the verifier
 
 `wallet-verifier` is a standalone crate (not part of the gateway's Cargo
-package), stateless and secretless, listening on `WALLET_VERIFIER_BIND`:
+package), stateless and secretless, listening on `WALLET_VERIFIER_BIND`. The
+deployable config lives in `ai-edge/docker-compose.wallet.yml` — an OPT-IN
+overlay on the existing Edge compose, so a routine `docker compose up` on the
+base file keeps today's behavior (wallet endpoints answer 501) and nothing
+changes until the operator deliberately deploys with both files:
 
-```yaml
-  wallet-verifier:
-    build: ./wallet-verifier
-    environment:
-      WALLET_VERIFIER_BIND: 0.0.0.0:8091
-    # No volumes, no secrets, no egress — it only answers /verify and /health.
+```bash
+# once: capture the §10 vector, gate the build
+cd wallet-verifier/tests/capture-vector && npm install && npm run capture
+cd ../.. && cargo test
 
-  ai-edge:
-    environment:
-      WALLET_AUTH_ENABLED: "true"
-      WALLET_VERIFIER_URL: http://wallet-verifier:8091
-      WALLET_SERVICE_ORIGIN: https://ai.leviathan.example
-      EDGE_WALLET_KEY_SECRET: ${EDGE_WALLET_KEY_SECRET}
-      WALLET_STATE_DB: /edge/state/wallet-state.db
+# add to ai-edge/.env
+echo "EDGE_WALLET_KEY_SECRET=$(openssl rand -hex 32)" >> ai-edge/.env
+
+# deploy — the ONLY step that touches running containers
+cd ai-edge
+docker compose -f docker-compose.yml -f docker-compose.wallet.yml up -d --build
 ```
+
+The overlay adds the `wallet-verifier` service (private network only, never
+exposed through Caddy) and flips the Edge's wallet env
+(`WALLET_AUTH_ENABLED`, `WALLET_VERIFIER_URL`, `WALLET_SERVICE_ORIGIN` from
+`EDGE_PUBLIC_DOMAIN`, `EDGE_WALLET_KEY_SECRET`, `WALLET_STATE_DB` on a named
+volume). The verifier's Docker build runs `cargo test`, so an image cannot be
+produced without the §10 vector gate passing.
 
 `WALLET_STATE_DB` must live on a volume: losing it invalidates every live
 session (users re-bind, nothing is lost but a click) — but losing it *while
@@ -384,8 +395,20 @@ The wallet signs with `@miden-sdk/miden-sdk` (WASM); the verifier deserializes
 with the `miden-crypto` crate. These MUST be the same generation of the Miden
 codebase — the crate has renamed the module (`rpo_falcon512` →
 `falcon512_poseidon2`) and the signature encoding is not stable across that
-boundary. `wallet-verifier` pins its version explicitly and ships a
-`tests/vectors/` directory; before deploying, capture one real
-`(public_key, word, signature)` triple from the wallet build in use and add it
-there. A verifier that cannot parse the wallet's signatures fails closed, which
-is safe but total — treat the vector test as a release gate.
+boundary. A verifier that cannot parse the wallet's signatures fails closed,
+which is safe but total — the vector test is a release gate, enforced twice:
+`cargo test` fails when `tests/vectors/` is empty, and the Docker image build
+runs the test suite.
+
+Producing the vector is automated: `tests/capture-vector/` creates a throwaway
+wallet with the extension's own key path (BIP-39 → `m/44'/0'/0'/0'` →
+`AuthSecretKey.rpoFalconWithRNG`) and signs test words — including a full
+§3.1-mapped bind statement — with the same `@miden-sdk` the extension ships.
+See its README; for releases, capture against the wallet's exact private
+registry build, not the public npm fallback.
+
+What the first capture established for `@miden-sdk` 0.15.0 ↔ `miden-crypto`
+0.29: the SDK wraps both the public key and the signature in a one-byte
+auth-scheme tag (`0x02` = Falcon-512/Poseidon2); the bytes inside are exactly
+the crate's encoding. The verifier therefore accepts bare and tagged forms
+(`read_bare_or_tagged`), refusing any other scheme tag.
