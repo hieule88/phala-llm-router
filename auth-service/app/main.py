@@ -333,8 +333,10 @@ class WalletBindRequest(BaseModel):
         description="SHA-256 hex of the spending credential the Edge derives "
                     "for this wallet. The raw key never reaches this service.")
     account_id: str | None = Field(None, max_length=256,
-        description="Bech32 Miden address. A public label for topup routing — "
-                    "never an authenticator.")
+        description="Bech32 Miden address. An UNVERIFIED claim, recorded as a "
+                    "public label — never an authenticator, and never a topup "
+                    "route until ownership of the address is proven. A claim "
+                    "conflict skips the label; it does not fail the bind.")
     initial_tier: str = Field("free", examples=["free", "starter", "pro"])
 
 

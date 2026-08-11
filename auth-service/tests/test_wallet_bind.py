@@ -118,11 +118,44 @@ class WalletBindTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res["success"])
         self.assertIn("another identity", res["error"])
 
-    async def test_refuses_to_steal_another_identitys_account_id(self):
-        await handlers.wallet_bind(self.conn, WALLET_A, key_hash("a"), account_id="mtst1qa")
+    async def test_conflicting_account_id_skips_the_label_but_binds(self):
+        # account_id is an unverified claim: a conflict must not fail the
+        # bind, or anyone could DoS a wallet by claiming its address first.
+        first = await handlers.wallet_bind(self.conn, WALLET_A, key_hash("a"), account_id="mtst1qa")
+        self.assertTrue(first["account_id_attached"])
+
         res = await handlers.wallet_bind(self.conn, WALLET_B, key_hash("b"), account_id="mtst1qa")
-        self.assertFalse(res["success"])
-        self.assertIn("another identity", res["error"])
+        self.assertTrue(res["success"])
+        self.assertFalse(res["account_id_attached"])
+        self.assertIn("not attached", res["warning"])
+        # The label stays with the first claimant; the second identity exists
+        # and can spend regardless.
+        self.assertEqual(
+            await handlers.lookup_identity(self.conn, "miden_account", "mtst1qa"),
+            first["identity_id"],
+        )
+        self.assertNotEqual(res["identity_id"], first["identity_id"])
+
+    async def test_squatting_an_address_cannot_block_the_victims_bind(self):
+        # The attack the soft-fail exists for: a squatter (valid signature,
+        # own wallet) claims the victim's address before the victim binds.
+        squatter = await handlers.wallet_bind(
+            self.conn, WALLET_B, key_hash("squatter"), account_id="mtst1qvictim",
+        )
+        self.assertTrue(squatter["account_id_attached"])
+
+        victim = await handlers.wallet_bind(
+            self.conn, WALLET_A, key_hash("victim"), account_id="mtst1qvictim",
+        )
+        self.assertTrue(victim["success"])
+        self.assertFalse(victim["account_id_attached"])
+        self.assertIn("warning", victim)
+        # Re-binding stays idempotent and keeps reporting the conflict.
+        again = await handlers.wallet_bind(
+            self.conn, WALLET_A, key_hash("victim"), account_id="mtst1qvictim",
+        )
+        self.assertTrue(again["success"])
+        self.assertFalse(again["account_id_attached"])
 
     async def test_two_wallets_get_two_identities(self):
         a = await handlers.wallet_bind(self.conn, WALLET_A, key_hash("a"))

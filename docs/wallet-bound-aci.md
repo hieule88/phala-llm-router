@@ -157,10 +157,12 @@ extension has on hand. The verifier accepts both and binds the signature to
 whichever was claimed. Whatever spelling a wallet first binds with becomes its
 ledger identity, so a wallet MUST NOT alternate between them.
 
-`account_id` is the bech32 Miden address. It is a *label*: the proven identity
-is `wallet_pub_key`, because that is what the signature attests to. The Edge
-records the address alongside it for payment routing, inside the signature's
-coverage, so it cannot be swapped by a relay.
+`account_id` is the bech32 Miden address. It is an **unverified claim**: the
+proven identity is `wallet_pub_key`, because that is what the signature attests
+to — the signature proves nothing about the address, which any wallet can put
+in its statement. The Edge records it inside the signature's coverage (so a
+relay cannot swap it), but it is a label only. Nothing may credit a balance
+routed by this label until ownership of the address is proven (§5).
 
 `scope` and `max_spend_mc` make a signature a **bounded grant**, not a blank
 cheque: the session may spend at most `max_spend_mc` millicredits and may only
@@ -194,10 +196,14 @@ On success the Edge stores a session and answers:
 ```json
 { "session_id": "lev_s_<32 hex>", "identity_id": 12,
   "expires_at": 1765086400, "scope": ["inference","receipts"],
-  "max_spend_mc": 100000, "balance_mc": 42000 }
+  "max_spend_mc": 100000, "balance_mc": 42000,
+  "account_id_attached": true }
 ```
 
 `session_id` is an opaque handle, **not a bearer credential** — see §6.
+`account_id_attached` reports whether the (unverified) address label stuck;
+when another identity claimed it first the bind still succeeds with
+`account_id_attached: false` and a `warning` (§5).
 
 ## 5. Wallet → ledger identity
 
@@ -212,8 +218,21 @@ POST /v1/wallet/bind
 
 which is idempotent and does three things: get-or-create the identity holding
 credential `("miden_wallet", wallet_pub_key)`; attach `("miden_account",
-account_id)` if given (a non-authenticator label, for topup routing); and attach
+account_id)` if given (a non-authenticator label); and attach
 `("api_key", api_key_hash)` to *that* identity.
+
+The `miden_account` label is first-come-first-served and **unverified**. When
+another identity already claims the address, the label is skipped — the bind
+still succeeds, and the response carries `account_id_attached: false` plus a
+`warning`. Failing the bind instead would let anyone deny a wallet service by
+claiming its (public) address first with a validly signed statement of their
+own. The flip side of first-come-first-served is that a squatter can hold the
+label; that is acceptable **only because the label routes nothing**: any future
+feature that credits topups by `miden_account` MUST first prove the address
+belongs to the wallet — by checking the on-chain account state (public
+accounts), or by having the wallet supply the seed/commitment material from
+which the address derives so the verifier can recompute it. Until then, topups
+route by payment-intent memo or identity id only.
 
 The api-key hash is how the Edge spends against the existing ledger without any
 change to `consume` / `settle` / `refund`. The raw key is never stored and never
@@ -311,6 +330,7 @@ inference — without the Edge being trusted for that claim.
 | Compromised Edge | Full compromise of wallet auth: it verifies signatures and holds `EDGE_WALLET_KEY_SECRET`, so it can bind arbitrary wallets and spend their balances. Mitigation path: move §4.3 verification and the key derivation into the TEE gateway, so the Edge only relays. Prompts stay confidential regardless — they are E2EE'd to the attested key, which the Edge does not hold. |
 | Compromised wallet-verifier | Can approve forged binds. Deploy it inside the TEE, or have the Edge additionally require that the challenge nonce it issued is the one signed (it does). |
 | Replay of a whole signed request | Blocked by ts + nonce cache; billing dedup (`Idempotency-Key`) is unchanged and independent. |
+| Claims someone else's `account_id` in a validly signed bind (address squatting) | Cannot block the victim's bind (a claim conflict skips the label, never fails the bind) and cannot spend or receive anything by it: the label authenticates nothing and routes no topups. What it buys the squatter is holding an unverified label — which stops mattering the moment address ownership proof lands (§5). |
 | Quantum adversary | The *root* authority is Falcon-512 (PQ). The session tier is Ed25519, so a future quantum adversary who records traffic could forge session signatures — but only within a session's ≤24 h lifetime and only up to `max_spend_mc`. Prompt confidentiality against harvest-now-decrypt-later is the gateway's ML-KEM story, not this layer's. |
 | Lost device | Sessions expire in ≤24 h. `POST /v1/wallet/sessions/revoke-all` after a re-bind from any device with the mnemonic kills the rest. |
 

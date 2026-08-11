@@ -161,6 +161,11 @@ class AuthResult:
     # when a credit was actually spent. Absent on an idempotent replay —
     # which is exactly why a replay can never trigger a refund.
     debit_token: Optional[str] = None
+    # Wallet-bind only: whether the (unverified) miden_account label was
+    # attached, and the ledger's warning when it was skipped on a claim
+    # conflict. The bind itself succeeds either way.
+    account_id_attached: Optional[bool] = None
+    warning: Optional[str] = None
 
 
 class AuthClient:
@@ -286,13 +291,17 @@ class AuthClient:
         except httpx.RequestError as e:
             return AuthResult(DENY_DOWN, error=f"auth unreachable: {e}")
         if r.status_code == 409:
-            # The wallet or its derived credential collides with another
-            # identity. Not retryable, and not the caller's to fix silently.
+            # The wallet's derived spending credential collides with another
+            # identity. (An account_id label conflict is NOT a 409 — the
+            # ledger skips the label and the bind succeeds with a warning.)
+            # Not retryable, and not the caller's to fix silently.
             return AuthResult(DENY_UNAUTH, error=str(r.json().get("detail", "wallet bind conflict")))
         if not (200 <= r.status_code < 300):
             return AuthResult(DENY_DOWN, error=f"auth returned {r.status_code}")
         data = r.json()
-        return AuthResult(ALLOW, balance=data.get("balance"), identity_id=data.get("identity_id"))
+        return AuthResult(ALLOW, balance=data.get("balance"), identity_id=data.get("identity_id"),
+                          account_id_attached=data.get("account_id_attached"),
+                          warning=data.get("warning"))
 
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -518,7 +527,7 @@ async def wallet_bind(request: Request):
     session = wallet.store.create_session(
         res.identity_id, statement, statement["scope"], wallet.now(),
     )
-    return {
+    out = {
         "session_id": session.session_id,
         "identity_id": session.identity_id,
         "expires_at": session.expires_at,
@@ -526,6 +535,11 @@ async def wallet_bind(request: Request):
         "max_spend_mc": session.max_spend_mc,
         "balance_mc": res.balance,
     }
+    if res.account_id_attached is not None:
+        out["account_id_attached"] = res.account_id_attached
+    if res.warning:
+        out["warning"] = res.warning
+    return out
 
 
 @app.post("/v1/wallet/session/revoke")

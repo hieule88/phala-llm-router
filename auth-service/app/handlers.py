@@ -288,9 +288,9 @@ async def wallet_bind(
 
     Three effects, all idempotent, all in one transaction:
       1. get-or-create the identity holding ('miden_wallet', wallet_pub_key),
-      2. attach ('miden_account', account_id) as a public label for topup
-         routing — never an authenticator (it is a public address, and a public
-         value that can spend is a public balance),
+      2. attach ('miden_account', account_id) as a public label — never an
+         authenticator (it is a public address, and a public value that can
+         spend is a public balance),
       3. attach ('api_key', api_key_hash) to THAT identity. This is how the
          wallet spends through the ordinary consume/settle/refund path with no
          changes to it; the Edge derives the raw key from the wallet public key
@@ -323,6 +323,8 @@ async def wallet_bind(
                 (identity_id, get_tier(initial_tier).name),
             )
 
+        account_id_attached = False
+        account_id_conflict = False
         if account_id:
             cur = await conn.execute(
                 "SELECT identity_id FROM credentials "
@@ -332,16 +334,15 @@ async def wallet_bind(
             )
             owner = await cur.fetchone()
             if owner and owner[0] != identity_id:
-                # The address is claimed by another identity. Refuse rather
-                # than silently binding a wallet to an address that routes
-                # someone else's topups.
-                return {"success": False, "error": "account_id belongs to another identity"}
-            if not owner:
-                await conn.execute(
-                    "INSERT INTO credentials (identity_id, credential_type, credential_value) "
-                    "VALUES (?, 'miden_account', ?)",
-                    (identity_id, account_id),
-                )
+                account_id_conflict = True
+            else:
+                if not owner:
+                    await conn.execute(
+                        "INSERT INTO credentials (identity_id, credential_type, credential_value) "
+                        "VALUES (?, 'miden_account', ?)",
+                        (identity_id, account_id),
+                    )
+                account_id_attached = True
 
         cur = await conn.execute(
             "SELECT identity_id FROM credentials "
@@ -363,14 +364,21 @@ async def wallet_bind(
         )
         bal = await cur.fetchone()
 
-    return {
+    result = {
         "success": True,
         "identity_id": identity_id,
         "created": created,
         "balance": bal[0] if bal else 0,
         "unit": "millicredit",
         "tier": bal[1] if bal else get_tier(initial_tier).name,
+        "account_id_attached": account_id_attached,
     }
+    if account_id_conflict:
+        result["warning"] = (
+            "account_id is already claimed by another identity; "
+            "the label was not attached and topups will not route by it"
+        )
+    return result
 
 
 async def revoke_credential(
