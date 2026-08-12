@@ -330,6 +330,30 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Leviathan AI Edge", lifespan=lifespan)
 
+# Cross-origin browser access, OFF by default. The wallet dApp page is served
+# on the Edge's own origin (Caddy /wallet/*) precisely so it needs no CORS;
+# set this only for a frontend hosted elsewhere (e.g. the Railway chat app)
+# that must call the Edge directly from the browser. Exact origins,
+# comma-separated — never "*": with "*" any web page could drive a visitor's
+# wallet session cross-site. Auth still rests on per-request signatures; CORS
+# here only gates which pages a browser will let talk to us at all.
+EDGE_CORS_ORIGINS = [o.strip() for o in os.getenv("EDGE_CORS_ORIGINS", "").split(",") if o.strip()]
+if EDGE_CORS_ORIGINS:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=EDGE_CORS_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=[
+            "authorization", "content-type", "idempotency-key",
+            "x-wallet-timestamp", "x-wallet-nonce", "x-wallet-signature",
+            "x-signing-algo", "x-client-pub-key", "x-model-pub-key",
+            "x-e2ee-version", "x-e2ee-nonce", "x-e2ee-timestamp",
+        ],
+        expose_headers=["x-receipt-id"],
+    )
+
 
 def _bearer(request: Request) -> Optional[str]:
     return _authorization(request, "bearer")

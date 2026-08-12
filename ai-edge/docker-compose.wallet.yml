@@ -45,5 +45,12 @@ services:
       - auth-service
       - wallet-verifier
 
+  # The wallet dApp page, on the Edge's own origin (https://<EDGE_DOMAIN>/wallet/).
+  # Copy it here before deploying:
+  #   cp -r <verify-repo>/wallet-aci/dapp ./wallet-dapp
+  caddy:
+    volumes:
+      - ${WALLET_DAPP_DIR:-./wallet-dapp}:/srv/wallet-dapp:ro
+
 volumes:
   edge_wallet_state:

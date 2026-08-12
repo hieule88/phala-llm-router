@@ -24,7 +24,18 @@
 # The Edge: the full OpenAI-compatible surface is user-facing by design
 # (per-key auth + metering happen inside the Edge itself).
 {$EDGE_PUBLIC_DOMAIN} {
-	reverse_proxy edge:8090 {
-		header_up X-Real-IP {remote_host}
+	# Wallet dApp page (wallet-bound ACI), served on the Edge's OWN origin: the
+	# browser needs no CORS, and the origin users approve in the wallet popup
+	# is exactly the WALLET_SERVICE_ORIGIN that bind statements must name.
+	# 404s harmlessly until docker-compose.wallet.yml mounts the files.
+	redir /wallet /wallet/ 308
+	handle_path /wallet/* {
+		root * /srv/wallet-dapp
+		file_server
+	}
+	handle {
+		reverse_proxy edge:8090 {
+			header_up X-Real-IP {remote_host}
+		}
 	}
 }
