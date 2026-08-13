@@ -9,9 +9,16 @@ dist-test/
 .env
 .env.*
 !.env.example
+!.env.*.example
 *.log
 *.tmp
 __pycache__/
 *.py[cod]
 .DS_Store
 /docs
+
+# cargo vendor output (large; regenerate with `cargo vendor`)
+wallet-verifier/vendor/
+
+# npm auth tokens for the private registry — NEVER commit (contains a token)
+.npmrc

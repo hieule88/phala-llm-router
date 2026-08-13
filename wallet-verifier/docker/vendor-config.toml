@@ -1,0 +1,15 @@
+# Cargo source replacement for OFFLINE Docker builds. The wallet's miden-crypto
+# lives on a private git host (git.softly.com) that the Docker builder cannot
+# reach; `cargo vendor` (run on the host, which HAS git credentials) copies every
+# dependency into ./vendor, and this file redirects cargo to it. Used only inside
+# the image (copied to .cargo/config.toml there) — host builds are unaffected.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://git.softly.com/leviathan/crypto?branch=v0.23.0"]
+git = "https://git.softly.com/leviathan/crypto"
+branch = "v0.23.0"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
