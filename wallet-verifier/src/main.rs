@@ -139,6 +139,7 @@ async fn verify(Json(req): Json<VerifyRequest>) -> Result<Json<VerifyResponse>, 
         ClaimedKey::Full(pk) => Serializable::to_bytes(&signer) == Serializable::to_bytes(&pk),
         ClaimedKey::Commitment(word) => signer.to_commitment() == *word,
     };
+
     if !binds_to_claim {
         return Ok(Json(VerifyResponse { valid: false }));
     }
