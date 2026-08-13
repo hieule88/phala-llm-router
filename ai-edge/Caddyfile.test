@@ -1,0 +1,42 @@
+# TEST stack Caddy — real HTTPS on port 8443 via Let's Encrypt DNS-01 (DuckDNS).
+#
+# Production's Caddy owns :80/:443 on this host, so this test front cannot use
+# them. DNS-01 proves domain control with a TXT record instead of an inbound
+# challenge, so we can get a genuine, browser-trusted cert while listening only
+# on 8443. Nothing about the production Caddy is touched.
+#
+# Domains come from the test .env (EDGE_PUBLIC_DOMAIN / AUTH_PUBLIC_DOMAIN set
+# to the -test DuckDNS names); the DuckDNS token comes from DUCKDNS_TOKEN.
+
+{
+	# Force the DNS-01 challenge for every site — otherwise Caddy would try
+	# HTTP-01/TLS-ALPN on :80/:443, which are taken and unreachable here.
+	acme_dns duckdns {env.DUCKDNS_TOKEN}
+}
+
+# Edge (dApp + OpenAI-compatible API), same /wallet/ routing as production.
+{$EDGE_PUBLIC_DOMAIN}:8443 {
+	redir /wallet /wallet/ 308
+	handle_path /wallet/* {
+		root * /srv/wallet-dapp
+		file_server
+	}
+	handle {
+		reverse_proxy edge:8090 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}
+
+# Auth-service: only the public payment/signup surface, exactly like prod.
+{$AUTH_PUBLIC_DOMAIN}:8443 {
+	@public path /v1/signup /v1/keys/rotate /v1/webhooks/nowpayments /v1/payment-intents /v1/payment-intents/* /v1/validate
+	handle @public {
+		reverse_proxy auth-service:8000 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

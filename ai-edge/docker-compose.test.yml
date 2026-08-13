@@ -1,0 +1,75 @@
+# Parallel TEST stack — mirrors production but fully isolated from it.
+#
+# Different compose PROJECT (leviathan-test) → its own network, its own
+# volumes (leviathan-test_*), its own container names (…-test). The running
+# production stack (project leviathan-ai-edge: leviathan-ai-edge /
+# leviathan-auth-service / leviathan-caddy) is NEVER touched by these commands:
+# different project + different container_name + different host ports.
+#
+# It builds SEPARATE images (leviathan-test-*), so `--build` here does not
+# overwrite the images the production containers run.
+#
+# Bring up / tear down (helper: ./test-stack.sh):
+#   docker compose -p leviathan-test \
+#     -f docker-compose.yml -f docker-compose.wallet.yml -f docker-compose.test.yml \
+#     --env-file .env.test up -d --build
+#   docker compose -p leviathan-test ... down            # add -v to drop test volumes
+#
+# Reach it (real HTTPS on 8443, cert via DNS-01 — host firewall must allow
+# inbound 8443):
+#   dApp   : https://leviathan-edge-test.duckdns.org:8443/wallet/
+#   API    : https://leviathan-edge-test.duckdns.org:8443/v1/...
+#            (also http://127.0.0.1:18090 direct, no TLS, for debugging)
+#   admin  : http://127.0.0.1:18000         (topup test identities, localhost)
+#
+# This overlay is layered ON TOP of docker-compose.wallet.yml, so it inherits
+# the wallet-verifier service and the Edge's wallet env; here we only rename
+# things to -test, isolate ports, and drop TLS.
+
+name: leviathan-test
+
+services:
+  auth-service:
+    container_name: leviathan-auth-service-test
+    # Localhost-only admin port so you can topup test identities directly,
+    # without going through Caddy. Not reachable off the host.
+    ports:
+      - "127.0.0.1:18000:8000"
+
+  wallet-verifier:
+    container_name: leviathan-wallet-verifier-test
+
+  edge:
+    container_name: leviathan-ai-edge-test
+    # Direct localhost port for health checks / debugging (prod edge has none).
+    ports:
+      - "127.0.0.1:18090:8090"
+    # Override the wallet overlay's https://${EDGE_PUBLIC_DOMAIN}: the test box
+    # is plain HTTP, and this must equal the origin the browser shows for the
+    # dApp EXACTLY (http://localhost:8088) or binds are refused. This file is
+    # last in the -f chain, so this value wins.
+    environment:
+      - WALLET_SERVICE_ORIGIN=${WALLET_SERVICE_ORIGIN}
+
+  caddy:
+    container_name: leviathan-caddy-test
+    # Custom Caddy image (stock + DuckDNS DNS provider) so it can get real
+    # Let's Encrypt certs via DNS-01 without :80/:443. Built as a SEPARATE
+    # image name, so production's caddy:2 image is untouched.
+    build: ./caddy-test
+    image: leviathan-test-caddy
+    # REPLACE the prod 80/443 bindings (held by leviathan-caddy) with 8443,
+    # which production does not use. !override, not append — else it would also
+    # try to grab 80/443 and clash. TLS is served here on 8443 via DNS-01.
+    ports: !override
+      - "8443:8443"
+    # DuckDNS token for the DNS-01 challenge. EDGE_PUBLIC_DOMAIN /
+    # AUTH_PUBLIC_DOMAIN (the -test DuckDNS names) come from the base caddy env.
+    environment:
+      - DUCKDNS_TOKEN=${DUCKDNS_TOKEN:?set DUCKDNS_TOKEN in .env.test}
+    # REPLACE the volume list: swap in the DNS-01 test Caddyfile and mount the
+    # dApp. caddy_data (holds the issued cert) → leviathan-test_caddy_data.
+    volumes: !override
+      - ./Caddyfile.test:/etc/caddy/Caddyfile:ro
+      - ${WALLET_DAPP_DIR:-./wallet-dapp}:/srv/wallet-dapp:ro
+      - caddy_data:/data
