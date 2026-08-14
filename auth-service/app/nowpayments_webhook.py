@@ -64,24 +64,14 @@ def _require_secret() -> str:
     return NOWPAYMENTS_IPN_SECRET
 
 
-def _canonical_json(payload: dict) -> bytes:
-    """Serialize with keys sorted alphabetically and no whitespace — this
-    is the exact byte sequence NOWPayments signs, per their IPN spec.
-    Anything else and the HMAC comparison fails even for a valid event.
-
-    ensure_ascii=False so non-ASCII strings (Cyrillic customer names,
-    emoji in `order_description`, CJK) are emitted as raw UTF-8, which
-    matches Node's `JSON.stringify` — the format NOWPayments actually
-    signs. Python's default `ensure_ascii=True` escapes them as \\uXXXX
-    and drops every legit event with a non-ASCII field.
-    """
-    return json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-    ).encode("utf-8")
-
-
 def verify_and_parse(raw_body: bytes, signature_header: Optional[str]) -> dict:
     """Verify HMAC-SHA512 signature and return the parsed IPN payload.
+
+    NOWPayments signs the HMAC over the **exact raw request body** it sends —
+    NOT a re-serialized/sorted form. Re-encoding (sort keys, whitespace, slash
+    or unicode escaping) produces different bytes and the HMAC never matches;
+    verified empirically against real sandbox IPNs. So we HMAC `raw_body` as-is
+    and only parse it into a dict afterwards, for the caller.
 
     Raises WebhookError with the HTTP status FastAPI should surface.
     """
@@ -91,23 +81,18 @@ def verify_and_parse(raw_body: bytes, signature_header: Optional[str]) -> dict:
     if len(raw_body) > MAX_IPN_BODY_BYTES:
         raise WebhookError(413, "IPN body too large")
 
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha512).hexdigest()
+    # Constant-time compare so an attacker can't derive the secret via
+    # per-byte response-time differences.
+    if not hmac.compare_digest(expected, signature_header.strip()):
+        raise WebhookError(401, "invalid NOWPayments signature")
+
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError as e:
         raise WebhookError(400, f"invalid JSON payload: {e}") from None
     if not isinstance(payload, dict):
         raise WebhookError(400, "IPN payload must be a JSON object")
-
-    # Rebuild the canonical form NOWPayments signed and compare.
-    expected = hmac.new(
-        secret.encode(),
-        _canonical_json(payload),
-        hashlib.sha512,
-    ).hexdigest()
-    # Constant-time compare so an attacker can't derive the secret via
-    # per-byte response-time differences.
-    if not hmac.compare_digest(expected, signature_header.strip()):
-        raise WebhookError(401, "invalid NOWPayments signature")
 
     return payload
 

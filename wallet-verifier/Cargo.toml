@@ -10,17 +10,6 @@ name = "leviathan-wallet-verifier"
 path = "src/main.rs"
 
 [dependencies]
-# The ONLY security-relevant dependency. It MUST be the exact miden-crypto the
-# wallet's @miden-sdk was built against — even between two "falcon512_poseidon2"
-# builds, the Poseidon2 parameters differ across versions and break verification
-# (see docs/wallet-bound-aci.md §10). The deployed wallet (chrome build, commit
-# 1cb20f4) links miden-crypto from the Leviathan fork at branch v0.23.0; the exact
-# rev is read from leviathan-client's Cargo.toml. crates.io 0.29 did NOT match and
-# failed every real signature. Fetching needs git.softly.com credentials — build
-# with CARGO_NET_GIT_FETCH_WITH_CLI=true so cargo uses the stored git credential.
-# branch (not rev) because the Gitea remote does not advertise HEAD, which the
-# rev-fetch path requires; v0.23.0's tip IS 08a97016cd0c3224818f649cb3accc90b2db1936
-# (Cargo.lock pins the exact commit for reproducibility).
 miden-crypto = { git = "https://git.softly.com/leviathan/crypto", branch = "v0.23.0", default-features = false, features = ["std"] }
 
 axum = "0.7"

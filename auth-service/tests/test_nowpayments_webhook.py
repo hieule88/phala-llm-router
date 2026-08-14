@@ -29,16 +29,16 @@ def run(coro):
 IPN_SECRET = "test_ipn_secret_" + "b" * 32
 
 
-def _canonical(payload: dict) -> bytes:
-    """Same canonicalisation as the production handler — must match
-    NOWPayments' signing format exactly (sorted keys, no whitespace)."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+def _sign_bytes(body: bytes) -> str:
+    """Sign the EXACT bytes, the way NOWPayments does (HMAC over the raw body)."""
+    return hmac.new(IPN_SECRET.encode(), body, hashlib.sha512).hexdigest()
 
 
 def _sign(payload: dict) -> tuple[bytes, str]:
-    body = _canonical(payload)
-    sig = hmac.new(IPN_SECRET.encode(), body, hashlib.sha512).hexdigest()
-    return body, sig
+    # The wire body can be any encoding NOWPayments chooses; the handler HMACs
+    # whatever raw bytes arrive, so the test signs the exact bytes it will send.
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    return body, _sign_bytes(body)
 
 
 def _payload(
@@ -94,6 +94,14 @@ class SignatureVerifyTest(SetupMixin, unittest.TestCase):
         body, sig = _sign(_payload())
         payload = self.mod.verify_and_parse(body, sig)
         self.assertEqual(payload["payment_status"], "finished")
+
+    def test_verifies_raw_body_verbatim_unsorted_with_slashes(self):
+        # Regression: NOWPayments signs the RAW body it sends — unsorted keys,
+        # whitespace, and unescaped slashes included. Re-serializing/sorting
+        # (the old bug) would change the bytes and 401 a valid event.
+        raw = b'{"payment_status": "finished", "order_id": "intent-abc/def", "pay_url": "https://x.io/p"}'
+        payload = self.mod.verify_and_parse(raw, _sign_bytes(raw))
+        self.assertEqual(payload["order_id"], "intent-abc/def")
 
     def test_valid_signature_with_wrong_body_bytes_fails(self):
         # If we tamper with the body after signing, verification must
