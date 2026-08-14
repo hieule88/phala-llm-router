@@ -39,6 +39,12 @@ services:
       # cache: losing it mid-session drops live sessions' spend tallies
       # (docs §9), hence the named volume.
       - WALLET_STATE_DB=/edge/state/wallet-state.db
+      # Cross-origin browser access for a separate frontend app. Empty = OFF
+      # (only the same-origin /wallet/ page can call the Edge). Set
+      # EDGE_CORS_ORIGINS in the env file to a comma-separated origin list, or
+      # `*` for any origin (safe here: auth is per-request signature/api-key,
+      # not cookies). app.py only adds CORS middleware when this is non-empty.
+      - EDGE_CORS_ORIGINS=${EDGE_CORS_ORIGINS:-}
     volumes:
       - edge_wallet_state:/edge/state
     depends_on:

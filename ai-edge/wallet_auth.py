@@ -1,6 +1,6 @@
 """Wallet-bound authentication for the Leviathan AI Edge.
 
-The user's Miden wallet IS the AI account. Instead of a bearer api key, the
+The user's Leviathan wallet IS the AI account. Instead of a bearer api key, the
 Edge accepts:
 
   * a **bind statement** signed by the wallet's Falcon-512 account key, which
@@ -12,7 +12,7 @@ Edge accepts:
 See ../docs/wallet-bound-aci.md for the protocol. Everything here is pure
 logic + SQLite; the FastAPI wiring lives in app.py, and Falcon verification is
 delegated to the stateless `wallet-verifier` service (no Python implementation
-of Miden's Falcon exists).
+of Leviathan's Falcon exists).
 
 Design notes worth keeping in mind while editing:
 
@@ -49,7 +49,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 BIND_PURPOSE = "leviathan.wallet.bind.v1"
 REQUEST_PURPOSE = "leviathan.wallet.request.v1"
 
-# Goldilocks prime: Miden field elements live in [0, p).
+# Goldilocks prime: Leviathan field elements live in [0, p).
 GOLDILOCKS_P = (1 << 64) - (1 << 32) + 1
 
 SESSION_PREFIX = "lev_s_"
@@ -649,12 +649,14 @@ class WalletAuthenticator:
         path: str,
         body: bytes,
         headers: dict,
-        required_scope: str,
+        required_scope: Optional[str],
     ) -> WalletSession:
         now = self.now()
         session = self.store.get_session(session_id, now)
 
-        if required_scope not in session.scope:
+        # `required_scope=None` means "any valid session" — used by actions that
+        # are not a delegated spend/read (e.g. topping up one's own balance).
+        if required_scope is not None and required_scope not in session.scope:
             raise WalletAuthError(
                 "wallet_scope", f"session was not authorized for '{required_scope}'", status=403,
             )

@@ -98,6 +98,13 @@ class WalletHttpTest(unittest.TestCase):
             })
         if path == "/v1/validate":
             return httpx.Response(200, json={"valid": True, "identity_id": 7, "balance": 49000})
+        if path == "/v1/payment-intents":
+            return httpx.Response(201, json={
+                "success": True, "intent_id": 3, "identity_id": 7,
+                "credits": body.get("credits"), "amount_cents": body.get("credits"),
+                "memo": "memo_abc123", "provider": body.get("provider"), "status": "pending",
+                "invoice_url": "https://nowpayments.example/pay/memo_abc123",
+            })
         return httpx.Response(200, json={"success": True})
 
     def _gateway(self, request: httpx.Request) -> httpx.Response:
@@ -266,6 +273,58 @@ class WalletHttpTest(unittest.TestCase):
                                          nonce="33" * 16),
             content=b"{}")
         self.assertEqual(after.json()["error"]["type"], "wallet_session_revoked")
+
+    def test_wallet_can_create_a_nowpayments_topup(self):
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        body = b'{"credits": 300}'
+        out = self.client.post(
+            "/v1/wallet/payment-intents",
+            headers=self._signed_headers(sk, session_id, "POST", "/v1/wallet/payment-intents", body),
+            content=body)
+        self.assertEqual(out.status_code, 200, out.text)
+        j = out.json()
+        self.assertEqual(j["memo"], "memo_abc123")
+        self.assertIn("nowpayments.example", j["invoice_url"])
+        # The ledger must receive the wallet's DERIVED api_key hash — never a raw key.
+        _, payload = next(c for c in self.ledger_calls if c[0] == "/v1/payment-intents")
+        self.assertEqual(payload["credential_type"], "api_key")
+        self.assertEqual(payload["credential_value"],
+                         self.edge.app.state.wallet.spend_credential_hash(WALLET_PK))
+        self.assertEqual(payload["credits"], 300)
+
+    def test_topup_rejects_non_positive_credits(self):
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        body = b'{"credits": 0}'
+        out = self.client.post(
+            "/v1/wallet/payment-intents",
+            headers=self._signed_headers(sk, session_id, "POST", "/v1/wallet/payment-intents", body),
+            content=body)
+        self.assertEqual(out.status_code, 400)
+        self.assertEqual(out.json()["error"]["type"], "wallet_invalid_request")
+
+    def test_wallet_balance_is_a_signed_read(self):
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        out = self.client.get(
+            "/v1/wallet/balance",
+            headers=self._signed_headers(sk, session_id, "GET", "/v1/wallet/balance", b""))
+        self.assertEqual(out.status_code, 200, out.text)
+        self.assertEqual(out.json()["balance_mc"], 49000)  # from the mock /v1/validate
+        # And it must reject an unsigned request (session id alone is not a credential).
+        bare = self.client.get("/v1/wallet/balance",
+                               headers={"authorization": f"Wallet {session_id}"})
+        self.assertEqual(bare.status_code, 401)
+
+    def test_topup_requires_a_wallet_session(self):
+        # An api key has its own /v1/payment-intents; this wallet endpoint refuses it.
+        out = self.client.post(
+            "/v1/wallet/payment-intents",
+            headers={"authorization": "Bearer lev_plainkey", "content-type": "application/json"},
+            content=b'{"credits": 300}')
+        self.assertEqual(out.status_code, 400)
+        self.assertEqual(out.json()["error"]["type"], "wallet_required")
 
     def test_api_key_path_still_works_alongside(self):
         body = b'{"model":"m"}'

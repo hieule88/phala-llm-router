@@ -38,6 +38,8 @@ Wallet endpoints (only when WALLET_AUTH_ENABLED=true):
   POST /v1/wallet/bind                 -> Falcon-verified session
   POST /v1/wallet/session/revoke       -> end this session (sent on wallet lock)
   POST /v1/wallet/sessions/revoke-all  -> end every session of this wallet
+  POST /v1/wallet/payment-intents      -> self-serve top-up (NOWPayments) for the wallet
+  GET  /v1/wallet/balance              -> current balance (signed read, no re-bind)
 """
 
 from __future__ import annotations
@@ -302,6 +304,36 @@ class AuthClient:
         return AuthResult(ALLOW, balance=data.get("balance"), identity_id=data.get("identity_id"),
                           account_id_attached=data.get("account_id_attached"),
                           warning=data.get("warning"))
+
+    async def create_payment_intent_hashed(
+        self, key_hash: str, credits: int, provider: str = "nowpayments",
+    ) -> "tuple[Optional[dict], Optional[AuthResult]]":
+        """Create a payment intent for the identity behind `key_hash`.
+
+        Wallet users have no raw api key, so the Edge presents their derived
+        credential hash to the SAME user-facing intent endpoint api-key users
+        hit. auth-service resolves it to the wallet's identity, mints the
+        NOWPayments invoice, and the existing webhook credits it on payment.
+        Returns (intent, None) on success or (None, AuthResult) on failure.
+        """
+        try:
+            r = await self._c.post(
+                f"{AUTH_SERVICE_URL}/v1/payment-intents",
+                json={
+                    "credential_type": "api_key", "credential_value": key_hash,
+                    "credits": credits, "provider": provider,
+                },
+            )
+        except httpx.RequestError as e:
+            return None, AuthResult(DENY_DOWN, error=f"auth unreachable: {e}")
+        if not (200 <= r.status_code < 300):
+            try:
+                detail = r.json().get("detail")
+            except Exception:
+                detail = None
+            status = DENY_UNAUTH if r.status_code in (400, 401) else DENY_DOWN
+            return None, AuthResult(status, error=str(detail or f"auth returned {r.status_code}"))
+        return r.json(), None
 
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -601,6 +633,64 @@ async def wallet_sessions_revoke_all(request: Request):
     wallet = request.app.state.wallet
     return {"revoked": wallet.store.revoke_all_for_wallet(
         principal.session.wallet_pub_key, wallet.now())}
+
+
+@app.post("/v1/wallet/payment-intents")
+async def wallet_payment_intent(request: Request):
+    """Self-serve top-up for a wallet — the NOWPayments path api-key users have.
+
+    A wallet has no raw api key to authenticate the payment endpoint with, so
+    the Edge authenticates the wallet session (Ed25519), derives the wallet's
+    credential hash, and creates the intent on its behalf. The returned
+    `invoice_url` is a normal NOWPayments checkout; on payment the existing IPN
+    webhook credits this wallet's identity — no wallet-specific billing code.
+    """
+    body = await request.body()
+    try:
+        # No spend/read scope required: funding your own balance only helps you.
+        principal = await _resolve_principal(request, "/v1/wallet/payment-intents", body, None)
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+    if principal.session is None:
+        return _wallet_error(WalletAuthError(
+            "wallet_required", "only a wallet session can create a wallet top-up", status=400))
+
+    try:
+        payload = json.loads(body or b"{}")
+    except ValueError:
+        return _wallet_error(WalletAuthError("wallet_invalid_request", "body must be JSON", status=400))
+    if not isinstance(payload, dict):
+        return _wallet_error(WalletAuthError("wallet_invalid_request", "body must be a JSON object", status=400))
+    credits = payload.get("credits")
+    if isinstance(credits, bool) or not isinstance(credits, int) or credits <= 0:
+        return _wallet_error(WalletAuthError(
+            "wallet_invalid_request", "credits must be a positive integer", status=400))
+    provider = payload.get("provider", "nowpayments")
+    if not isinstance(provider, str):
+        return _wallet_error(WalletAuthError("wallet_invalid_request", "provider must be a string", status=400))
+
+    intent, err = await request.app.state.auth.create_payment_intent_hashed(
+        principal.credential_hash, credits, provider)
+    if err is not None:
+        return _deny_response(err)
+    return intent
+
+
+@app.get("/v1/wallet/balance")
+async def wallet_balance(request: Request):
+    """Current credit balance for the authenticated wallet.
+
+    A signed READ — one Ed25519-signed GET, no Falcon and no re-bind — so a page
+    can refresh the balance after a top-up without reconnecting the wallet.
+    """
+    try:
+        principal = await _resolve_principal(request, "/v1/wallet/balance", b"", None)
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+    res = await request.app.state.auth.validate_hashed(principal.credential_hash)
+    if res.status in (DENY_UNAUTH, DENY_DOWN):   # ALLOW and DENY_NO_BALANCE both carry a balance
+        return _deny_response(res)
+    return {"balance_mc": res.balance, "identity_id": res.identity_id}
 
 
 async def _metered_proxy(request: Request, path: str) -> Response:
