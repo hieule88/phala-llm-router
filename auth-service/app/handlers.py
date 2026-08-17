@@ -934,7 +934,7 @@ async def mark_paid_by_memo(
                 "status": "paid",
                 "deduplicated": True,
             }
-        if status != "pending":
+        if status != "pending" and not (status == "expired" and allow_expired):
             return {
                 "success": False,
                 "error": f"intent is {status}, cannot mark paid",

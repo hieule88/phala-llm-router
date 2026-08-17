@@ -20,6 +20,7 @@ misrouted event can't credit an arbitrary account.
 import hashlib
 import hmac
 import json
+import logging
 import os
 from typing import Optional
 
@@ -27,6 +28,9 @@ import aiosqlite
 
 from . import handlers
 
+# Money-path logging. A `finished` IPN that fails to credit is real revenue
+# with no ledger entry — it must leave a trace even when the HTTP layer ACKs.
+logger = logging.getLogger("auth.nowpayments")
 
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
 
@@ -172,6 +176,8 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
     """
     status = payload.get("payment_status")
     if status not in TERMINAL_SUCCESS_STATUSES:
+        logger.info("IPN %s ack'd, no credit (payment_id=%s order_id=%s)",
+                    status, payload.get("payment_id"), payload.get("order_id"))
         return {"handled": False, "payment_status": status}
 
     order_id = payload.get("order_id")
@@ -202,9 +208,20 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
             actual_amount_cents=actual_cents,
             # A slow bank/crypto confirm may land after the intent's
             # TTL. NOWPayments' 'finished' signal is money-in-hand;
-            # dropping it on expiry would lose real revenue.
+            # dropping it on expiry would lose real revenue. This also
+            # pays intents already lazily flipped to 'expired'.
             allow_expired=True,
         )
+        if result.get("success"):
+            logger.info("IPN finished credited (payment_id=%s memo=%s dedup=%s)",
+                        payment_id, order_id, bool(result.get("deduplicated")))
+        else:
+            logger.error(
+                "MONEY RECEIVED BUT NOT CREDITED: payment_id=%s memo=%s "
+                "amount=%s %s error=%r — investigate and finalise via "
+                "POST /v1/payment-intents/%s/mark-paid",
+                payment_id, order_id, price_amount, price_currency,
+                result.get("error"), order_id)
         return {"handled": True, "payment_status": status, "result": result}
 
     # Legacy identity:<id> path — direct topup by identity, source keyed
@@ -214,4 +231,12 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
     credits = _usd_to_credits(price_amount, price_currency)
     source = f"nowpayments:{payment_id}"
     result = await handlers.topup(conn, identity_id, credits, source)
+    if result.get("success"):
+        logger.info("IPN finished credited (payment_id=%s identity=%s credits=%s)",
+                    payment_id, identity_id, credits)
+    else:
+        logger.error(
+            "MONEY RECEIVED BUT NOT CREDITED: payment_id=%s identity=%s "
+            "credits=%s error=%r — finalise manually via POST /v1/topup",
+            payment_id, identity_id, credits, result.get("error"))
     return {"handled": True, "payment_status": status, "result": result}

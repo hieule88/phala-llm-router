@@ -390,6 +390,10 @@ class MarkIntentPaidRequest(BaseModel):
         description="External reference for audit (bank tx id, payment id, etc.).")
     actual_amount_cents: Optional[int] = Field(None, gt=0,
         description="If provided, must be >= intent's expected amount_cents.")
+    allow_expired: bool = Field(False,
+        description="Honour a payment that landed after the intent's TTL "
+                    "(same escape hatch the provider webhooks use). The "
+                    "intent is credited at its ORIGINAL price.")
 
 
 # ─── Lifespan: open DB once at startup, close on shutdown ─────────────────
@@ -751,6 +755,7 @@ async def mark_payment_intent_paid(
     with ADMIN_TOKEN."""
     result = await handlers.mark_paid_by_memo(
         app.state.db, memo, req.provider_ref, req.actual_amount_cents,
+        allow_expired=req.allow_expired,
     )
     if not result.get("success"):
         status_code = 404 if "not found" in result.get("error", "") else 400
@@ -776,14 +781,27 @@ async def cancel_payment_intent(request: Request, memo: str):
 async def nowpayments_webhook_endpoint(request: Request):
     """NOWPayments IPN receiver.
 
-    Authenticated by the x-nowpayments-sig header (HMAC-SHA512 over the
-    canonical JSON body). Only `payment_status == "finished"` credits
-    the balance; every other status is ACK'd so retries stop.
+    Authenticated by the x-nowpayments-sig header (HMAC-SHA512 over the RAW
+    request bytes). Only `payment_status == "finished"` credits the balance;
+    every other status is ACK'd so retries stop.
+
+    A `finished` payment that FAILS to credit is answered 500 on purpose:
+    NOWPayments retries non-2xx deliveries, so a transient failure (or one an
+    operator can fix, like a prematurely-expired intent) gets more chances
+    instead of being dropped forever with a silent 200. Each such failure is
+    also logged at ERROR by the dispatcher.
     """
     raw_body = await _read_bounded_body(request, WEBHOOK_MAX_BODY_BYTES)
     sig = request.headers.get("x-nowpayments-sig")
     try:
         payload = nowpayments_webhook.verify_and_parse(raw_body, sig)
-        return await nowpayments_webhook.dispatch(app.state.db, payload)
+        out = await nowpayments_webhook.dispatch(app.state.db, payload)
     except nowpayments_webhook.WebhookError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    result = out.get("result") or {}
+    if out.get("handled") and result.get("success") is False:
+        raise HTTPException(
+            status_code=500,
+            detail=f"payment confirmed but not credited: {result.get('error', 'unknown')}",
+        )
+    return out

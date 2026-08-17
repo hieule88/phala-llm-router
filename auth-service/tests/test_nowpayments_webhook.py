@@ -204,6 +204,108 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         self.assertEqual(cm.exception.status_code, 400)
 
 
+class ExpiredIntentTrapTest(SetupMixin, unittest.TestCase):
+    """H3 regression: an intent lazily flipped to 'expired' (by an ops probe
+    or monitoring script) must still be payable when the provider's
+    `finished` IPN arrives — the flip-then-IPN ordering used to swallow the
+    payment forever while ACKing 200."""
+
+    def _go(self):
+        from app.db import init_db
+        from app import handlers
+
+        async def scenario():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_x")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="nowpayments")
+                memo = intent["memo"]
+                # Force the TTL into the past, then poke it WITHOUT
+                # allow_expired — the lazy sweep flips the row to 'expired'.
+                await conn.execute(
+                    "UPDATE payment_intents SET expires_at = "
+                    "datetime(CURRENT_TIMESTAMP, '-1 hour') WHERE memo = ?", (memo,))
+                await conn.commit()
+                probe = await handlers.mark_paid_by_memo(conn, memo)
+                # The late IPN lands after the flip.
+                ipn = await self.mod.dispatch(conn, _payload(
+                    order_id=memo, price_amount=3.0, payment_id=777))
+                cur = await conn.execute(
+                    "SELECT status FROM payment_intents WHERE memo = ?", (memo,))
+                status = (await cur.fetchone())[0]
+                cur = await conn.execute(
+                    "SELECT balance FROM balances WHERE identity_id = 1")
+                balance = (await cur.fetchone())[0]
+                return probe, ipn, status, balance
+            finally:
+                await conn.close()
+
+        return run(scenario())
+
+    def test_late_ipn_still_credits_a_flipped_expired_intent(self):
+        probe, ipn, status, balance = self._go()
+        self.assertFalse(probe["success"])                 # the probe still refuses
+        self.assertIn("expired", probe["error"])
+        self.assertTrue(ipn["result"]["success"], ipn)     # the IPN pays anyway
+        self.assertEqual(status, "paid")
+        self.assertEqual(balance, 300)                     # intent's ORIGINAL credits
+
+    def test_replayed_late_ipn_deduplicates(self):
+        from app.db import init_db
+        from app import handlers
+
+        async def scenario():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_x")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="nowpayments")
+                memo = intent["memo"]
+                await conn.execute(
+                    "UPDATE payment_intents SET expires_at = "
+                    "datetime(CURRENT_TIMESTAMP, '-1 hour') WHERE memo = ?", (memo,))
+                await conn.commit()
+                await handlers.mark_paid_by_memo(conn, memo)     # flip
+                p = _payload(order_id=memo, price_amount=3.0, payment_id=778)
+                r1 = await self.mod.dispatch(conn, p)
+                r2 = await self.mod.dispatch(conn, p)
+                cur = await conn.execute(
+                    "SELECT balance FROM balances WHERE identity_id = 1")
+                return r1, r2, (await cur.fetchone())[0]
+            finally:
+                await conn.close()
+
+        r1, r2, balance = run(scenario())
+        self.assertTrue(r1["result"]["success"])
+        self.assertTrue(r2["result"].get("deduplicated"))
+        self.assertEqual(balance, 300)                     # credited exactly once
+
+    def test_cancelled_intent_is_still_refused(self):
+        # 'cancelled' is an explicit operator verdict, not a TTL accident —
+        # allow_expired must not override it. The 500-ack + ERROR log make
+        # the arriving money visible instead of silently credited.
+        from app.db import init_db
+        from app import handlers
+
+        async def scenario():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_x")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="nowpayments")
+                memo = intent["memo"]
+                await handlers.cancel_intent_by_memo(conn, memo)
+                return await self.mod.dispatch(conn, _payload(
+                    order_id=memo, price_amount=3.0, payment_id=779))
+            finally:
+                await conn.close()
+
+        ipn = run(scenario())
+        self.assertFalse(ipn["result"]["success"])
+        self.assertIn("cancelled", ipn["result"]["error"])
+
+
 class PricingTest(SetupMixin, unittest.TestCase):
     def test_price_rounds_correctly(self):
         # $10.00 → 1000 cents → 1000 credits at 1 cent/credit.
