@@ -342,5 +342,99 @@ class WalletHttpTest(unittest.TestCase):
         self.assertEqual(res.json()["error"]["type"], "wallet_invalid_statement")
 
 
+class _PoisonStream(httpx.AsyncByteStream):
+    """A response body whose first read kills the connection."""
+
+    async def __aiter__(self):
+        raise httpx.ReadError("socket died mid-read")
+        yield b""  # pragma: no cover — makes this an async generator
+
+
+class MeteredReleaseTest(WalletHttpTest):
+    def setUp(self):
+        super().setUp()
+        self.consume_reply = None     
+        self.gateway_mode = "ok"      
+
+    def _ledger(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/consume" and self.consume_reply is not None:
+            self.ledger_calls.append((request.url.path, {}))
+            return self.consume_reply
+        return super()._ledger(request)
+
+    def _gateway(self, request: httpx.Request) -> httpx.Response:
+        if self.gateway_mode == "poison_500":
+            return httpx.Response(500, stream=_PoisonStream())
+        if self.gateway_mode == "crash":
+            raise RuntimeError("gateway transport blew up")
+        return super()._gateway(request)
+
+    # helpers -----------------------------------------------------------------
+
+    def _spent(self, session_id: str) -> int:
+        row = self.edge.app.state.wallet.store._conn.execute(
+            "SELECT spent FROM wallet_sessions WHERE session_id = ?", (session_id,),
+        ).fetchone()
+        return row[0]
+
+    def _post_chat(self, sk, session_id):
+        body = b'{"model":"m","messages":[]}'
+        return self.client.post(
+            "/v1/chat/completions",
+            headers=self._signed_headers(sk, session_id, "POST", "/v1/chat/completions", body),
+            content=body,
+        )
+
+    def _refund_calls(self):
+        return [c for c in self.ledger_calls if c[0] == "/v1/refund"]
+
+    # tests -------------------------------------------------------------------
+
+    def test_success_keeps_the_hold(self):
+        res, sk = self._bind()
+        sid = res.json()["session_id"]
+        self.assertEqual(self._post_chat(sk, sid).status_code, 200)
+        self.assertEqual(self._spent(sid), 1)          # charged, not released
+        self.assertEqual(self._refund_calls(), [])
+
+    def test_consume_denied_releases_the_hold_without_a_refund(self):
+        res, sk = self._bind()
+        sid = res.json()["session_id"]
+        self.consume_reply = httpx.Response(
+            200, json={"success": False, "error": "insufficient balance"})
+        out = self._post_chat(sk, sid)
+        self.assertEqual(out.status_code, 402)
+        self.assertEqual(self._spent(sid), 0)          # hold given back
+        self.assertEqual(self._refund_calls(), [])     # nothing was debited
+
+    def test_malformed_ledger_reply_releases_the_hold(self):
+        res, sk = self._bind()
+        sid = res.json()["session_id"]
+        self.consume_reply = httpx.Response(200, content=b"not json at all")
+        with self.assertRaises(Exception):
+            self._post_chat(sk, sid)
+        self.assertEqual(self._spent(sid), 0)
+        self.assertEqual(self._refund_calls(), [])     # failed before the debit stuck
+
+    def test_gateway_500_with_dead_socket_refunds_and_releases(self):
+        res, sk = self._bind()
+        sid = res.json()["session_id"]
+        self.gateway_mode = "poison_500"
+        with self.assertRaises(Exception):
+            self._post_chat(sk, sid)
+        self.assertEqual(self._spent(sid), 0)
+        refunds = self._refund_calls()
+        self.assertEqual(len(refunds), 1)              # ledger debit reversed, once
+
+    def test_unexpected_gateway_crash_refunds_and_releases(self):
+        res, sk = self._bind()
+        sid = res.json()["session_id"]
+        self.gateway_mode = "crash"
+        with self.assertRaises(Exception):
+            self._post_chat(sk, sid)
+        self.assertEqual(self._spent(sid), 0)
+        self.assertEqual(len(self._refund_calls()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

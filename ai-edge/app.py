@@ -44,6 +44,7 @@ Wallet endpoints (only when WALLET_AUTH_ENABLED=true):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -738,56 +739,79 @@ async def _metered_proxy(request: Request, path: str) -> Response:
         except WalletAuthError as exc:
             return _wallet_error(exc)
 
-    async def _release(reason: str, debit_token: Optional[str]) -> None:
+    released = False
+    debited = False                       # a real ledger debit happened
+    debit_token: Optional[str] = None
+
+    async def _release(reason: str) -> None:
         """Undo everything this request booked. The ledger refund and the
         session cap are separate books; a failure must reverse both."""
-        await request.app.state.auth.refund_hashed(principal.credential_hash, debit_token, reason)
+        nonlocal released
+        if released:
+            return
+        released = True
+        if debited:
+            await request.app.state.auth.refund_hashed(
+                principal.credential_hash, debit_token, reason)
         if principal.session is not None:
             request.app.state.wallet.store.uncharge(
                 principal.session.session_id, WALLET_REQUEST_COST,
             )
 
-    res = await request.app.state.auth.consume_hashed(principal.credential_hash, idem)
-    if res.status != ALLOW:
-        if principal.session is not None:
-            request.app.state.wallet.store.uncharge(
-                principal.session.session_id, WALLET_REQUEST_COST,
-            )
-        return _deny_response(res)
-    if res.identity_id is None:
-        # Ledger allowed the debit but did not say WHO — without an identity
-        # we cannot assign receipt ownership. Fail closed and give it back.
-        await _release("auth_missing_identity", res.debit_token)
-        return JSONResponse(status_code=503, content={"error": {
-            "message": "billing service returned no identity, retry later", "type": DENY_DOWN}})
-
-    # Forward to the gateway: service token + this user's tenant bearer, streaming.
-    gw: httpx.AsyncClient = request.app.state.gw
-    req = gw.build_request("POST", f"{GATEWAY_URL}{path}",
-                           headers=_fwd_request_headers(request, res.identity_id), content=body)
     try:
-        resp = await gw.send(req, stream=True)
-    except httpx.RequestError as e:
-        await _release(f"gateway_unreachable:{e}", res.debit_token)
-        return JSONResponse(status_code=502, content={"error": {"message": "gateway unreachable", "type": "gateway"}})
+        res = await request.app.state.auth.consume_hashed(principal.credential_hash, idem)
+        if res.status != ALLOW:
+            # No debit happened; _release only returns the session hold.
+            await _release(f"consume_denied:{res.status}")
+            return _deny_response(res)
+        debited, debit_token = True, res.debit_token
+        if res.identity_id is None:
+            # Ledger allowed the debit but did not say WHO — without an identity
+            # we cannot assign receipt ownership. Fail closed and give it back.
+            await _release("auth_missing_identity")
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "billing service returned no identity, retry later", "type": DENY_DOWN}})
 
-    if resp.status_code >= 400:
-        # Gateway rejected (e.g. upstream 404/429). Refund and surface the error.
-        err_body = await resp.aread()
-        await resp.aclose()
-        await _release(f"gateway_status:{resp.status_code}", res.debit_token)
-        return Response(content=err_body, status_code=resp.status_code, headers=_fwd_response_headers(resp))
-
-    async def _stream():
-        # aiter_bytes (not aiter_raw): yields decoded chunks and we deliberately
-        # do NOT forward content-encoding, so the client gets a coherent body.
+        # Forward to the gateway: service token + this user's tenant bearer, streaming.
+        gw: httpx.AsyncClient = request.app.state.gw
+        req = gw.build_request("POST", f"{GATEWAY_URL}{path}",
+                               headers=_fwd_request_headers(request, res.identity_id), content=body)
         try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        finally:
-            await resp.aclose()
+            resp = await gw.send(req, stream=True)
+        except httpx.RequestError as e:
+            await _release(f"gateway_unreachable:{e}")
+            return JSONResponse(status_code=502, content={"error": {"message": "gateway unreachable", "type": "gateway"}})
 
-    return StreamingResponse(_stream(), status_code=resp.status_code, headers=_fwd_response_headers(resp))
+        try:
+            if resp.status_code >= 400:
+                # Gateway rejected (e.g. upstream 404/429). Refund and surface the error.
+                err_body = await resp.aread()
+                await resp.aclose()
+                await _release(f"gateway_status:{resp.status_code}")
+                return Response(content=err_body, status_code=resp.status_code, headers=_fwd_response_headers(resp))
+        except BaseException:
+            # aread/aclose died (gateway sent headers then stalled or dropped
+            # the socket). Close our half; the outer envelope releases.
+            await resp.aclose()
+            raise
+
+        async def _stream():
+            # aiter_bytes (not aiter_raw): yields decoded chunks and we deliberately
+            # do NOT forward content-encoding, so the client gets a coherent body.
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+
+        return StreamingResponse(_stream(), status_code=resp.status_code, headers=_fwd_response_headers(resp))
+    except BaseException as e:
+        # The unanticipated exits: CancelledError (client hung up mid-flight),
+        # JSON decode of a malformed ledger reply, anything else. Shield the
+        # release so a second cancellation cannot kill the refund mid-flight,
+        # then let the original exception continue.
+        await asyncio.shield(_release(f"unexpected:{type(e).__name__}"))
+        raise
 
 
 @app.post("/v1/chat/completions")
