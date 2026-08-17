@@ -103,9 +103,9 @@ Also add the Edge origin to `host_permissions` in `public/manifest.json`.
 ## Confirmation UI
 
 The bind statement is what the user approves, so show its terms rather than a
-generic prompt — the service origin, `max_spend_mc` (in credits, not
-millicredits), the expiry, and the scopes. `openAciSession` takes them as
-`authorization: { scope, maxSpendMc, ttlSec }`; the Edge enforces every one and
+generic prompt — the service origin, `max_spend` (in credits — 1 credit =
+1 request), the expiry, and the scopes. `openAciSession` takes them as
+`authorization: { scope, maxSpend, ttlSec }`; the Edge enforces every one and
 caps the lifetime at 24h.
 
 ## E2EE

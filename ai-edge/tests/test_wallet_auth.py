@@ -64,7 +64,7 @@ def make_auth(now=None, verifier=None, **overrides):
         key_secret="wallet-secret",
         state_db=tempfile.NamedTemporaryFile(suffix=".db", delete=False).name,
         session_max_ttl_sec=86400,
-        max_spend_mc=1000000,
+        max_spend=1000,
         verifier_timeout_sec=5.0,
     )
     cfg_kwargs.update(overrides)
@@ -86,7 +86,7 @@ def make_statement(auth, session_pub_hex, nonce, **overrides):
         "session_pub_key": session_pub_hex,
         "e2ee_pub_key": "cd" * 32,
         "scope": ["inference", "receipts", "models"],
-        "max_spend_mc": 100000,
+        "max_spend": 100,
     }
     stmt.update(overrides)
     return stmt
@@ -172,14 +172,14 @@ class CrossLanguageVectorTest(unittest.TestCase):
         "session_pub_key": "cd" * 32,
         "e2ee_pub_key": "ef" * 32,
         "scope": ["inference", "receipts", "models"],
-        "max_spend_mc": 100000,
+        "max_spend": 100,
     }
     BODY = '{"model":"m","messages":[{"role":"user","content":"xin chào"}]}'.encode()
 
     def test_statement_word(self):
         self.assertEqual(
             wallet_auth.statement_word_bytes(self.STATEMENT).hex(),
-            "08460a83f2c3c8d2a229191a1fb9353ab477f31ec7de4b0d791d340a36d02d92",
+            "a3a82deb545db9841fe99d852845ec718b9b41132a863591dd6b0f863f59c1f3",
         )
 
     def test_request_signing_bytes(self):
@@ -264,9 +264,9 @@ class StatementValidationTest(unittest.TestCase):
 
     def test_rejects_spend_cap_above_policy(self):
         with self.assertRaises(WalletAuthError):
-            self.auth.validate_statement(self._stmt(max_spend_mc=1000001))
+            self.auth.validate_statement(self._stmt(max_spend=1001))
         with self.assertRaises(WalletAuthError):
-            self.auth.validate_statement(self._stmt(max_spend_mc=0))
+            self.auth.validate_statement(self._stmt(max_spend=0))
 
     def test_rejects_unknown_scope(self):
         with self.assertRaises(WalletAuthError):
@@ -499,32 +499,32 @@ class RequestAuthTest(unittest.TestCase):
 class SpendCapTest(unittest.TestCase):
     def test_cap_is_enforced_and_releasable(self):
         auth = make_auth()
-        session, _ = bind(auth, max_spend_mc=2000)
-        auth.store.charge(session.session_id, 1000, auth.now())
-        auth.store.charge(session.session_id, 1000, auth.now())
+        session, _ = bind(auth, max_spend=2)
+        auth.store.charge(session.session_id, 1, auth.now())
+        auth.store.charge(session.session_id, 1, auth.now())
         with self.assertRaises(WalletAuthError) as ctx:
-            auth.store.charge(session.session_id, 1000, auth.now())
+            auth.store.charge(session.session_id, 1, auth.now())
         self.assertEqual(ctx.exception.code, "wallet_spend_cap")
         self.assertEqual(ctx.exception.status, 402)
 
-        auth.store.uncharge(session.session_id, 1000)
-        auth.store.charge(session.session_id, 1000, auth.now())
+        auth.store.uncharge(session.session_id, 1)
+        auth.store.charge(session.session_id, 1, auth.now())
 
     def test_uncharge_cannot_mint_budget(self):
         auth = make_auth()
-        session, _ = bind(auth, max_spend_mc=1000)
+        session, _ = bind(auth, max_spend=1)
         for _ in range(3):
-            auth.store.uncharge(session.session_id, 1000)
-        auth.store.charge(session.session_id, 1000, auth.now())
+            auth.store.uncharge(session.session_id, 1)
+        auth.store.charge(session.session_id, 1, auth.now())
         with self.assertRaises(WalletAuthError):
-            auth.store.charge(session.session_id, 1000, auth.now())
+            auth.store.charge(session.session_id, 1, auth.now())
 
     def test_revoked_session_cannot_be_charged(self):
         auth = make_auth()
         session, _ = bind(auth)
         auth.store.revoke_session(session.session_id, auth.now())
         with self.assertRaises(WalletAuthError):
-            auth.store.charge(session.session_id, 1000, auth.now())
+            auth.store.charge(session.session_id, 1, auth.now())
 
     def test_revoke_all_kills_every_session_of_the_wallet(self):
         auth = make_auth()

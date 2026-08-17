@@ -47,7 +47,7 @@ function statement(overrides: Partial<BindStatement> = {}): BindStatement {
     session_pub_key: 'cd'.repeat(32),
     e2ee_pub_key: 'ef'.repeat(32),
     scope: ['inference', 'receipts', 'models'],
-    max_spend_mc: 100_000,
+    max_spend: 100,
     ...overrides
   };
 }
@@ -127,7 +127,7 @@ test('cross-language vector: the Edge rebuilds exactly these bytes', async () =>
   const stmt = statement({ account_id: 'mtst1qexample — ünïcode' });
   assert.equal(
     bytesToHex(await statementWordBytes(stmt as unknown as Json)),
-    '08460a83f2c3c8d2a229191a1fb9353ab477f31ec7de4b0d791d340a36d02d92'
+    'a3a82deb545db9841fe99d852845ec718b9b41132a863591dd6b0f863f59c1f3'
   );
 
   const body = new TextEncoder().encode('{"model":"m","messages":[{"role":"user","content":"xin chào"}]}');
@@ -237,8 +237,8 @@ test('openAciSession signs the statement it sends', async () => {
         identity_id: 7,
         expires_at: 1765043200,
         scope: ['inference', 'receipts', 'models'],
-        max_spend_mc: 100_000,
-        balance_mc: 50_000
+        max_spend: 100,
+        balance: 50
       })
   });
 
@@ -297,8 +297,8 @@ function fakeSession(): AciSession {
     identityId: 7,
     expiresAt: 1765043200,
     scope: ['inference'],
-    maxSpendMc: 100_000,
-    balanceMc: 50_000,
+    maxSpend: 100,
+    balance: 50,
     statement: statement()
   };
 }

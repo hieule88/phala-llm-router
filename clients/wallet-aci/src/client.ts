@@ -19,14 +19,14 @@ export interface AciAuthorization {
   /** Capabilities this session may use. */
   scope: string[];
   /** Millicredits this session may spend before the user must re-authorize. */
-  maxSpendMc: number;
+  maxSpend: number;
   /** Session lifetime in seconds. The Edge caps this at 24h. */
   ttlSec: number;
 }
 
 export const DEFAULT_AUTHORIZATION: AciAuthorization = {
   scope: ['inference', 'receipts', 'models'],
-  maxSpendMc: 100_000,
+  maxSpend: 100,
   ttlSec: 12 * 60 * 60
 };
 
@@ -36,8 +36,8 @@ export interface AciSession {
   identityId: number;
   expiresAt: number;
   scope: string[];
-  maxSpendMc: number;
-  balanceMc: number | null;
+  maxSpend: number;
+  balance: number | null;
   /**
    * The statement the user actually approved. Worth keeping: it is the audit
    * trail that ties this session — and every receipt it produces — back to the
@@ -121,7 +121,7 @@ export async function openAciSession(params: {
     session_pub_key: params.keys.signPublicKeyHex,
     e2ee_pub_key: params.keys.e2eePublicKeyHex,
     scope: auth.scope,
-    max_spend_mc: auth.maxSpendMc
+    max_spend: auth.maxSpend
   };
 
   const signature = await params.signWord(await statementWordBytes(statement as unknown as Json));
@@ -140,8 +140,8 @@ export async function openAciSession(params: {
     identityId: bound.identity_id,
     expiresAt: bound.expires_at,
     scope: bound.scope,
-    maxSpendMc: bound.max_spend_mc,
-    balanceMc: bound.balance_mc ?? null,
+    maxSpend: bound.max_spend,
+    balance: bound.balance ?? null,
     statement
   };
 }

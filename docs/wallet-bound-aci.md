@@ -146,7 +146,7 @@ attempt that references it, successful or not.
   "session_pub_key": "<ed25519 public key hex>",
   "e2ee_pub_key":    "<x25519 public key hex>",
   "scope":           ["inference", "receipts"],
-  "max_spend_mc":    100000
+  "max_spend":       100
 }
 ```
 
@@ -167,8 +167,9 @@ in its statement. The Edge records it inside the signature's coverage (so a
 relay cannot swap it), but it is a label only. Nothing may credit a balance
 routed by this label until ownership of the address is proven (§5).
 
-`scope` and `max_spend_mc` make a signature a **bounded grant**, not a blank
-cheque: the session may spend at most `max_spend_mc` millicredits and may only
+`scope` and `max_spend` make a signature a **bounded grant**, not a blank
+cheque: the session may spend at most `max_spend` credits (1 credit = 1
+request) and may only
 touch the listed capabilities. `expires_at` MUST be at most 24 h after
 `issued_at`.
 
@@ -183,7 +184,7 @@ The Edge checks, in order, failing closed on the first failure:
 
 1. `purpose`, `service`, and the field set are exactly as specified.
 2. `issued_at` is within ±300 s of now; `expires_at` is in the future and
-   ≤ `issued_at + 86400`; `max_spend_mc` is within the configured ceiling.
+   ≤ `issued_at + 86400`; `max_spend` is within the configured ceiling.
 3. The nonce is live, unconsumed, and was issued to this `wallet_pub_key`.
 4. `session_pub_key` and `e2ee_pub_key` are well-formed 32-byte hex, and
    `session_pub_key` is not already bound to a *different* wallet.
@@ -199,7 +200,7 @@ On success the Edge stores a session and answers:
 ```json
 { "session_id": "lev_s_<32 hex>", "identity_id": 12,
   "expires_at": 1765086400, "scope": ["inference","receipts"],
-  "max_spend_mc": 100000, "balance_mc": 42000,
+  "max_spend": 100, "balance": 42,
   "account_id_attached": true }
 ```
 
@@ -334,7 +335,7 @@ inference — without the Edge being trusted for that claim.
 | Compromised wallet-verifier | Can approve forged binds. Deploy it inside the TEE, or have the Edge additionally require that the challenge nonce it issued is the one signed (it does). |
 | Replay of a whole signed request | Blocked by ts + nonce cache; billing dedup (`Idempotency-Key`) is unchanged and independent. |
 | Claims someone else's `account_id` in a validly signed bind (address squatting) | Cannot block the victim's bind (a claim conflict skips the label, never fails the bind) and cannot spend or receive anything by it: the label authenticates nothing and routes no topups. What it buys the squatter is holding an unverified label — which stops mattering the moment address ownership proof lands (§5). |
-| Quantum adversary | The *root* authority is Falcon-512 (PQ). The session tier is Ed25519, so a future quantum adversary who records traffic could forge session signatures — but only within a session's ≤24 h lifetime and only up to `max_spend_mc`. Prompt confidentiality against harvest-now-decrypt-later is the gateway's ML-KEM story, not this layer's. |
+| Quantum adversary | The *root* authority is Falcon-512 (PQ). The session tier is Ed25519, so a future quantum adversary who records traffic could forge session signatures — but only within a session's ≤24 h lifetime and only up to `max_spend`. Prompt confidentiality against harvest-now-decrypt-later is the gateway's ML-KEM story, not this layer's. |
 | Lost device | Sessions expire in ≤24 h. `POST /v1/wallet/sessions/revoke-all` after a re-bind from any device with the mnemonic kills the rest. |
 
 ## 9. Configuration
@@ -347,7 +348,7 @@ inference — without the Edge being trusted for that claim.
 | `WALLET_SERVICE_ORIGIN` | Edge | The `service` value bind statements must carry. Must be the public origin users see. |
 | `WALLET_STATE_DB` | Edge | SQLite file for challenges + sessions. |
 | `WALLET_SESSION_MAX_TTL_SEC` | Edge | Ceiling on `expires_at − issued_at` (default 86400). |
-| `WALLET_MAX_SPEND_MC` | Edge | Ceiling on a session's `max_spend_mc`. |
+| `WALLET_MAX_SPEND` | Edge | Ceiling on a session's `max_spend` (credits). |
 
 The api-key path is untouched: `Authorization: Bearer lev_…` keeps working
 alongside `Authorization: Wallet lev_s_…`, so this ships without a migration.

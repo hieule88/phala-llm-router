@@ -184,7 +184,7 @@ const sampleStatement = {
   session_pub_key: randomBytes(32).toString('hex'),
   e2ee_pub_key: randomBytes(32).toString('hex'),
   scope: ['inference', 'receipts'],
-  max_spend_mc: 100000,
+  max_spend: 100,
 };
 
 const cases = [

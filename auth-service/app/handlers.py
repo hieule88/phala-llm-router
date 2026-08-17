@@ -369,7 +369,7 @@ async def wallet_bind(
         "identity_id": identity_id,
         "created": created,
         "balance": bal[0] if bal else 0,
-        "unit": "millicredit",
+        "unit": "credit",
         "tier": bal[1] if bal else get_tier(initial_tier).name,
         "account_id_attached": account_id_attached,
     }

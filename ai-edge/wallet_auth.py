@@ -65,7 +65,7 @@ REQUEST_CLOCK_SKEW_SEC = 120
 BIND_FIELDS = frozenset({
     "purpose", "service", "nonce", "issued_at", "expires_at",
     "wallet_pub_key", "account_id", "session_pub_key", "e2ee_pub_key",
-    "scope", "max_spend_mc",
+    "scope", "max_spend",
 })
 REQUEST_FIELDS = ("purpose", "session", "method", "path", "body_sha256", "ts", "nonce")
 
@@ -93,7 +93,9 @@ class WalletAuthConfig:
     key_secret: str
     state_db: str
     session_max_ttl_sec: int
-    max_spend_mc: int
+    # Hard ceiling (in CREDITS — 1 credit = 1 request) a bind statement may
+    # authorize per session. The ledger itself is denominated in credits.
+    max_spend: int
     verifier_timeout_sec: float
 
     @staticmethod
@@ -107,7 +109,7 @@ class WalletAuthConfig:
             key_secret=str(e.get("EDGE_WALLET_KEY_SECRET", "")),
             state_db=str(e.get("WALLET_STATE_DB", "/edge/wallet-state.db")),
             session_max_ttl_sec=int(e.get("WALLET_SESSION_MAX_TTL_SEC", "86400")),
-            max_spend_mc=int(e.get("WALLET_MAX_SPEND_MC", "1000000")),
+            max_spend=int(e.get("WALLET_MAX_SPEND", "1000")),
             verifier_timeout_sec=float(e.get("WALLET_VERIFIER_TIMEOUT_SEC", "10.0")),
         )
         if not enabled:
@@ -123,8 +125,8 @@ class WalletAuthConfig:
                 raise RuntimeError(f"{name} must be set when WALLET_AUTH_ENABLED=true")
         if cfg.session_max_ttl_sec <= 0:
             raise RuntimeError("WALLET_SESSION_MAX_TTL_SEC must be > 0")
-        if cfg.max_spend_mc <= 0:
-            raise RuntimeError("WALLET_MAX_SPEND_MC must be > 0")
+        if cfg.max_spend <= 0:
+            raise RuntimeError("WALLET_MAX_SPEND must be > 0")
         return cfg
 
 
@@ -274,8 +276,8 @@ CREATE TABLE IF NOT EXISTS wallet_sessions (
     session_pub_key TEXT NOT NULL,
     e2ee_pub_key    TEXT NOT NULL,
     scope           TEXT NOT NULL,
-    max_spend_mc    INTEGER NOT NULL,
-    spent_mc        INTEGER NOT NULL DEFAULT 0,
+    max_spend       INTEGER NOT NULL,
+    spent           INTEGER NOT NULL DEFAULT 0,
     issued_at       INTEGER NOT NULL,
     expires_at      INTEGER NOT NULL,
     revoked_at      INTEGER
@@ -306,8 +308,8 @@ class WalletSession:
     session_pub_key: str
     e2ee_pub_key: str
     scope: tuple[str, ...]
-    max_spend_mc: int
-    spent_mc: int
+    max_spend: int   # credits this session may spend (1 credit = 1 request)
+    spent: int       # credits already booked against max_spend
     issued_at: int
     expires_at: int
 
@@ -325,6 +327,15 @@ class WalletStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        # Migrate pre-credit DBs (columns were named *_mc when the accounting
+        # was labeled millicredits; values were per-request either way).
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(wallet_sessions)")}
+        if "max_spend_mc" in cols:
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE wallet_sessions RENAME COLUMN max_spend_mc TO max_spend")
+                self._conn.execute(
+                    "ALTER TABLE wallet_sessions RENAME COLUMN spent_mc TO spent")
 
     def close(self) -> None:
         self._conn.close()
@@ -389,20 +400,20 @@ class WalletStore:
             session_pub_key=statement["session_pub_key"],
             e2ee_pub_key=statement["e2ee_pub_key"],
             scope=scope_t,
-            max_spend_mc=statement["max_spend_mc"],
-            spent_mc=0,
+            max_spend=statement["max_spend"],
+            spent=0,
             issued_at=statement["issued_at"],
             expires_at=statement["expires_at"],
         )
         with self._conn:
             self._conn.execute(
                 "INSERT INTO wallet_sessions (session_id, identity_id, wallet_pub_key, account_id,"
-                " session_pub_key, e2ee_pub_key, scope, max_spend_mc, issued_at, expires_at)"
+                " session_pub_key, e2ee_pub_key, scope, max_spend, issued_at, expires_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     session.session_id, identity_id, session.wallet_pub_key, session.account_id,
                     session.session_pub_key, session.e2ee_pub_key, " ".join(scope_t),
-                    session.max_spend_mc, session.issued_at, session.expires_at,
+                    session.max_spend, session.issued_at, session.expires_at,
                 ),
             )
         return session
@@ -410,7 +421,7 @@ class WalletStore:
     def get_session(self, session_id: str, now: int) -> WalletSession:
         cur = self._conn.execute(
             "SELECT session_id, identity_id, wallet_pub_key, account_id, session_pub_key,"
-            "       e2ee_pub_key, scope, max_spend_mc, spent_mc, issued_at, expires_at,"
+            "       e2ee_pub_key, scope, max_spend, spent, issued_at, expires_at,"
             "       revoked_at "
             "FROM wallet_sessions WHERE session_id = ?",
             (session_id,),
@@ -425,7 +436,7 @@ class WalletStore:
         return WalletSession(
             session_id=row[0], identity_id=row[1], wallet_pub_key=row[2], account_id=row[3],
             session_pub_key=row[4], e2ee_pub_key=row[5], scope=tuple(row[6].split()) if row[6] else (),
-            max_spend_mc=row[7], spent_mc=row[8], issued_at=row[9], expires_at=row[10],
+            max_spend=row[7], spent=row[8], issued_at=row[9], expires_at=row[10],
         )
 
     def revoke_session(self, session_id: str, now: int) -> bool:
@@ -460,18 +471,18 @@ class WalletStore:
             except sqlite3.IntegrityError:
                 raise WalletAuthError("wallet_replay", "request nonce already used") from None
 
-    def charge(self, session_id: str, amount_mc: int, now: int) -> None:
-        """Book `amount_mc` against the session's signed spend cap.
+    def charge(self, session_id: str, amount: int, now: int) -> None:
+        """Book `amount` credits against the session's signed spend cap.
 
         The UPDATE carries the cap in its WHERE clause, so two concurrent
-        requests cannot both slip past the last millicredit.
+        requests cannot both slip past the last credit.
         """
         with self._conn:
             cur = self._conn.execute(
-                "UPDATE wallet_sessions SET spent_mc = spent_mc + ? "
+                "UPDATE wallet_sessions SET spent = spent + ? "
                 "WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ? "
-                "  AND spent_mc + ? <= max_spend_mc RETURNING spent_mc",
-                (amount_mc, session_id, now, amount_mc),
+                "  AND spent + ? <= max_spend RETURNING spent",
+                (amount, session_id, now, amount),
             )
             if cur.fetchone() is None:
                 raise WalletAuthError(
@@ -480,7 +491,7 @@ class WalletStore:
                     status=402,
                 )
 
-    def uncharge(self, session_id: str, amount_mc: int) -> None:
+    def uncharge(self, session_id: str, amount: int) -> None:
         """Give back a booking whose request never happened (gateway refused).
 
         Mirrors the ledger refund; clamped at zero so a double-uncharge cannot
@@ -488,8 +499,8 @@ class WalletStore:
         """
         with self._conn:
             self._conn.execute(
-                "UPDATE wallet_sessions SET spent_mc = MAX(spent_mc - ?, 0) WHERE session_id = ?",
-                (amount_mc, session_id),
+                "UPDATE wallet_sessions SET spent = MAX(spent - ?, 0) WHERE session_id = ?",
+                (amount, session_id),
             )
 
 
@@ -500,7 +511,7 @@ class WalletStore:
 class BindResult:
     session: WalletSession
     created_identity: bool
-    balance_mc: Optional[int]
+    balance: Optional[int]  # credits
 
 
 class WalletAuthenticator:
@@ -568,7 +579,7 @@ class WalletAuthenticator:
 
         issued_at = _int_field(statement, "issued_at")
         expires_at = _int_field(statement, "expires_at")
-        max_spend = _int_field(statement, "max_spend_mc")
+        max_spend = _int_field(statement, "max_spend")
         now = self.now()
         if abs(now - issued_at) > BIND_CLOCK_SKEW_SEC:
             raise WalletAuthError("wallet_stale_statement", "issued_at is too far from server time")
@@ -579,10 +590,10 @@ class WalletAuthenticator:
                 "wallet_invalid_statement",
                 f"session lifetime exceeds {self.cfg.session_max_ttl_sec}s",
             )
-        if not (0 < max_spend <= self.cfg.max_spend_mc):
+        if not (0 < max_spend <= self.cfg.max_spend):
             raise WalletAuthError(
                 "wallet_invalid_statement",
-                f"max_spend_mc must be in 1..{self.cfg.max_spend_mc}",
+                f"max_spend must be in 1..{self.cfg.max_spend}",
             )
 
         scope = statement["scope"]

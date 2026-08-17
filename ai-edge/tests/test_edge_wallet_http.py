@@ -89,15 +89,15 @@ class WalletHttpTest(unittest.TestCase):
         if path == "/v1/wallet/bind":
             return httpx.Response(200, json={
                 "success": True, "identity_id": 7, "created": True,
-                "balance": 50000, "unit": "millicredit", "tier": "free",
+                "balance": 50, "unit": "credit", "tier": "free",
             })
         if path == "/v1/consume":
             return httpx.Response(200, json={
-                "success": True, "identity_id": 7, "balance": 49000,
-                "debit_token": "dt", "unit": "millicredit",
+                "success": True, "identity_id": 7, "balance": 49,
+                "debit_token": "dt", "unit": "credit",
             })
         if path == "/v1/validate":
-            return httpx.Response(200, json={"valid": True, "identity_id": 7, "balance": 49000})
+            return httpx.Response(200, json={"valid": True, "identity_id": 7, "balance": 49})
         if path == "/v1/payment-intents":
             return httpx.Response(201, json={
                 "success": True, "intent_id": 3, "identity_id": 7,
@@ -132,7 +132,7 @@ class WalletHttpTest(unittest.TestCase):
             "session_pub_key": pub,
             "e2ee_pub_key": "cd" * 32,
             "scope": ["inference", "receipts", "models"],
-            "max_spend_mc": 100000,
+            "max_spend": 100,
         }
         statement.update(overrides)
         res = self.client.post("/v1/wallet/bind", json={
@@ -162,7 +162,7 @@ class WalletHttpTest(unittest.TestCase):
         body = res.json()
         self.assertTrue(body["session_id"].startswith("lev_s_"))
         self.assertEqual(body["identity_id"], 7)
-        self.assertEqual(body["balance_mc"], 50000)
+        self.assertEqual(body["balance"], 50)
 
         path, payload = next(c for c in self.ledger_calls if c[0] == "/v1/wallet/bind")
         self.assertEqual(payload["wallet_pub_key"], WALLET_PK)
@@ -233,7 +233,7 @@ class WalletHttpTest(unittest.TestCase):
         self.assertEqual(len(self.gateway_requests), 1)
 
     def test_spend_cap_stops_the_session_before_the_ledger_is_touched(self):
-        res, sk = self._bind(max_spend_mc=1000)
+        res, sk = self._bind(max_spend=1)
         session_id = res.json()["session_id"]
         body = b'{"model":"m"}'
 
@@ -311,7 +311,7 @@ class WalletHttpTest(unittest.TestCase):
             "/v1/wallet/balance",
             headers=self._signed_headers(sk, session_id, "GET", "/v1/wallet/balance", b""))
         self.assertEqual(out.status_code, 200, out.text)
-        self.assertEqual(out.json()["balance_mc"], 49000)  # from the mock /v1/validate
+        self.assertEqual(out.json()["balance"], 49)  # from the mock /v1/validate
         # And it must reject an unsigned request (session id alone is not a credential).
         bare = self.client.get("/v1/wallet/balance",
                                headers={"authorization": f"Wallet {session_id}"})

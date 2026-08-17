@@ -100,10 +100,11 @@ EDGE_TENANT_SECRET = os.getenv("EDGE_TENANT_SECRET", "")
 # as before this feature existed.
 WALLET_CFG = wallet_auth.WalletAuthConfig.from_env()
 
-# What one metered request books against a session's signed spend cap. Matches
-# the ledger's flat hold (auth-service DEFAULT_CONSUME_AMOUNT_MC) so the cap
-# the user signed is denominated in the same units they see billed.
-WALLET_REQUEST_COST_MC = int(os.getenv("WALLET_REQUEST_COST_MC", "1000"))
+# What one metered request books against a session's signed spend cap, in
+# CREDITS. Matches the ledger exactly: auth-service /v1/consume debits a flat
+# 1 credit per request, so the cap the user signed is denominated in the same
+# unit they see billed ($3 -> 300 credits -> 300 chats).
+WALLET_REQUEST_COST = int(os.getenv("WALLET_REQUEST_COST", "1"))
 
 # Fail-closed: refuse to start misconfigured so we never bill/serve wrong.
 for _name, _val in (
@@ -588,8 +589,8 @@ async def wallet_bind(request: Request):
         "identity_id": session.identity_id,
         "expires_at": session.expires_at,
         "scope": list(session.scope),
-        "max_spend_mc": session.max_spend_mc,
-        "balance_mc": res.balance,
+        "max_spend": session.max_spend,
+        "balance": res.balance,
     }
     if res.account_id_attached is not None:
         out["account_id_attached"] = res.account_id_attached
@@ -690,7 +691,7 @@ async def wallet_balance(request: Request):
     res = await request.app.state.auth.validate_hashed(principal.credential_hash)
     if res.status in (DENY_UNAUTH, DENY_DOWN):   # ALLOW and DENY_NO_BALANCE both carry a balance
         return _deny_response(res)
-    return {"balance_mc": res.balance, "identity_id": res.identity_id}
+    return {"balance": res.balance, "identity_id": res.identity_id}
 
 
 async def _metered_proxy(request: Request, path: str) -> Response:
@@ -731,7 +732,7 @@ async def _metered_proxy(request: Request, path: str) -> Response:
     if principal.session is not None:
         try:
             request.app.state.wallet.store.charge(
-                principal.session.session_id, WALLET_REQUEST_COST_MC,
+                principal.session.session_id, WALLET_REQUEST_COST,
                 request.app.state.wallet.now(),
             )
         except WalletAuthError as exc:
@@ -743,14 +744,14 @@ async def _metered_proxy(request: Request, path: str) -> Response:
         await request.app.state.auth.refund_hashed(principal.credential_hash, debit_token, reason)
         if principal.session is not None:
             request.app.state.wallet.store.uncharge(
-                principal.session.session_id, WALLET_REQUEST_COST_MC,
+                principal.session.session_id, WALLET_REQUEST_COST,
             )
 
     res = await request.app.state.auth.consume_hashed(principal.credential_hash, idem)
     if res.status != ALLOW:
         if principal.session is not None:
             request.app.state.wallet.store.uncharge(
-                principal.session.session_id, WALLET_REQUEST_COST_MC,
+                principal.session.session_id, WALLET_REQUEST_COST,
             )
         return _deny_response(res)
     if res.identity_id is None:

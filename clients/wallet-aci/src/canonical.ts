@@ -33,7 +33,7 @@ export interface BindStatement {
   /** X25519 key used for ACI E2EE, lowercase hex. */
   e2ee_pub_key: string;
   scope: string[];
-  max_spend_mc: number;
+  max_spend: number;
 }
 
 /**

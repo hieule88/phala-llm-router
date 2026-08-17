@@ -52,7 +52,7 @@ class WalletBindTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res["success"])
         self.assertTrue(res["created"])
         self.assertEqual(res["balance"], 0)
-        self.assertEqual(res["unit"], "millicredit")
+        self.assertEqual(res["unit"], "credit")
 
         identity = res["identity_id"]
         self.assertEqual(

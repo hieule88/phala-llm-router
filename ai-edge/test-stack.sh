@@ -7,7 +7,7 @@
 #   ./test-stack.sh nuke      down + delete test volumes (fresh ledger next up)
 #   ./test-stack.sh logs      follow logs
 #   ./test-stack.sh ps        list test containers
-#   ./test-stack.sh topup ID [AMOUNT]   credit a test identity (default 100000 mc)
+#   ./test-stack.sh topup ID [AMOUNT]   credit a test identity (default 100 credits)
 #
 # Safety: every compose call is pinned to `-p leviathan-test`, so it can only
 # create/stop containers, networks and volumes labelled with that project.
@@ -43,8 +43,8 @@ case "${1:-}" in
   logs)  dc logs -f --tail=100 ;;
   ps)    dc ps ;;
   topup)
-    id="${2:?usage: ./test-stack.sh topup <identity_id> [amount_mc]}"
-    amount="${3:-100000}"
+    id="${2:?usage: ./test-stack.sh topup <identity_id> [amount_credits]}"
+    amount="${3:-100}"
     token="$(grep -E '^ADMIN_TOKEN=' "$ENVFILE" | cut -d= -f2-)"
     curl -fsS -X POST http://127.0.0.1:18000/v1/topup \
       -H "Authorization: Bearer $token" -H 'content-type: application/json' \
