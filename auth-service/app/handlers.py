@@ -45,7 +45,7 @@ if CENTS_PER_CREDIT <= 0:
 
 # Providers that create_intent is allowed to record. Anything else is a
 # routing-info lie or a log-injection attempt and is refused up front.
-ALLOWED_PROVIDERS = frozenset({"manual", "nowpayments", "onchain"})
+ALLOWED_PROVIDERS = frozenset({"manual", "nowpayments", "stripe", "onchain"})
 
 # Default lifetime of a pending intent. Long enough to comfortably span
 # a cross-border bank transfer or a slow on-chain confirmation (30 days).

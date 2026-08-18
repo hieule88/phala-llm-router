@@ -54,7 +54,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import handlers, nowpayments_client, nowpayments_webhook
+from . import handlers, nowpayments_client, nowpayments_webhook, stripe_client, stripe_webhook
 from .db import init_db
 from .tier_limit import TierRateLimiter
 
@@ -124,6 +124,13 @@ RATE_LIMIT_NOWPAYMENTS_WEBHOOK = os.getenv("RATE_LIMIT_NOWPAYMENTS_WEBHOOK", "60
 # Real NOWPayments events fit in a few kilobytes; 64KB gives comfortable
 # headroom for future event shapes.
 WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", str(64 * 1024)))
+
+# Operator override for the checkout provider. When set (e.g. "stripe"),
+# every intent uses THIS provider regardless of what the client asked for —
+# payment rails are operator policy, and this lets you switch providers
+# (say, when a sandbox is down) without touching any deployed frontend.
+# Empty = respect the client's requested provider.
+TOPUP_PROVIDER_OVERRIDE = os.getenv("TOPUP_PROVIDER_OVERRIDE", "").strip()
 
 
 async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
@@ -656,13 +663,14 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
     )
     if identity_id is None:
         raise HTTPException(status_code=401, detail="invalid credential")
+    provider = TOPUP_PROVIDER_OVERRIDE or req.provider
     result = await handlers.create_intent(
-        app.state.db, identity_id, req.credits, req.provider,
+        app.state.db, identity_id, req.credits, provider,
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "create intent failed"))
 
-    if req.provider == "nowpayments":
+    if provider == "nowpayments":
         try:
             invoice = await nowpayments_client.create_invoice(
                 memo=result["memo"],
@@ -675,12 +683,23 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
             # via a soft warning field so the client can decide to retry
             # checkout without recreating the intent.
             result["checkout_error"] = e.detail
+    elif provider == "stripe":
+        try:
+            invoice = await stripe_client.create_checkout_session(
+                memo=result["memo"],
+                amount_cents=result["amount_cents"],
+            )
+            result["invoice_url"] = invoice["invoice_url"]
+            result["invoice_id"] = invoice["invoice_id"]
+        except stripe_client.StripeError as e:
+            result["checkout_error"] = e.detail
+    result["provider"] = provider
     return result
 
 
 class CheckoutRequest(BaseModel):
     provider: str = Field("nowpayments",
-        description="Currently only 'nowpayments' is supported for on-demand checkout.")
+        description="'nowpayments' or 'stripe' — which hosted checkout to create.")
 
 
 @app.post("/v1/payment-intents/{memo}/checkout")
@@ -702,15 +721,25 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             status_code=409,
             detail=f"intent is {intent['status']}, cannot create checkout",
         )
-    if req.provider != "nowpayments":
-        raise HTTPException(status_code=400, detail=f"unsupported provider: {req.provider!r}")
-    try:
-        invoice = await nowpayments_client.create_invoice(
-            memo=intent["memo"],
-            amount_cents=intent["amount_cents"],
-        )
-    except nowpayments_client.NowpaymentsError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    provider = TOPUP_PROVIDER_OVERRIDE or req.provider
+    if provider == "nowpayments":
+        try:
+            invoice = await nowpayments_client.create_invoice(
+                memo=intent["memo"],
+                amount_cents=intent["amount_cents"],
+            )
+        except nowpayments_client.NowpaymentsError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    elif provider == "stripe":
+        try:
+            invoice = await stripe_client.create_checkout_session(
+                memo=intent["memo"],
+                amount_cents=intent["amount_cents"],
+            )
+        except stripe_client.StripeError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    else:
+        raise HTTPException(status_code=400, detail=f"unsupported provider: {provider!r}")
     return {
         "memo": intent["memo"],
         "invoice_url": invoice["invoice_url"],
@@ -797,6 +826,35 @@ async def nowpayments_webhook_endpoint(request: Request):
         payload = nowpayments_webhook.verify_and_parse(raw_body, sig)
         out = await nowpayments_webhook.dispatch(app.state.db, payload)
     except nowpayments_webhook.WebhookError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    result = out.get("result") or {}
+    if out.get("handled") and result.get("success") is False:
+        raise HTTPException(
+            status_code=500,
+            detail=f"payment confirmed but not credited: {result.get('error', 'unknown')}",
+        )
+    return out
+
+
+@app.post("/v1/webhooks/stripe")
+@limiter.limit(RATE_LIMIT_NOWPAYMENTS_WEBHOOK)
+async def stripe_webhook_endpoint(request: Request):
+    """Stripe event receiver.
+
+    Authenticated by the Stripe-Signature header (HMAC-SHA256 over
+    "<t>.<raw body>" with the endpoint's whsec_ secret, ±300s tolerance).
+    Only paid checkout sessions credit the balance; everything else is
+    ACK'd. Same fail-loud contract as the NOWPayments receiver: a paid
+    session that FAILS to credit is answered 500 so Stripe keeps retrying
+    (and the dispatcher logs it at ERROR) instead of the payment being
+    dropped with a silent 200.
+    """
+    raw_body = await _read_bounded_body(request, WEBHOOK_MAX_BODY_BYTES)
+    sig = request.headers.get("stripe-signature")
+    try:
+        event = stripe_webhook.verify_and_parse(raw_body, sig)
+        out = await stripe_webhook.dispatch(app.state.db, event)
+    except stripe_webhook.WebhookError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail) from None
     result = out.get("result") or {}
     if out.get("handled") and result.get("success") is False:

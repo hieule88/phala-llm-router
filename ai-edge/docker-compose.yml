@@ -21,6 +21,14 @@ services:
       - NOWPAYMENTS_API_KEY=${NOWPAYMENTS_API_KEY:-}
       - NOWPAYMENTS_IPN_CALLBACK_URL=${NOWPAYMENTS_IPN_CALLBACK_URL:-}
       - NOWPAYMENTS_API_BASE=${NOWPAYMENTS_API_BASE:-https://api.nowpayments.io/v1}
+      # Stripe (second checkout provider; test mode uses sk_test_/whsec_ keys).
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - STRIPE_SUCCESS_URL=${STRIPE_SUCCESS_URL:-}
+      - STRIPE_CANCEL_URL=${STRIPE_CANCEL_URL:-}
+      # Force every top-up onto one provider regardless of what clients ask
+      # for (switch rails without redeploying any frontend). Empty = client picks.
+      - TOPUP_PROVIDER_OVERRIDE=${TOPUP_PROVIDER_OVERRIDE:-}
     volumes:
       - auth_data:/data
     expose:
