@@ -24,7 +24,7 @@ use crate::aggregator::service::{
 };
 
 use super::errors::{self, Surface};
-use super::request_transform::{build_candidates, Endpoint};
+use super::request_transform::{build_candidates, inject_default_system_prompt, Endpoint};
 use super::router::RouteInFlight;
 use super::sse::KeepAliveStream;
 use super::stream_transform::SseTransformStream;
@@ -143,6 +143,7 @@ fn log_failed_attempts(ctx: OutcomeCtx<'_>, attempts: &[(String, u16)], is_strea
 pub(super) async fn run(
     service: &AciService,
     sse_keepalive_ms: Option<u64>,
+    default_system_prompt: Option<&str>,
     input: CompletionInput,
     candidates: Vec<RouteCandidate>,
     mut route_in_flight: Option<RouteInFlight>,
@@ -152,7 +153,7 @@ pub(super) async fn run(
         endpoint,
         endpoint_path,
         surface,
-        params,
+        mut params,
         received_body,
         requester,
         e2ee,
@@ -162,6 +163,15 @@ pub(super) async fn run(
         user_tier,
         stream,
     } = input;
+
+    // Operator default system prompt (cutoff disclosure / no-fabrication
+    // policy). Chat-shaped endpoints only; the receipt's request.received
+    // hash was already fixed to the client's exact bytes upstream of here.
+    if matches!(endpoint, Endpoint::ChatComplete | Endpoint::Messages) {
+        if let Some(prompt) = default_system_prompt {
+            inject_default_system_prompt(&mut params, prompt);
+        }
+    }
 
     let model = params.get("model").and_then(Value::as_str);
     let outcome_ctx = OutcomeCtx {

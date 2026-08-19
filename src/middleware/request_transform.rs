@@ -286,6 +286,43 @@ fn inject_stream_options(params: &mut Value) {
     }
 }
 
+/// Prepend the operator-configured default system prompt to a chat request
+/// that carries no system/developer instruction of its own. Returns whether
+/// the prompt was injected.
+///
+/// Runs AFTER the receipt's `request.received` hash is taken from the client's
+/// exact bytes, so the receipt still verifies against what the client sent;
+/// the modified upstream body is committed separately (`middleware.forwarded`)
+/// and the difference is disclosed by the `transparency.request_modified`
+/// receipt event. Content is a plain string on purpose: the Anthropic shaping
+/// path (`anthropic_system`) lifts string-content system messages verbatim and
+/// would silently drop exotic content-block shapes.
+///
+/// A request that brings its own system/developer message (or, for the
+/// Anthropic endpoint, a top-level `system` field) is left untouched — the
+/// caller's explicit instruction outranks the operator default.
+pub(super) fn inject_default_system_prompt(params: &mut Value, prompt: &str) -> bool {
+    if prompt.trim().is_empty() {
+        return false;
+    }
+    if params.get("system").is_some_and(|s| !s.is_null()) {
+        return false; // Anthropic-style top-level system field present
+    }
+    let Some(messages) = params.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let has_own = messages.iter().any(|m| {
+        m.get("role")
+            .and_then(Value::as_str)
+            .is_some_and(is_system_role)
+    });
+    if has_own {
+        return false;
+    }
+    messages.insert(0, json!({"role": "system", "content": prompt}));
+    true
+}
+
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
 fn is_system_role(role: &str) -> bool {
@@ -1309,5 +1346,62 @@ mod tests {
         // Anthropic shaping converts to Anthropic messages and max_tokens stays.
         assert_eq!(bodies[1].1["max_tokens"], json!(8));
         assert_eq!(bodies[1].1["messages"][0]["role"], json!("user"));
+    }
+
+    #[test]
+    fn default_system_prompt_injects_when_absent() {
+        let mut params = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(inject_default_system_prompt(&mut params, "cutoff notice"));
+        assert_eq!(params["messages"][0]["role"], json!("system"));
+        assert_eq!(params["messages"][0]["content"], json!("cutoff notice"));
+        assert_eq!(params["messages"][1]["role"], json!("user"));
+    }
+
+    #[test]
+    fn default_system_prompt_respects_existing_system_message() {
+        let mut params = json!({"messages": [
+            {"role": "system", "content": "mine"},
+            {"role": "user", "content": "hi"},
+        ]});
+        assert!(!inject_default_system_prompt(&mut params, "cutoff notice"));
+        assert_eq!(params["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(params["messages"][0]["content"], json!("mine"));
+    }
+
+    #[test]
+    fn default_system_prompt_respects_developer_role_and_top_level_system() {
+        let mut dev = json!({"messages": [{"role": "developer", "content": "d"}]});
+        assert!(!inject_default_system_prompt(&mut dev, "x"));
+        let mut anthropic = json!({"system": "mine", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(!inject_default_system_prompt(&mut anthropic, "x"));
+        assert_eq!(anthropic["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_system_prompt_skips_empty_prompt_and_missing_messages() {
+        let mut params = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(!inject_default_system_prompt(&mut params, "   "));
+        let mut no_messages = json!({"prompt": "raw completion"});
+        assert!(!inject_default_system_prompt(&mut no_messages, "x"));
+        assert!(no_messages.get("messages").is_none());
+    }
+
+    #[test]
+    fn default_system_prompt_survives_anthropic_shaping_as_system_field() {
+        // A plain-string system message must be lifted into Anthropic's
+        // top-level `system`, not dropped.
+        let mut params = json!({"model": "m", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]});
+        assert!(inject_default_system_prompt(&mut params, "cutoff notice"));
+        let candidates = vec![RouteCandidate {
+            route_id: "anthropic:m".into(),
+            format: ProviderFormat::Anthropic,
+            engine: None,
+        }];
+        let bodies = build_candidates(&params, Endpoint::ChatComplete, &candidates).unwrap();
+        // Anthropic shaping lifts it into the top-level `system` field as a
+        // text block — the prompt text must survive, not be dropped.
+        assert_eq!(bodies[0].1["system"][0]["text"], json!("cutoff notice"));
+        assert_eq!(bodies[0].1["messages"][0]["role"], json!("user"));
     }
 }

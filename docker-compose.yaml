@@ -46,7 +46,8 @@ configs:
           "metrics_stale_ms": 3000,
           "metrics_path": "/v1/metrics",
           "trusted_user_tier_header": false,
-          "default_engine": "vllm"
+          "default_engine": "vllm",
+          "default_system_prompt": "${PRIVATE_AI_GATEWAY_DEFAULT_SYSTEM_PROMPT:-}"
         }
       }
   gateway-upstreams:

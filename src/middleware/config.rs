@@ -33,6 +33,14 @@ pub struct MiddlewareConfig {
     /// SSE keep-alive interval for streaming responses. Defaults to 10_000 ms;
     /// `0` disables the heartbeat.
     pub sse_keepalive_ms: Option<u64>,
+    /// Operator-set default system prompt (e.g. disclosing the model's
+    /// knowledge cutoff and forbidding fabricated URLs). Prepended as a
+    /// `{"role":"system"}` message to chat requests that carry no
+    /// system/developer message of their own; requests that set one keep it.
+    /// Injection happens AFTER the receipt's `request.received` commitment
+    /// (which stays bound to the client's exact bytes) and is disclosed in the
+    /// receipt via the `transparency.request_modified` event. Unset/empty = off.
+    pub default_system_prompt: Option<String>,
 }
 
 impl Default for MiddlewareConfig {
@@ -50,6 +58,7 @@ impl Default for MiddlewareConfig {
             trusted_user_tier_header: false,
             default_engine: None,
             sse_keepalive_ms: None,
+            default_system_prompt: None,
         }
     }
 }
