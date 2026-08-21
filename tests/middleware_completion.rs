@@ -329,7 +329,7 @@ async fn catalog_derives_single_public_model() {
 }
 
 #[tokio::test]
-async fn multiple_public_models_without_static_selection_fail_closed() {
+async fn multiple_public_models_are_all_listed() {
     let calls = Arc::new(CapturedCalls::default());
     let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls).await;
     let manager = upstream_manager(vec![
@@ -340,15 +340,18 @@ async fn multiple_public_models_without_static_selection_fail_closed() {
 
     let (status, _, body) = response_parts(mw.handle_catalog("/v1/models").await).await;
 
-    assert_eq!(status, 503);
-    assert!(body["error"]["message"]
-        .as_str()
+    assert_eq!(status, 200);
+    let ids: Vec<&str> = body["data"]
+        .as_array()
         .unwrap()
-        .contains("requires exactly one public model"));
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["gpt-a", "gpt-b"]);
 }
 
 #[tokio::test]
-async fn configured_public_model_filters_catalog_and_requests() {
+async fn configured_public_model_is_primary_not_a_filter() {
     let calls = Arc::new(CapturedCalls::default());
     let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls).await;
     let manager = upstream_manager(vec![
@@ -363,10 +366,68 @@ async fn configured_public_model_filters_catalog_and_requests() {
         },
     );
 
+    // Every servable model stays discoverable; the primary is among them.
     let (status, _, body) = response_parts(mw.handle_catalog("/v1/models").await).await;
     assert_eq!(status, 200);
-    assert_eq!(body["data"].as_array().unwrap().len(), 1);
-    assert_eq!(body["data"][0]["id"], json!("gpt-b"));
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["gpt-a", "gpt-b"]);
+}
+
+#[tokio::test]
+async fn second_model_routes_to_its_own_upstream() {
+    // Two DIFFERENT public models on two upstreams: a request for the
+    // non-primary model must reach the upstream serving it, with the
+    // public name rewritten to that upstream's model id.
+    let calls_a = Arc::new(CapturedCalls::default());
+    let calls_b = Arc::new(CapturedCalls::default());
+    let upstream_a = spawn_openai_upstream(
+        "chat-a",
+        200,
+        json!({"object":"chat.completion","model":"up-a","choices":[]}),
+        calls_a.clone(),
+    )
+    .await;
+    let upstream_b = spawn_openai_upstream(
+        "chat-b",
+        200,
+        json!({"object":"chat.completion","model":"up-b","choices":[]}),
+        calls_b.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![
+        upstream_config("gpu-a", &upstream_a, "gpt-a", "up-a"),
+        upstream_config("gpu-b", &upstream_b, "glm-5.2", "zai-org/GLM-5.2-FP8"),
+    ]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            public_model: Some("gpt-a".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let (status, headers, body) = response_parts(
+        mw.handle_completion(&service, chat_input("glm-5.2", "hello there"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("chat-b"));
+    assert!(headers.get("x-receipt-id").is_some());
+    assert_eq!(calls_a.bodies.lock().unwrap().len(), 0);
+    assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
+    assert_eq!(
+        calls_b.bodies.lock().unwrap()[0]["model"],
+        json!("zai-org/GLM-5.2-FP8"),
+        "public model must be rewritten to the upstream model id"
+    );
 }
 
 #[tokio::test]

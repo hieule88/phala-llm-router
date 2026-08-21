@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use super::types::Engine;
 
-/// Single-model router middleware settings.
+/// Router middleware settings.
 ///
-/// If `public_model` is unset, the router derives it from the live upstream
-/// config and requires exactly one unique public model.
+/// The router serves EVERY model present in the upstream config (the config
+/// is the allow-list; /v1/models lists them all). `public_model` names the
+/// primary model: it is always listed in the catalog and is the one the
+/// upstream health status tracks. If unset, it is derived when the upstream
+/// config carries exactly one unique public model.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MiddlewareConfig {

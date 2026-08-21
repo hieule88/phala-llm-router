@@ -155,11 +155,10 @@ impl RouterBackend {
         match models.len() {
             0 => Ok(None),
             1 => Ok(models.into_iter().next()),
-            _ => Err(
-                "router middleware requires exactly one public model; set middleware.public_model \
-                 or remove extra public models from upstream config"
-                    .to_string(),
-            ),
+            // Multiple public models are served side by side; there is no
+            // single "the" model to report. Routing goes by the requested
+            // model (see ordered_routes), so this is not a config error.
+            _ => Ok(None),
         }
     }
 
@@ -176,20 +175,21 @@ impl RouterBackend {
 
     fn ordered_routes(
         &self,
-        public_model: &str,
         input: &CompletionInput,
     ) -> (Vec<RouterRoute>, Option<RouteSelection>) {
         let tier = self.request_tier(input);
-        let requested_model = input.params.get("model").and_then(Value::as_str);
-        if requested_model != Some(public_model) {
+        // Any model present in the upstream config is servable — the config
+        // is the allow-list. An unknown model yields no routes and the
+        // caller's existing "no route available for model X" 400.
+        let Some(requested_model) = input.params.get("model").and_then(Value::as_str) else {
             return (Vec::new(), None);
-        }
+        };
 
-        let mut routes = self.model_routes(public_model);
+        let mut routes = self.model_routes(requested_model);
         let routing_text = bounded_routing_text(&input.params, input.endpoint);
         let selected = {
             let mut state = self.state.lock().expect("router state poisoned");
-            state.select(public_model, &routing_text, &routes, &self.config, tier)
+            state.select(requested_model, &routing_text, &routes, &self.config, tier)
         };
         let Some(selected) = selected.clone() else {
             return (routes, None);
@@ -263,7 +263,7 @@ impl RouterBackend {
         });
         json!({
             "mode": "router",
-            "purpose": "single_model_multi_backend_cache_and_load_aware_routing",
+            "purpose": "multi_model_multi_backend_cache_and_load_aware_routing",
             "config": self.config,
             "routing_text_max_chars": MAX_ROUTING_HISTORY_CHARS,
             "public_model": public_model.as_ref().ok().and_then(Clone::clone),
@@ -275,16 +275,22 @@ impl RouterBackend {
 
     pub(super) fn upstream_status_code(&self) -> u8 {
         let upstream_snapshot = self.upstream_config.snapshot();
-        let public_model = match self.public_model(&upstream_snapshot) {
-            Ok(Some(model)) => model,
-            Ok(None) | Err(_) => return UPSTREAM_STATUS_RED,
-        };
-        let routes = upstream_snapshot
-            .upstreams
-            .iter()
-            .filter(|upstream| upstream.enabled && upstream.models.contains_key(&public_model))
-            .map(|upstream| route_from_upstream(upstream, &public_model, &self.config))
-            .collect::<Vec<_>>();
+        // Health tracks the primary model when one is configured (its outage
+        // is THE outage users see); with no primary, any servable model
+        // counts.
+        let primary = self.config.public_model.as_deref().map(str::trim);
+        let mut routes = Vec::new();
+        for upstream in upstream_snapshot.upstreams.iter().filter(|u| u.enabled) {
+            for model in upstream.models.keys() {
+                if primary.is_some_and(|p| p != model) {
+                    continue;
+                }
+                routes.push(route_from_upstream(upstream, model, &self.config));
+            }
+        }
+        if routes.is_empty() {
+            return UPSTREAM_STATUS_RED;
+        }
         let state = self.state.lock().expect("router state poisoned");
         state.upstream_status_code(&routes, &self.config, UserTier::Basic)
     }
@@ -300,19 +306,22 @@ impl RouterBackend {
             );
         }
         let snapshot = self.upstream_config.snapshot();
-        let public_model = match self.public_model(&snapshot) {
-            Ok(model) => model,
-            Err(err) => {
-                return errors::error_response(
-                    Surface::Openai,
-                    503,
-                    "service_unavailable",
-                    &err,
-                    None,
-                );
+        // The catalog is every model an enabled upstream can serve — the
+        // same allow-list ordered_routes routes by — so clients discover
+        // new models the moment the operator adds them to upstream config.
+        let mut models = BTreeSet::new();
+        if let Some(primary) = self.config.public_model.as_deref() {
+            models.insert(primary.trim().to_string());
+        }
+        for upstream in &snapshot.upstreams {
+            if !upstream.enabled {
+                continue;
             }
-        };
-        let data = public_model
+            for model in upstream.models.keys() {
+                models.insert(model.clone());
+            }
+        }
+        let data = models
             .into_iter()
             .map(|id| {
                 json!({
@@ -337,22 +346,14 @@ impl RouterBackend {
         service: &AciService,
         input: CompletionInput,
     ) -> Response {
-        let snapshot = self.upstream_config.snapshot();
-        let public_model = match self.public_model(&snapshot) {
-            Ok(Some(model)) => model,
-            Ok(None) => String::new(),
-            Err(err) => {
-                return errors::error_response(
-                    input.surface,
-                    503,
-                    "service_unavailable",
-                    &err,
-                    Some(&input.request_id),
-                );
-            }
-        };
+        let requested_model = input
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let mut input = input;
-        let (routes, selected) = self.ordered_routes(&public_model, &input);
+        let (routes, selected) = self.ordered_routes(&input);
         let user_tier = self.request_tier(&input);
         if !self.config.trusted_user_tier_header {
             input.user_tier = None;
@@ -362,7 +363,7 @@ impl RouterBackend {
             .map(|selection| RouteInFlight::start(self.state.clone(), selection));
         if let Some(selection) = selected.as_ref() {
             tracing::debug!(
-                public_model,
+                model = %requested_model,
                 user_tier = user_tier.as_str(),
                 selected_route = %selection.route_id,
                 reason = selection.reason,
@@ -372,7 +373,7 @@ impl RouterBackend {
                 "router middleware selected upstream route"
             );
         } else {
-            tracing::debug!(public_model, "router middleware found no route");
+            tracing::debug!(model = %requested_model, "router middleware found no route");
         }
 
         completion::run(
