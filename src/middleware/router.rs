@@ -378,8 +378,7 @@ impl RouterBackend {
 
         completion::run(
             service,
-            self.config.sse_keepalive_ms,
-            self.config.default_system_prompt.as_deref(),
+            &self.config,
             input,
             routes.into_iter().map(|route| route.candidate).collect(),
             route_in_flight,

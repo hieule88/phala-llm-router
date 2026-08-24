@@ -23,13 +23,14 @@ use crate::aggregator::service::{
     ServiceError, ServiceResponseStream,
 };
 
+use super::config::MiddlewareConfig;
 use super::errors::{self, Surface};
 use super::request_transform::{build_candidates, inject_default_system_prompt, Endpoint};
 use super::router::RouteInFlight;
 use super::sse::KeepAliveStream;
 use super::stream_transform::SseTransformStream;
 use super::types::{ProviderFormat, RouteCandidate};
-use super::{response_transform, stream_transform};
+use super::{response_transform, stream_transform, web_search};
 
 /// Everything the completion path needs, computed by the HTTP handler after E2EE
 /// termination and JSON normalization.
@@ -142,8 +143,7 @@ fn log_failed_attempts(ctx: OutcomeCtx<'_>, attempts: &[(String, u16)], is_strea
 
 pub(super) async fn run(
     service: &AciService,
-    sse_keepalive_ms: Option<u64>,
-    default_system_prompt: Option<&str>,
+    config: &MiddlewareConfig,
     input: CompletionInput,
     candidates: Vec<RouteCandidate>,
     mut route_in_flight: Option<RouteInFlight>,
@@ -168,8 +168,23 @@ pub(super) async fn run(
     // policy). Chat-shaped endpoints only; the receipt's request.received
     // hash was already fixed to the client's exact bytes upstream of here.
     if matches!(endpoint, Endpoint::ChatComplete | Endpoint::Messages) {
-        if let Some(prompt) = default_system_prompt {
+        if let Some(prompt) = config.default_system_prompt.as_deref() {
             inject_default_system_prompt(&mut params, prompt);
+        }
+    }
+
+    // Per-request web search opt-in (web_search.rs). The flag is stripped
+    // unconditionally; whether it takes effect is the operator's call.
+    let mut aggregate_web_search = false;
+    let mut web_search_rejected = false;
+    if matches!(endpoint, Endpoint::ChatComplete) && web_search::take_request_flag(&mut params) {
+        if config.web_search_enabled {
+            web_search::prepare_upstream_params(&mut params);
+            // A streaming client sees the search activity in its own stream;
+            // a buffered client needs the stream folded back into one JSON.
+            aggregate_web_search = !stream;
+        } else {
+            web_search_rejected = true;
         }
     }
 
@@ -179,6 +194,12 @@ pub(super) async fn run(
         model: model.unwrap_or(""),
         started,
     };
+    if web_search_rejected {
+        let message = "web search is not enabled on this gateway";
+        log_generated_outcome(outcome_ctx, "web_search", 400, 0, "", 0, message);
+        let body = errors::envelope_bytes(surface, "web_search_disabled", message, Some(&request_id));
+        return finalize_generated(surface, service, endpoint_path, 400, body, &[], e2ee);
+    }
     if candidates.is_empty() {
         let message = format!("no route available for model {}", model.unwrap_or("(none)"));
         log_generated_outcome(outcome_ctx, "routing", 400, 0, "", 0, &message);
@@ -248,9 +269,17 @@ pub(super) async fn run(
                 .unwrap_or(ProviderFormat::Openai);
 
             let (client_status, final_body) = if (200..300).contains(&upstream_status) {
-                let upstream_json: Value = match serde_json::from_slice(&forward.upstream_body) {
-                    Ok(value) => value,
-                    Err(_) => {
+                let parsed: Option<Value> = if aggregate_web_search {
+                    // The upstream replied with an SSE stream (we forced
+                    // stream:true for the search tool); fold it back into one
+                    // chat.completion carrying the `web_searches` disclosure.
+                    web_search::aggregate_stream(&forward.upstream_body)
+                } else {
+                    serde_json::from_slice(&forward.upstream_body).ok()
+                };
+                let upstream_json: Value = match parsed {
+                    Some(value) => value,
+                    None => {
                         let message = "upstream returned a malformed success body";
                         log_generated_outcome(
                             outcome_ctx,
@@ -363,7 +392,7 @@ pub(super) async fn run(
                     Some(transform) => Box::pin(SseTransformStream::new(forward.body, transform)),
                     None => forward.body,
                 };
-            let keepalive = match sse_keepalive_ms.unwrap_or(10_000) {
+            let keepalive = match config.sse_keepalive_ms.unwrap_or(10_000) {
                 0 => None,
                 ms => Some(Duration::from_millis(ms)),
             };

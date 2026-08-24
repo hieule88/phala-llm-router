@@ -13,6 +13,7 @@ mod router;
 pub mod sse;
 pub mod stream_transform;
 pub mod types;
+mod web_search;
 
 use std::sync::Arc;
 

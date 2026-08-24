@@ -36,6 +36,14 @@ pub struct MiddlewareConfig {
     /// SSE keep-alive interval for streaming responses. Defaults to 10_000 ms;
     /// `0` disables the heartbeat.
     pub sse_keepalive_ms: Option<u64>,
+    /// Allow clients to opt into backend web search per request (a top-level
+    /// `"web_search": true` in the chat body). When enabled, the gateway adds
+    /// the upstream's server-side search tool and, for non-streaming clients,
+    /// folds the upstream stream back into one JSON that discloses every
+    /// search query in a `web_searches` array. OFF by default: search queries
+    /// derived from user prompts leave the attested boundary, so turning this
+    /// on is an explicit operator decision.
+    pub web_search_enabled: bool,
     /// Operator-set default system prompt (e.g. disclosing the model's
     /// knowledge cutoff and forbidding fabricated URLs). Prepended as a
     /// `{"role":"system"}` message to chat requests that carry no
@@ -61,6 +69,7 @@ impl Default for MiddlewareConfig {
             trusted_user_tier_header: false,
             default_engine: None,
             sse_keepalive_ms: None,
+            web_search_enabled: false,
             default_system_prompt: None,
         }
     }

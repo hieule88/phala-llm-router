@@ -214,6 +214,39 @@ async fn spawn_openai_upstream(
     format!("http://{addr}")
 }
 
+async fn spawn_sse_text_upstream(
+    body_text: &'static str,
+    calls: Arc<CapturedCalls>,
+) -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |headers: HeaderMap, raw: Bytes| {
+            let calls = calls.clone();
+            async move {
+                let parsed = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
+                calls.bodies.lock().unwrap().push(parsed);
+                calls
+                    .headers
+                    .lock()
+                    .unwrap()
+                    .push(capture_headers(&headers));
+                (
+                    StatusCode::OK,
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    body_text,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 async fn spawn_openai_streaming_upstream(id: &'static str, calls: Arc<CapturedCalls>) -> String {
     let app = Router::new().route(
         "/v1/chat/completions",
@@ -290,6 +323,13 @@ fn chat_input(model: &str, content: &str) -> CompletionInput {
         user_tier: None,
         stream: false,
     }
+}
+
+fn web_search_chat_input(model: &str, content: &str) -> CompletionInput {
+    let mut input = chat_input(model, content);
+    input.params["web_search"] = json!(true);
+    input.received_body = serde_json::to_vec(&input.params).unwrap();
+    input
 }
 
 async fn response_parts(response: axum::response::Response) -> (u16, axum::http::HeaderMap, Value) {
@@ -750,4 +790,78 @@ async fn image_fetch_5xx_becomes_client_400() {
     assert_eq!(status, 400);
     assert_eq!(body["error"]["type"], json!("invalid_request_error"));
     assert!(body["error"]["message"].as_str().unwrap().contains(url));
+}
+
+#[tokio::test]
+async fn web_search_flag_aggregates_upstream_stream_and_discloses_queries() {
+    // A non-streaming client opts in with web_search:true. The gateway must
+    // send the upstream a STREAMING request carrying the search tool (and no
+    // flag), then fold the SSE reply into one JSON that lists every query.
+    const SSE: &str = concat!(
+        "data: {\"id\":\"cmpl-ws\",\"model\":\"up-a\",\"created\":7,\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{\\\"query\\\": \\\"tokyo population 2026\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"nearai_tool_result\":{\"name\":\"web_context_search\",\"output\":\"[1] ...\"}}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"About 37 million.\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"total_tokens\":13}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_sse_text_upstream(SSE, calls.clone()).await;
+    let manager = upstream_manager(vec![upstream_config("gpu-a", &upstream, "gpt-test", "up-a")]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            web_search_enabled: true,
+            ..Default::default()
+        },
+    );
+
+    let (status, headers, body) = response_parts(
+        mw.handle_completion(&service, web_search_chat_input("gpt-test", "tokyo?"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(headers.get("x-receipt-id").is_some());
+    // Aggregated single JSON, not SSE:
+    assert_eq!(body["object"], json!("chat.completion"));
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        json!("About 37 million.")
+    );
+    assert_eq!(body["usage"]["total_tokens"], json!(13));
+    // The disclosure — exactly what left the enclave:
+    assert_eq!(body["web_searches"][0]["query"], json!("tokyo population 2026"));
+
+    // The upstream request was reshaped: tool present, stream forced, flag gone.
+    let sent = &calls.bodies.lock().unwrap()[0];
+    assert_eq!(sent["stream"], json!(true));
+    assert!(sent.get("web_search").is_none());
+    let tool_types: Vec<&str> = sent["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["type"].as_str())
+        .collect();
+    assert!(tool_types.contains(&"web_context_search"));
+}
+
+#[tokio::test]
+async fn web_search_flag_is_refused_when_operator_disabled() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls.clone()).await;
+    let manager = upstream_manager(vec![upstream_config("gpu-a", &upstream, "gpt-test", "up-a")]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(manager, MiddlewareConfig::default()); // web_search_enabled: false
+
+    let (status, _, body) = response_parts(
+        mw.handle_completion(&service, web_search_chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["type"], json!("web_search_disabled"));
+    assert!(calls.bodies.lock().unwrap().is_empty(), "must not reach the upstream");
 }
