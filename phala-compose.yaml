@@ -24,7 +24,7 @@ configs:
   gateway-pin:
     content: |
       REPO_URL=https://github.com/hieule88/phala-llm-router.git
-      COMMIT_SHA=${PRIVATE_AI_GATEWAY_REPO_COMMIT:?set PRIVATE_AI_GATEWAY_REPO_COMMIT to the audited full commit SHA}
+      COMMIT_SHA=9d393a1609f11185d296506d22fce70a5ce01b18
       WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
   gateway-config:
     content: |
@@ -47,7 +47,7 @@ configs:
           "metrics_path": "/v1/metrics",
           "trusted_user_tier_header": false,
           "default_engine": "vllm",
-          "default_system_prompt": "${PRIVATE_AI_GATEWAY_DEFAULT_SYSTEM_PROMPT:-}"
+          "default_system_prompt": "You are served through a confidential TEE inference service. Your training data has a cutoff date and you know nothing after it. For recent events or facts you cannot know, say so plainly instead of guessing - never fabricate URLs, citations, quotes, news, or dates. Only give a URL when you are confident it existed before your cutoff, and state your cutoff when asked about recent topics. If a web search tool is available, use it only when the user explicitly asks you to search or look something up online; when you search, never include confidential details from the conversation (names, codenames, personal or business plans) in the query - search only the generic public topic - and tell the user what query you searched. If the user asks you to search but no search tool is available, say you cannot browse the web."
         }
       }
   gateway-upstreams:
