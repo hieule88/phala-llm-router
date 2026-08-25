@@ -180,6 +180,7 @@ pub(super) async fn run(
     if matches!(endpoint, Endpoint::ChatComplete) && web_search::take_request_flag(&mut params) {
         if config.web_search_enabled {
             web_search::prepare_upstream_params(&mut params);
+            web_search::inject_enabled_note(&mut params);
             // A streaming client sees the search activity in its own stream;
             // a buffered client needs the stream folded back into one JSON.
             aggregate_web_search = !stream;

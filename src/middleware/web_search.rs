@@ -58,6 +58,39 @@ pub(super) fn prepare_upstream_params(params: &mut Value) {
     obj.insert("stream".to_string(), Value::Bool(true));
 }
 
+/// System note telling the model the opt-in already happened. Without it,
+/// models conditioned by the operator prompt to treat search as usually-absent
+/// keep asking the user to "enable web search" even while the tool sits in the
+/// request (observed with gpt-oss-120b).
+const ENABLED_NOTE: &str = "Web search is ENABLED for this request: the user \
+already opted in through their client, so never ask them to enable it. Use the \
+web search tool directly whenever the answer needs current or post-cutoff \
+information. Keep queries generic — no confidential details from the \
+conversation — and tell the user what you searched.";
+
+/// Roles that may lead a chat as instructions; the note goes right after them.
+const LEADING_ROLES: [&str; 2] = ["system", "developer"];
+
+/// Tell the model, in-band, that search is already on. Inserted as a system
+/// message after any leading system/developer block so it composes with both
+/// the operator default prompt and a client-supplied one. Upstream-only, like
+/// every other transform here: the receipt's `request.received` hash was fixed
+/// to the client's exact bytes before this runs.
+pub(super) fn inject_enabled_note(params: &mut Value) {
+    let Some(messages) = params.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let at = messages
+        .iter()
+        .take_while(|m| {
+            m.get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|r| LEADING_ROLES.contains(&r))
+        })
+        .count();
+    messages.insert(at, json!({ "role": "system", "content": ENABLED_NOTE }));
+}
+
 /// Fold a complete upstream SSE stream back into one `chat.completion` JSON.
 ///
 /// Collected per chunk: `delta.content` / `delta.reasoning_content` are
@@ -218,6 +251,34 @@ mod tests {
         let mut with_fn = json!({"tools": [{"type": "function", "function": {"name": "f"}}]});
         prepare_upstream_params(&mut with_fn);
         assert_eq!(with_fn["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn enabled_note_lands_after_leading_instruction_block() {
+        // After the operator/client system block…
+        let mut params = json!({"messages": [
+            {"role": "system", "content": "operator prompt"},
+            {"role": "user", "content": "hi"},
+        ]});
+        inject_enabled_note(&mut params);
+        let msgs = params["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], json!("system"));
+        assert_eq!(msgs[1]["content"], json!(ENABLED_NOTE));
+        assert_eq!(msgs[2]["role"], json!("user"));
+
+        // …or first when there is none.
+        let mut bare = json!({"messages": [{"role": "user", "content": "hi"}]});
+        inject_enabled_note(&mut bare);
+        assert_eq!(bare["messages"][0]["content"], json!(ENABLED_NOTE));
+
+        // Developer role counts as leading instructions too.
+        let mut dev = json!({"messages": [
+            {"role": "developer", "content": "d"},
+            {"role": "user", "content": "hi"},
+        ]});
+        inject_enabled_note(&mut dev);
+        assert_eq!(dev["messages"][1]["content"], json!(ENABLED_NOTE));
     }
 
     #[test]

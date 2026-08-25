@@ -845,6 +845,19 @@ async fn web_search_flag_aggregates_upstream_stream_and_discloses_queries() {
         .filter_map(|t| t["type"].as_str())
         .collect();
     assert!(tool_types.contains(&"web_context_search"));
+    // …and the model is told in-band that search is already on, so it never
+    // asks the user to enable it.
+    let enabled_note = sent["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| {
+            m["role"] == json!("system")
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("Web search is ENABLED"))
+        });
+    assert!(enabled_note, "missing enabled note: {sent}");
 }
 
 #[tokio::test]

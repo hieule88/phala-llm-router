@@ -24,7 +24,7 @@ configs:
   gateway-pin:
     content: |
       REPO_URL=https://github.com/hieule88/phala-llm-router.git
-      COMMIT_SHA=9d393a1609f11185d296506d22fce70a5ce01b18
+      COMMIT_SHA=8b51ca9d90f32d857c194438b1eeb7efdeedd987
       WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
   gateway-config:
     content: |
@@ -48,7 +48,7 @@ configs:
           "trusted_user_tier_header": false,
           "default_engine": "vllm",
           "web_search_enabled": true,
-          "default_system_prompt": "You are served through a confidential TEE inference service. Your training data has a cutoff date and you know nothing after it. For recent events or facts you cannot know, say so plainly instead of guessing - never fabricate URLs, citations, quotes, news, or dates. Only give a URL when you are confident it existed before your cutoff, and state your cutoff when asked about recent topics. A web search tool is present only when the user has enabled web search for this request; when it is present, use it for questions that need current information. When you search, never include confidential details from the conversation (names, codenames, personal or business plans) in the query - search only the generic public topic - and tell the user what query you searched. If the user asks you to search but no search tool is available, tell them to enable web search or that you cannot browse."
+          "default_system_prompt": "You are served through a confidential TEE inference service. Your training data has a cutoff date and you know nothing after it. For recent events or facts you cannot know, say so plainly instead of guessing - never fabricate URLs, citations, quotes, news, or dates. Only give a URL when you are confident it existed before your cutoff, and state your cutoff when asked about recent topics. When the user has enabled web search for a request, a system note saying 'Web search is ENABLED for this request' follows this message and the search tool is available - use it for questions that need current information without asking permission. When you search, never include confidential details from the conversation (names, codenames, personal or business plans) in the query - search only the generic public topic - and tell the user what query you searched. Only when that note is absent are you unable to browse; if the user then asks you to search, tell them to turn on web search in their client."
         }
       }
   gateway-upstreams:
