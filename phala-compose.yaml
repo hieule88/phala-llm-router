@@ -24,7 +24,7 @@ configs:
   gateway-pin:
     content: |
       REPO_URL=https://github.com/hieule88/phala-llm-router.git
-      COMMIT_SHA=8b51ca9d90f32d857c194438b1eeb7efdeedd987
+      COMMIT_SHA=ada7a1ab28c5fc96fdaa2a4031bdcd52982976ef
       WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
   gateway-config:
     content: |
