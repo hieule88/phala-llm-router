@@ -65,7 +65,9 @@ pub(super) fn prepare_upstream_params(params: &mut Value) {
 const ENABLED_NOTE: &str = "Web search is ENABLED for this request: the user \
 already opted in through their client, so never ask them to enable it. Use the \
 web search tool directly whenever the answer needs current or post-cutoff \
-information. Keep queries generic — no confidential details from the \
+information. The search budget is small: run at most two focused searches, \
+then answer from whatever they returned — a partial answer with sources beats \
+an empty one. Keep queries generic — no confidential details from the \
 conversation — and tell the user what you searched.";
 
 /// Roles that may lead a chat as instructions; the note goes right after them.
@@ -112,7 +114,12 @@ pub(super) fn aggregate_stream(sse: &[u8]) -> Option<Value> {
     let mut finish: Option<String> = None;
     let mut content = String::new();
     let mut reasoning = String::new();
-    let mut tool_args: BTreeMap<u64, String> = BTreeMap::new();
+    // One accumulator per tool CALL, in stream order. Sequential server-side
+    // search rounds reuse index 0, so the index alone cannot key the map: a
+    // chunk carrying an `id` or `function.name` starts a new call, and
+    // `current_slot` remembers which accumulator each index is appending to.
+    let mut tool_args: Vec<String> = Vec::new();
+    let mut current_slot: BTreeMap<u64, usize> = BTreeMap::new();
     let mut saw_chunk = false;
 
     for line in text.lines() {
@@ -165,12 +172,22 @@ pub(super) fn aggregate_stream(sse: &[u8]) -> Option<Value> {
                 .flatten()
             {
                 let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let starts_new_call = tc.get("id").and_then(Value::as_str).is_some()
+                    || tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .is_some();
+                if starts_new_call || !current_slot.contains_key(&index) {
+                    current_slot.insert(index, tool_args.len());
+                    tool_args.push(String::new());
+                }
                 if let Some(piece) = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
                     .and_then(Value::as_str)
                 {
-                    tool_args.entry(index).or_default().push_str(piece);
+                    tool_args[current_slot[&index]].push_str(piece);
                 }
             }
         }
@@ -180,17 +197,9 @@ pub(super) fn aggregate_stream(sse: &[u8]) -> Option<Value> {
     }
 
     let web_searches: Vec<Value> = tool_args
-        .values()
-        .map(|args| {
-            // The model's arguments are usually {"query": "..."} — surface the
-            // query text when parseable, the raw arguments otherwise. Either
-            // way the user sees verbatim what egressed.
-            serde_json::from_str::<Value>(args)
-                .ok()
-                .and_then(|v| v.get("query").and_then(Value::as_str).map(str::to_string))
-                .map(|q| json!({ "query": q }))
-                .unwrap_or_else(|| json!({ "raw": args }))
-        })
+        .iter()
+        .filter(|args| !args.trim().is_empty())
+        .flat_map(|args| parse_query_disclosures(args))
         .collect();
 
     let mut message = json!({ "role": "assistant", "content": content });
@@ -213,6 +222,30 @@ pub(super) fn aggregate_stream(sse: &[u8]) -> Option<Value> {
         out["usage"] = u;
     }
     Some(out)
+}
+
+/// Turn one accumulated arguments buffer into disclosure entries. Usually one
+/// `{"query": "..."}` object; a buffer holding several concatenated objects
+/// (seen when an upstream reuses tool_call ids across rounds) yields one entry
+/// per object. Anything unparseable is surfaced verbatim as `{"raw": ...}` —
+/// the user must always see exactly what egressed.
+fn parse_query_disclosures(args: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for item in serde_json::Deserializer::from_str(args).into_iter::<Value>() {
+        match item {
+            Ok(v) => out.push(
+                v.get("query")
+                    .and_then(Value::as_str)
+                    .map(|q| json!({ "query": q }))
+                    .unwrap_or_else(|| json!({ "raw": v.to_string() })),
+            ),
+            Err(_) => return vec![json!({ "raw": args })],
+        }
+    }
+    if out.is_empty() {
+        out.push(json!({ "raw": args }));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -308,6 +341,43 @@ mod tests {
         assert_eq!(out["usage"]["total_tokens"], json!(12));
         // The disclosure: exactly what the model sent out, reassembled.
         assert_eq!(out["web_searches"][0]["query"], json!("lithium chile 2026"));
+    }
+
+    #[test]
+    fn sequential_calls_reusing_index_zero_disclose_separately() {
+        // NEAR AI streams each server-side search round as a fresh tool call
+        // that reuses index 0; function.name marks the start of each round.
+        let sse = concat!(
+            "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{\\\"query\\\": \\\"first \"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"topic\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{\\\"query\\\": \\\"second topic\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = aggregate_stream(sse.as_bytes()).expect("aggregates");
+        let searches = out["web_searches"].as_array().unwrap();
+        assert_eq!(searches.len(), 2, "{searches:?}");
+        assert_eq!(searches[0]["query"], json!("first topic"));
+        assert_eq!(searches[1]["query"], json!("second topic"));
+    }
+
+    #[test]
+    fn concatenated_argument_objects_split_into_entries() {
+        // Belt and braces: even if rounds still land in one buffer, the
+        // stream deserializer splits {"query":..}{"query":..} into entries.
+        let entries = parse_query_disclosures("{\"query\": \"a\"}\n{\"query\": \"b\"}");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["query"], json!("a"));
+        assert_eq!(entries[1]["query"], json!("b"));
+
+        // Unparseable tails fall back to verbatim raw.
+        let raw = parse_query_disclosures("{\"query\": \"a\"}{broken");
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0]["raw"].as_str().unwrap().contains("broken"));
+
+        // Objects without a query field stay visible too.
+        let other = parse_query_disclosures("{\"url\": \"x\"}");
+        assert_eq!(other[0]["raw"], json!("{\"url\":\"x\"}"));
     }
 
     #[test]
