@@ -65,10 +65,12 @@ pub(super) fn prepare_upstream_params(params: &mut Value) {
 const ENABLED_NOTE: &str = "Web search is ENABLED for this request: the user \
 already opted in through their client, so never ask them to enable it. Use the \
 web search tool directly whenever the answer needs current or post-cutoff \
-information. The search budget is small: run at most two focused searches, \
-then answer from whatever they returned — a partial answer with sources beats \
-an empty one. Keep queries generic — no confidential details from the \
-conversation — and tell the user what you searched.";
+information. If earlier replies in this conversation were written without \
+search (guessing, or saying you cannot browse), do not restate them — verify \
+with a fresh search now. The search budget is small: run at most two focused \
+searches, then answer from whatever they returned — a partial answer with \
+sources beats an empty one. Keep queries generic — no confidential details \
+from the conversation — and tell the user what you searched.";
 
 /// Roles that may lead a chat as instructions; the note goes right after them.
 const LEADING_ROLES: [&str; 2] = ["system", "developer"];
