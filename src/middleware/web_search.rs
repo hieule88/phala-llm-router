@@ -65,26 +65,36 @@ pub(super) fn prepare_upstream_params(params: &mut Value) {
 const ENABLED_NOTE: &str = "Web search is ENABLED for this request: the user \
 already opted in through their client, so never ask them to enable it. Use the \
 web search tool directly whenever the answer needs current or post-cutoff \
-information. If earlier replies in this conversation were written without \
-search (guessing, or saying you cannot browse), do not restate them — verify \
-with a fresh search now. The search budget is small: run at most two focused \
-searches, then answer from whatever they returned — a partial answer with \
-sources beats an empty one. Keep queries generic — no confidential details \
-from the conversation — and tell the user what you searched.";
+information. Treat prices, market data, tickers, news, and questions about \
+entities or terms that might postdate your training as needing a search — \
+search FIRST instead of answering from possibly stale knowledge. If earlier \
+replies in this conversation were written without search (guessing, or saying \
+you cannot browse), do not restate them — verify with a fresh search now. The \
+search budget is small: run at most two focused searches, then answer from \
+whatever they returned — a partial answer with sources beats an empty one. \
+Keep queries generic — no confidential details from the conversation — and \
+tell the user what you searched.";
 
 /// Roles that may lead a chat as instructions; the note goes right after them.
 const LEADING_ROLES: [&str; 2] = ["system", "developer"];
 
-/// Tell the model, in-band, that search is already on. Inserted as a system
-/// message after any leading system/developer block so it composes with both
-/// the operator default prompt and a client-supplied one. Upstream-only, like
+/// Tell the model, in-band, that search is already on. When the chat opens
+/// with a system/developer message (the operator default prompt or a
+/// client-supplied one), the note is APPENDED to that message's string content
+/// rather than added as a second system entry: several serving templates
+/// (observed: NEAR's Qwen 3.5/3.6/3.8 — "System message must be at the
+/// beginning") reject more than one system message, and merging composes with
+/// every template that accepts one. A fresh system message is inserted only
+/// when the chat has none, and non-string leading content (block arrays) falls
+/// back to inserting AFTER the leading block — imperfect for strict templates,
+/// but never corrupts the client's structured content. Upstream-only, like
 /// every other transform here: the receipt's `request.received` hash was fixed
 /// to the client's exact bytes before this runs.
 pub(super) fn inject_enabled_note(params: &mut Value) {
     let Some(messages) = params.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    let at = messages
+    let leading = messages
         .iter()
         .take_while(|m| {
             m.get("role")
@@ -92,7 +102,16 @@ pub(super) fn inject_enabled_note(params: &mut Value) {
                 .is_some_and(|r| LEADING_ROLES.contains(&r))
         })
         .count();
-    messages.insert(at, json!({ "role": "system", "content": ENABLED_NOTE }));
+    if leading > 0 {
+        if let Some(Value::String(content)) = messages[0].get_mut("content") {
+            content.push_str("\n\n");
+            content.push_str(ENABLED_NOTE);
+            return;
+        }
+        messages.insert(leading, json!({ "role": "system", "content": ENABLED_NOTE }));
+        return;
+    }
+    messages.insert(0, json!({ "role": "system", "content": ENABLED_NOTE }));
 }
 
 /// Fold a complete upstream SSE stream back into one `chat.completion` JSON.
@@ -289,31 +308,50 @@ mod tests {
     }
 
     #[test]
-    fn enabled_note_lands_after_leading_instruction_block() {
-        // After the operator/client system block…
+    fn enabled_note_merges_into_the_leading_system_message() {
+        // A leading system message absorbs the note — templates like NEAR's
+        // Qwen builds reject a SECOND system message outright.
         let mut params = json!({"messages": [
             {"role": "system", "content": "operator prompt"},
             {"role": "user", "content": "hi"},
         ]});
         inject_enabled_note(&mut params);
         let msgs = params["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[1]["role"], json!("system"));
-        assert_eq!(msgs[1]["content"], json!(ENABLED_NOTE));
-        assert_eq!(msgs[2]["role"], json!("user"));
+        assert_eq!(msgs.len(), 2, "no extra system message may appear");
+        let merged = msgs[0]["content"].as_str().unwrap();
+        assert!(merged.starts_with("operator prompt"));
+        assert!(merged.contains("Web search is ENABLED"));
+        assert_eq!(msgs[1]["role"], json!("user"));
 
-        // …or first when there is none.
+        // No leading instructions → the note becomes the (single) first one.
         let mut bare = json!({"messages": [{"role": "user", "content": "hi"}]});
         inject_enabled_note(&mut bare);
+        assert_eq!(bare["messages"][0]["role"], json!("system"));
         assert_eq!(bare["messages"][0]["content"], json!(ENABLED_NOTE));
 
-        // Developer role counts as leading instructions too.
+        // Developer-led chats merge the same way.
         let mut dev = json!({"messages": [
             {"role": "developer", "content": "d"},
             {"role": "user", "content": "hi"},
         ]});
         inject_enabled_note(&mut dev);
-        assert_eq!(dev["messages"][1]["content"], json!(ENABLED_NOTE));
+        assert_eq!(dev["messages"].as_array().unwrap().len(), 2);
+        assert!(dev["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Web search is ENABLED"));
+
+        // Structured (non-string) leading content is never corrupted: the
+        // note falls back to its own message after the leading block.
+        let mut blocks = json!({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "op"}]},
+            {"role": "user", "content": "hi"},
+        ]});
+        inject_enabled_note(&mut blocks);
+        let msgs = blocks["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[0]["content"].is_array());
+        assert_eq!(msgs[1]["content"], json!(ENABLED_NOTE));
     }
 
     #[test]
