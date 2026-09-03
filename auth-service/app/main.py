@@ -54,7 +54,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import handlers, nowpayments_client, nowpayments_webhook, stripe_client, stripe_webhook
+from . import handlers, nowpayments_client, nowpayments_webhook, onchain_client, stripe_client, stripe_webhook
 from .db import init_db
 from .tier_limit import TierRateLimiter
 
@@ -693,13 +693,25 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
             result["invoice_id"] = invoice["invoice_id"]
         except stripe_client.StripeError as e:
             result["checkout_error"] = e.detail
+    elif provider == "onchain":
+        try:
+            invoice = await onchain_client.create_payment_request(
+                memo=result["memo"],
+                amount_cents=result["amount_cents"],
+            )
+            result["invoice_url"] = invoice["invoice_url"]
+            result["invoice_id"] = invoice["invoice_id"]
+            result["onchain"] = invoice["onchain"]
+        except onchain_client.OnchainError as e:
+            result["checkout_error"] = e.detail
     result["provider"] = provider
     return result
 
 
 class CheckoutRequest(BaseModel):
     provider: str = Field("nowpayments",
-        description="'nowpayments' or 'stripe' — which hosted checkout to create.")
+        description="'nowpayments', 'stripe' or 'onchain' — which checkout/payment "
+                    "instructions to create.")
 
 
 @app.post("/v1/payment-intents/{memo}/checkout")
@@ -738,15 +750,26 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             )
         except stripe_client.StripeError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    elif provider == "onchain":
+        try:
+            invoice = await onchain_client.create_payment_request(
+                memo=intent["memo"],
+                amount_cents=intent["amount_cents"],
+            )
+        except onchain_client.OnchainError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from None
     else:
         raise HTTPException(status_code=400, detail=f"unsupported provider: {provider!r}")
-    return {
+    resp = {
         "memo": intent["memo"],
         "invoice_url": invoice["invoice_url"],
         "invoice_id": invoice["invoice_id"],
         "amount_cents": intent["amount_cents"],
         "credits": intent["credits"],
     }
+    if "onchain" in invoice:
+        resp["onchain"] = invoice["onchain"]
+    return resp
 
 
 @app.get("/v1/payment-intents/{memo}")
