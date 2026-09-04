@@ -189,7 +189,7 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         self.assertEqual(cm.exception.status_code, 400)
 
     def test_paid_expired_intent_still_credits(self):
-        # Same H3 guarantee as NOWPayments: a lazily-flipped 'expired' row
+        # H3 guarantee: a lazily-flipped 'expired' row
         # must still be payable when Stripe confirms money arrived.
         from app import handlers
 

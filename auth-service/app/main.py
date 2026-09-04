@@ -18,7 +18,7 @@ Endpoints under `/v1`:
   GET  /v1/payment-intents/{memo}         → check intent status (public, opaque memo)
   POST /v1/payment-intents/{memo}/mark-paid → finalize intent (ADMIN or webhook)
   POST /v1/payment-intents/{memo}/cancel  → cancel pending intent (ADMIN)
-  POST /v1/webhooks/nowpayments           → NOWPayments IPN (HMAC-SHA512-authenticated)
+  POST /v1/webhooks/stripe                → Stripe events (HMAC-SHA256-authenticated)
   GET  /health                            → liveness probe (no DB hit)
 
 Auth model:
@@ -36,7 +36,7 @@ Auth model:
     (users share it over chat/email), so an open consume would let anyone
     who learned a victim's hash drain their balance — only the TEE proxy,
     which holds the token, may debit.
-  - The NOWPayments webhook is authenticated by the processor's HMAC
+  - The Stripe webhook is authenticated by the processor's HMAC
     signature — no Bearer token is expected because the caller is the
     payment processor's infra.
 """
@@ -54,7 +54,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import handlers, nowpayments_client, nowpayments_webhook, onchain_client, stripe_client, stripe_webhook
+from . import handlers, onchain_client, stripe_client, stripe_webhook
 from .db import init_db
 from .tier_limit import TierRateLimiter
 
@@ -117,11 +117,11 @@ RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "20/minute")
 # Payment processor retries are aggressive; a rate-limit-driven drop of
 # a paid event is a revenue bug. Keep this ceiling well above any
 # plausible retry burst.
-RATE_LIMIT_NOWPAYMENTS_WEBHOOK = os.getenv("RATE_LIMIT_NOWPAYMENTS_WEBHOOK", "600/minute")
+RATE_LIMIT_WEBHOOK = os.getenv("RATE_LIMIT_WEBHOOK", "600/minute")
 
 # Hard cap on webhook body size, applied at Content-Length inspection time
 # so an attacker announcing a huge payload never triggers a full-body read.
-# Real NOWPayments events fit in a few kilobytes; 64KB gives comfortable
+# Real Stripe events fit in a few kilobytes; 64KB gives comfortable
 # headroom for future event shapes.
 WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", str(64 * 1024)))
 
@@ -375,7 +375,7 @@ class RefundRequest(BaseModel):
 class TopupRequest(BaseModel):
     identity_id: int
     amount: int = Field(..., gt=0)
-    source: str = Field(..., description="Provenance tag, e.g. 'nowpayments:PAYMENT_ID'.")
+    source: str = Field(..., description="Provenance tag, e.g. 'stripe:SESSION_ID'.")
 
 
 class SetTierRequest(BaseModel):
@@ -388,7 +388,7 @@ class CreatePaymentIntentRequest(BaseModel):
     credential_value: str
     credits: int = Field(..., gt=0)
     provider: str = Field("manual",
-        description="'manual', 'nowpayments', or 'onchain'. "
+        description="'manual', 'stripe', or 'onchain'. "
                     "amount_cents is derived server-side from credits × CENTS_PER_CREDIT.")
 
 
@@ -650,11 +650,12 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
     bound to Alice's identity. The returned `memo` is the reference
     the user must include when they actually pay.
 
-    When `provider == "nowpayments"`, we also call NOWPayments'
-    invoice API and return a hosted-checkout `invoice_url` alongside
-    the memo. NOWPayments failure does NOT roll back the intent — the
-    intent row is committed either way, and the caller can retry the
-    checkout-URL step via /v1/payment-intents/{memo}/checkout.
+    When `provider == "stripe"`, we also create a hosted Checkout
+    Session and return its `invoice_url` alongside the memo; for
+    "onchain" the `onchain` block carries the wallet payment
+    instructions instead. Provider failure does NOT roll back the
+    intent — the intent row is committed either way, and the caller can
+    retry the checkout step via /v1/payment-intents/{memo}/checkout.
     """
     if req.credential_type not in handlers.AUTHENTICATOR_CREDENTIAL_TYPES:
         raise HTTPException(status_code=401, detail="invalid credential")
@@ -670,20 +671,7 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "create intent failed"))
 
-    if provider == "nowpayments":
-        try:
-            invoice = await nowpayments_client.create_invoice(
-                memo=result["memo"],
-                amount_cents=result["amount_cents"],
-            )
-            result["invoice_url"] = invoice["invoice_url"]
-            result["invoice_id"] = invoice["invoice_id"]
-        except nowpayments_client.NowpaymentsError as e:
-            # Intent is committed; downstream provider failed. Report
-            # via a soft warning field so the client can decide to retry
-            # checkout without recreating the intent.
-            result["checkout_error"] = e.detail
-    elif provider == "stripe":
+    if provider == "stripe":
         try:
             invoice = await stripe_client.create_checkout_session(
                 memo=result["memo"],
@@ -692,6 +680,9 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
             result["invoice_url"] = invoice["invoice_url"]
             result["invoice_id"] = invoice["invoice_id"]
         except stripe_client.StripeError as e:
+            # Intent is committed; downstream provider failed. Report
+            # via a soft warning field so the client can decide to retry
+            # checkout without recreating the intent.
             result["checkout_error"] = e.detail
     elif provider == "onchain":
         try:
@@ -709,8 +700,8 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
 
 
 class CheckoutRequest(BaseModel):
-    provider: str = Field("nowpayments",
-        description="'nowpayments', 'stripe' or 'onchain' — which checkout/payment "
+    provider: str = Field("stripe",
+        description="'stripe' or 'onchain' — which checkout/payment "
                     "instructions to create.")
 
 
@@ -734,15 +725,7 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             detail=f"intent is {intent['status']}, cannot create checkout",
         )
     provider = TOPUP_PROVIDER_OVERRIDE or req.provider
-    if provider == "nowpayments":
-        try:
-            invoice = await nowpayments_client.create_invoice(
-                memo=intent["memo"],
-                amount_cents=intent["amount_cents"],
-            )
-        except nowpayments_client.NowpaymentsError as e:
-            raise HTTPException(status_code=e.status_code, detail=e.detail) from None
-    elif provider == "stripe":
+    if provider == "stripe":
         try:
             invoice = await stripe_client.create_checkout_session(
                 memo=intent["memo"],
@@ -828,49 +811,17 @@ async def cancel_payment_intent(request: Request, memo: str):
     return result
 
 
-@app.post("/v1/webhooks/nowpayments")
-@limiter.limit(RATE_LIMIT_NOWPAYMENTS_WEBHOOK)
-async def nowpayments_webhook_endpoint(request: Request):
-    """NOWPayments IPN receiver.
-
-    Authenticated by the x-nowpayments-sig header (HMAC-SHA512 over the RAW
-    request bytes). Only `payment_status == "finished"` credits the balance;
-    every other status is ACK'd so retries stop.
-
-    A `finished` payment that FAILS to credit is answered 500 on purpose:
-    NOWPayments retries non-2xx deliveries, so a transient failure (or one an
-    operator can fix, like a prematurely-expired intent) gets more chances
-    instead of being dropped forever with a silent 200. Each such failure is
-    also logged at ERROR by the dispatcher.
-    """
-    raw_body = await _read_bounded_body(request, WEBHOOK_MAX_BODY_BYTES)
-    sig = request.headers.get("x-nowpayments-sig")
-    try:
-        payload = nowpayments_webhook.verify_and_parse(raw_body, sig)
-        out = await nowpayments_webhook.dispatch(app.state.db, payload)
-    except nowpayments_webhook.WebhookError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
-    result = out.get("result") or {}
-    if out.get("handled") and result.get("success") is False:
-        raise HTTPException(
-            status_code=500,
-            detail=f"payment confirmed but not credited: {result.get('error', 'unknown')}",
-        )
-    return out
-
-
 @app.post("/v1/webhooks/stripe")
-@limiter.limit(RATE_LIMIT_NOWPAYMENTS_WEBHOOK)
+@limiter.limit(RATE_LIMIT_WEBHOOK)
 async def stripe_webhook_endpoint(request: Request):
     """Stripe event receiver.
 
     Authenticated by the Stripe-Signature header (HMAC-SHA256 over
     "<t>.<raw body>" with the endpoint's whsec_ secret, ±300s tolerance).
     Only paid checkout sessions credit the balance; everything else is
-    ACK'd. Same fail-loud contract as the NOWPayments receiver: a paid
-    session that FAILS to credit is answered 500 so Stripe keeps retrying
-    (and the dispatcher logs it at ERROR) instead of the payment being
-    dropped with a silent 200.
+    ACK'd. Fail-loud contract: a paid session that FAILS to credit is
+    answered 500 so Stripe keeps retrying (and the dispatcher logs it at
+    ERROR) instead of the payment being dropped with a silent 200.
     """
     raw_body = await _read_bounded_body(request, WEBHOOK_MAX_BODY_BYTES)
     sig = request.headers.get("stripe-signature")

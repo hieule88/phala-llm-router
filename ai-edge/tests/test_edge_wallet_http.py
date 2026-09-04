@@ -103,7 +103,7 @@ class WalletHttpTest(unittest.TestCase):
                 "success": True, "intent_id": 3, "identity_id": 7,
                 "credits": body.get("credits"), "amount_cents": body.get("credits"),
                 "memo": "memo_abc123", "provider": body.get("provider"), "status": "pending",
-                "invoice_url": "https://nowpayments.example/pay/memo_abc123",
+                "invoice_url": "https://checkout.example/pay/memo_abc123",
             })
         return httpx.Response(200, json={"success": True})
 
@@ -274,7 +274,7 @@ class WalletHttpTest(unittest.TestCase):
             content=b"{}")
         self.assertEqual(after.json()["error"]["type"], "wallet_session_revoked")
 
-    def test_wallet_can_create_a_nowpayments_topup(self):
+    def test_wallet_can_create_a_topup(self):
         res, sk = self._bind()
         session_id = res.json()["session_id"]
         body = b'{"credits": 300}'
@@ -285,7 +285,7 @@ class WalletHttpTest(unittest.TestCase):
         self.assertEqual(out.status_code, 200, out.text)
         j = out.json()
         self.assertEqual(j["memo"], "memo_abc123")
-        self.assertIn("nowpayments.example", j["invoice_url"])
+        self.assertIn("checkout.example", j["invoice_url"])
         # The ledger must receive the wallet's DERIVED api_key hash — never a raw key.
         _, payload = next(c for c in self.ledger_calls if c[0] == "/v1/payment-intents")
         self.assertEqual(payload["credential_type"], "api_key")

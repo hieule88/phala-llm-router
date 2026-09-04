@@ -45,7 +45,7 @@ if CENTS_PER_CREDIT <= 0:
 
 # Providers that create_intent is allowed to record. Anything else is a
 # routing-info lie or a log-injection attempt and is refused up front.
-ALLOWED_PROVIDERS = frozenset({"manual", "nowpayments", "stripe", "onchain"})
+ALLOWED_PROVIDERS = frozenset({"manual", "stripe", "onchain"})
 
 # Default lifetime of a pending intent. Long enough to comfortably span
 # a cross-border bank transfer or a slow on-chain confirmation (30 days).
@@ -602,7 +602,7 @@ async def topup(
 ) -> dict:
     """Credit an identity's balance, idempotent on `source`.
 
-    `source` is a caller-supplied tag (e.g. "nowpayments:PAYMENT_ID",
+    `source` is a caller-supplied tag (e.g. "stripe:SESSION_ID",
     "miden_p2id_<note_id>", "lightning_invoice_Y") and is stored with a
     UNIQUE constraint in the `topups` table. A second call with the same
     tag returns the existing balance without applying the credit again —

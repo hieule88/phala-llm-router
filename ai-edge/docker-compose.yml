@@ -14,14 +14,7 @@ services:
       - PROXY_REFUND_TOKEN=${PROXY_REFUND_TOKEN:?set PROXY_REFUND_TOKEN (openssl rand -hex 32)}
       - AUTH_DB_PATH=/data/auth.db
       - ALLOW_EMPTY_DB=${ALLOW_EMPTY_DB:-}
-      # NOWPayments (top-ups). Empty disables the webhook (503).
-      # For the sandbox set NOWPAYMENTS_API_BASE=https://api-sandbox.nowpayments.io/v1
-      # (with a sandbox API key + sandbox IPN secret); default is production.
-      - NOWPAYMENTS_IPN_SECRET=${NOWPAYMENTS_IPN_SECRET:-}
-      - NOWPAYMENTS_API_KEY=${NOWPAYMENTS_API_KEY:-}
-      - NOWPAYMENTS_IPN_CALLBACK_URL=${NOWPAYMENTS_IPN_CALLBACK_URL:-}
-      - NOWPAYMENTS_API_BASE=${NOWPAYMENTS_API_BASE:-https://api.nowpayments.io/v1}
-      # Stripe (second checkout provider; test mode uses sk_test_/whsec_ keys).
+      # Stripe (hosted checkout; test mode uses sk_test_/whsec_ keys).
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
       - STRIPE_SUCCESS_URL=${STRIPE_SUCCESS_URL:-}
@@ -59,7 +52,7 @@ services:
     networks: [edge-net]
 
   # Public HTTPS front (Let's Encrypt via Caddy) for two DuckDNS names:
-  #   AUTH_PUBLIC_DOMAIN — auth-service payment surface + NOWPayments IPN
+  #   AUTH_PUBLIC_DOMAIN — auth-service payment surface + Stripe webhook
   #   EDGE_PUBLIC_DOMAIN — the Edge (OpenAI-compatible API for end users)
   # Set both in .env; DNS records must point at this host first.
   caddy:

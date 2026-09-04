@@ -38,7 +38,7 @@ Wallet endpoints (only when WALLET_AUTH_ENABLED=true):
   POST /v1/wallet/bind                 -> Falcon-verified session
   POST /v1/wallet/session/revoke       -> end this session (sent on wallet lock)
   POST /v1/wallet/sessions/revoke-all  -> end every session of this wallet
-  POST /v1/wallet/payment-intents      -> self-serve top-up (NOWPayments) for the wallet
+  POST /v1/wallet/payment-intents      -> self-serve top-up (Stripe/on-chain) for the wallet
   GET  /v1/wallet/balance              -> current balance (signed read, no re-bind)
 """
 
@@ -308,14 +308,15 @@ class AuthClient:
                           warning=data.get("warning"))
 
     async def create_payment_intent_hashed(
-        self, key_hash: str, credits: int, provider: str = "nowpayments",
+        self, key_hash: str, credits: int, provider: str = "stripe",
     ) -> "tuple[Optional[dict], Optional[AuthResult]]":
         """Create a payment intent for the identity behind `key_hash`.
 
         Wallet users have no raw api key, so the Edge presents their derived
         credential hash to the SAME user-facing intent endpoint api-key users
-        hit. auth-service resolves it to the wallet's identity, mints the
-        NOWPayments invoice, and the existing webhook credits it on payment.
+        hit. auth-service resolves it to the wallet's identity and returns
+        the provider's payment instructions (Stripe checkout URL, or the
+        `onchain` block); the matching receive side credits it on payment.
         Returns (intent, None) on success or (None, AuthResult) on failure.
         """
         try:
@@ -639,13 +640,14 @@ async def wallet_sessions_revoke_all(request: Request):
 
 @app.post("/v1/wallet/payment-intents")
 async def wallet_payment_intent(request: Request):
-    """Self-serve top-up for a wallet — the NOWPayments path api-key users have.
+    """Self-serve top-up for a wallet — the same intent path api-key users have.
 
     A wallet has no raw api key to authenticate the payment endpoint with, so
     the Edge authenticates the wallet session (Ed25519), derives the wallet's
-    credential hash, and creates the intent on its behalf. The returned
-    `invoice_url` is a normal NOWPayments checkout; on payment the existing IPN
-    webhook credits this wallet's identity — no wallet-specific billing code.
+    credential hash, and creates the intent on its behalf. Provider 'stripe'
+    returns a hosted checkout `invoice_url`; 'onchain' returns the wallet
+    payment instructions in `onchain`. Either receive side credits this
+    wallet's identity — no wallet-specific billing code.
     """
     body = await request.body()
     try:
@@ -667,7 +669,7 @@ async def wallet_payment_intent(request: Request):
     if isinstance(credits, bool) or not isinstance(credits, int) or credits <= 0:
         return _wallet_error(WalletAuthError(
             "wallet_invalid_request", "credits must be a positive integer", status=400))
-    provider = payload.get("provider", "nowpayments")
+    provider = payload.get("provider", "stripe")
     if not isinstance(provider, str):
         return _wallet_error(WalletAuthError("wallet_invalid_request", "provider must be a string", status=400))
 

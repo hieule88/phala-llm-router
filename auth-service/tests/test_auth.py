@@ -238,7 +238,7 @@ class TopupTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "k")
-                r = await handlers.topup(conn, ident, 500, source="nowpayments:x")
+                r = await handlers.topup(conn, ident, 500, source="stripe:x")
                 self.assertTrue(r["success"])
                 self.assertEqual(r["balance"], 500)
             finally:
@@ -650,8 +650,8 @@ class TopupIdempotencyTest(unittest.TestCase):
             conn = await init_db(":memory:")
             try:
                 ident = await handlers.create_identity(conn, "api_key", "h")
-                r1 = await handlers.topup(conn, ident, 100, "nowpayments:ABC")
-                r2 = await handlers.topup(conn, ident, 100, "nowpayments:ABC")
+                r1 = await handlers.topup(conn, ident, 100, "stripe:ABC")
+                r2 = await handlers.topup(conn, ident, 100, "stripe:ABC")
                 self.assertTrue(r1["success"])
                 self.assertEqual(r1["balance"], 100)
                 self.assertTrue(r2["success"])
@@ -861,96 +861,6 @@ class TierRateLimiterTest(unittest.TestCase):
                 await limiter.check(i, "pro", now=float(i))
             self.assertEqual(len(limiter._buckets), 5,
                 f"expected dict bounded at 5, got {len(limiter._buckets)}")
-        run(go())
-
-
-class NowpaymentsClientTest(unittest.TestCase):
-    """Send-side (invoice creation) tests. Uses a mocked httpx.AsyncClient
-    so no outbound calls happen — we exercise the shape of the request we
-    would send, plus the response handling for the various failure modes
-    NOWPayments can return.
-    """
-
-    def test_missing_api_key_raises_503(self):
-        # Reload module state with an empty key to simulate an operator
-        # who hasn't finished the send-side setup yet.
-        async def go():
-            from unittest.mock import patch
-            from app import nowpayments_client
-            with patch.object(nowpayments_client, "NOWPAYMENTS_API_KEY", ""):
-                with self.assertRaises(nowpayments_client.NowpaymentsError) as ctx:
-                    await nowpayments_client.create_invoice(
-                        memo="intent-abc", amount_cents=100,
-                    )
-                self.assertEqual(ctx.exception.status_code, 503)
-                self.assertIn("NOWPAYMENTS_API_KEY", ctx.exception.detail)
-        run(go())
-
-    def test_negative_amount_raises_400(self):
-        async def go():
-            from unittest.mock import patch
-            from app import nowpayments_client
-            with patch.object(nowpayments_client, "NOWPAYMENTS_API_KEY", "fakekey"):
-                with self.assertRaises(nowpayments_client.NowpaymentsError) as ctx:
-                    await nowpayments_client.create_invoice(
-                        memo="intent-abc", amount_cents=0,
-                    )
-                self.assertEqual(ctx.exception.status_code, 400)
-        run(go())
-
-    def test_happy_path_returns_url(self):
-        async def go():
-            from unittest.mock import AsyncMock, MagicMock, patch
-            from app import nowpayments_client
-            fake_response = MagicMock()
-            fake_response.status_code = 200
-            fake_response.json = MagicMock(return_value={
-                "id": "5555555555",
-                "invoice_url": "https://nowpayments.io/payment/?iid=5555",
-                "expiration_estimate_date": "2026-08-01T00:00:00Z",
-            })
-            fake_client = AsyncMock()
-            fake_client.__aenter__.return_value = fake_client
-            fake_client.post = AsyncMock(return_value=fake_response)
-            with patch.object(nowpayments_client, "NOWPAYMENTS_API_KEY", "fakekey"), \
-                 patch.object(nowpayments_client.httpx, "AsyncClient",
-                              return_value=fake_client):
-                result = await nowpayments_client.create_invoice(
-                    memo="intent-abc", amount_cents=100,
-                )
-                self.assertEqual(result["invoice_url"],
-                                 "https://nowpayments.io/payment/?iid=5555")
-                self.assertEqual(result["invoice_id"], "5555555555")
-                # Verify request body: order_id must equal our memo so
-                # NOWPayments echoes it back in the IPN webhook.
-                call = fake_client.post.call_args
-                body = call.kwargs["json"]
-                self.assertEqual(body["order_id"], "intent-abc")
-                self.assertEqual(body["price_amount"], 1.0)  # 100 cents
-                self.assertEqual(body["price_currency"], "usd")
-                # x-api-key header must be present.
-                self.assertEqual(call.kwargs["headers"]["x-api-key"], "fakekey")
-        run(go())
-
-    def test_upstream_5xx_surfaces_as_bad_gateway(self):
-        async def go():
-            from unittest.mock import AsyncMock, MagicMock, patch
-            from app import nowpayments_client
-            fake_response = MagicMock()
-            fake_response.status_code = 502
-            fake_response.text = "bad gateway"
-            fake_client = AsyncMock()
-            fake_client.__aenter__.return_value = fake_client
-            fake_client.post = AsyncMock(return_value=fake_response)
-            with patch.object(nowpayments_client, "NOWPAYMENTS_API_KEY", "fakekey"), \
-                 patch.object(nowpayments_client.httpx, "AsyncClient",
-                              return_value=fake_client):
-                with self.assertRaises(nowpayments_client.NowpaymentsError) as ctx:
-                    await nowpayments_client.create_invoice(
-                        memo="intent-abc", amount_cents=100,
-                    )
-                self.assertEqual(ctx.exception.status_code, 502)
-                self.assertIn("502", ctx.exception.detail)
         run(go())
 
 

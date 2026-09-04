@@ -5,9 +5,8 @@ Stripe authenticates deliveries with the `Stripe-Signature` header:
     Stripe-Signature: t=<unix ts>,v1=<hex hmac>[,v1=<hex hmac>...]
 
 where each v1 is HMAC-SHA256 over the ASCII string "<t>.<raw body>" keyed
-with the endpoint's signing secret (whsec_...). Like the NOWPayments IPN
-after the raw-body fix, the signature covers the EXACT bytes on the wire —
-never re-serialize before verifying.
+with the endpoint's signing secret (whsec_...). The signature covers the
+EXACT bytes on the wire — never re-serialize before verifying.
 
 We act on `checkout.session.completed` (and
 `checkout.session.async_payment_succeeded` for delayed methods) with
@@ -57,8 +56,8 @@ class WebhookError(Exception):
 
 def _require_secret() -> str:
     if not STRIPE_WEBHOOK_SECRET:
-        # Same rationale as the NOWPayments adapter: a 404 (not 5xx) so a
-        # misconfigured deployment doesn't look retryable to Stripe.
+        # A 404 (not 5xx) so a misconfigured deployment doesn't look
+        # retryable to Stripe.
         raise WebhookError(404, "stripe webhook not configured")
     return STRIPE_WEBHOOK_SECRET
 
@@ -128,9 +127,9 @@ async def dispatch(conn: aiosqlite.Connection, event: dict) -> dict:
         memo,
         provider_ref=f"stripe:{session_id}",
         actual_amount_cents=amount_total,
-        # Same escape hatch as NOWPayments: a payment confirmed by the
-        # provider must be honoured even if the intent's TTL lapsed (or the
-        # row was already lazily flipped to 'expired').
+        # Escape hatch: a payment confirmed by the provider must be
+        # honoured even if the intent's TTL lapsed (or the row was
+        # already lazily flipped to 'expired').
         allow_expired=True,
     )
     if result.get("success"):

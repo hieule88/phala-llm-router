@@ -2,8 +2,8 @@
 for payment intents.
 
 Companion to the note-watcher (receive-side, separate service), mirroring
-the stripe_client / stripe_webhook and nowpayments_client /
-nowpayments_webhook splits and the same caller contract: given an existing
+the stripe_client / stripe_webhook split and the same caller contract:
+given an existing
 `payment_intents` row, produce what the payer needs to pay it. Unlike the
 hosted-checkout rails there is no third-party API to call — "checkout" is
 pure data: the gateway's receiving address, the accepted faucet (token) id,
@@ -68,8 +68,8 @@ _KNOWN_ADDRESS_PREFIXES = ("mm1", "mtst1", "mdev1", "mlcl1", "mcst1")
 class OnchainError(Exception):
     """Raised when payment instructions cannot be produced (missing or
     inconsistent config, bad amount). Callers surface it exactly like
-    StripeError / NowpaymentsError: HTTP error without touching the
-    committed payment_intents row."""
+    StripeError: HTTP error without touching the committed
+    payment_intents row."""
 
     def __init__(self, detail: str, status_code: int = 502):
         super().__init__(detail)

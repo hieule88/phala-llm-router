@@ -1,15 +1,14 @@
 """Stripe send-side client: create hosted Checkout Sessions for payment
 intents.
 
-Companion to `stripe_webhook.py` (receive-side), mirroring the
-nowpayments_client / nowpayments_webhook split and the same caller
+Companion to `stripe_webhook.py` (receive-side), with a simple caller
 contract: given an existing `payment_intents` row, obtain a hosted
 checkout URL. The user pays on Stripe's page; Stripe fires the
 `checkout.session.completed` webhook which the receive-side adapter
 converts into a balance credit via mark_paid_by_memo.
 
 Uses Stripe's REST API directly over httpx (form-encoded, Bearer auth) —
-no `stripe` pip dependency, consistent with the NOWPayments client.
+no `stripe` pip dependency.
 
 Test mode: use an `sk_test_...` key; payments are made with Stripe's
 test cards (4242 4242 4242 4242, any future date, any CVC). No real
@@ -43,8 +42,7 @@ STRIPE_HTTP_TIMEOUT = float(os.getenv("STRIPE_HTTP_TIMEOUT", "10.0"))
 class StripeError(Exception):
     """Raised when the outbound call to Stripe failed for any reason
     (missing config, network, non-2xx, malformed body). Callers surface
-    it exactly like NowpaymentsError: 502/503 without touching the
-    committed payment_intents row."""
+    it as 502/503 without touching the committed payment_intents row."""
 
     def __init__(self, detail: str, status_code: int = 502):
         super().__init__(detail)
@@ -72,8 +70,8 @@ async def create_checkout_session(
     """Create a Stripe Checkout Session bound to `memo`.
 
     `memo` rides in `client_reference_id` (and metadata) and comes back on
-    the webhook event — the same correlation role as NOWPayments'
-    `order_id`. Returns the same shape as nowpayments_client.create_invoice:
+    the webhook event — the correlation key that binds the payment to the
+    intent. Returns:
       { "invoice_url": <hosted checkout URL>,
         "invoice_id":  <session id, cs_...>,
         "expiration_estimate_date": <unix ts or None> }

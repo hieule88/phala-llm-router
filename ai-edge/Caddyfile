@@ -7,7 +7,7 @@
 # (/v1/consume, /v1/refund) stay private on the docker network — the Edge and
 # ops reach them internally; the internet gets 404.
 {$AUTH_PUBLIC_DOMAIN} {
-	@public path /v1/signup /v1/keys/rotate /v1/webhooks/nowpayments /v1/webhooks/stripe /v1/payment-intents /v1/payment-intents/* /v1/validate
+	@public path /v1/signup /v1/keys/rotate /v1/webhooks/stripe /v1/payment-intents /v1/payment-intents/* /v1/validate
 	handle @public {
 		reverse_proxy auth-service:8000 {
 			# Overwrite, never pass through: a client-supplied X-Real-IP would
