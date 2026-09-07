@@ -12,13 +12,17 @@ identities, or debit balances.
 
 Trust model: the watcher's claim is re-checked server-side wherever the
 server has independent knowledge — the faucet must be the one accepted
-rail-wide (a note of the wrong token must never credit), the amount is
-converted with the server's own rate (rounded DOWN), and crediting goes
-through the same mark_paid_by_memo path as every other rail, so replay
-dedup (topups.source UNIQUE), the underpaid guard, and the expired-intent
-escape hatch all apply unchanged. What the server cannot re-check — that
-note_id really exists on-chain with those assets — is exactly the
-watcher's job, which is why the endpoint is not public.
+rail-wide (a note of the wrong token must never credit), the reported
+amount must EQUAL the intent's dusted amount (token_amount_for_intent:
+price + per-memo sub-cent dust, the value the payer was quoted), and
+crediting goes through the same mark_paid_by_memo path as every other
+rail, so replay dedup (topups.source UNIQUE), the underpaid guard, and
+the expired-intent escape hatch all apply unchanged. The dust check is
+what makes amounts intent-specific: a note that paid intent A cannot be
+re-attributed to a same-price intent B, because B demands different
+base units. What the server cannot re-check — that note_id really
+exists on-chain with those assets — is exactly the watcher's job, which
+is why the endpoint is not public.
 """
 
 from __future__ import annotations
@@ -96,6 +100,37 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
         actual_cents = onchain_client.cents_for_token_amount(p["amount_base_units"])
     except onchain_client.OnchainError as e:
         raise WebhookError(e.status_code, e.detail) from None
+
+    # Dusted-amount guard, enforced HERE and not merely advised to the
+    # watcher: the payer was quoted price + memo_dust, and the note must
+    # match that figure EXACTLY. Less is an underpayment; more is NOT
+    # accepted as overpay, because a >= rule reopens the misattribution
+    # hole (mint intents until one's dust undercuts the observed note,
+    # then claim it as "overpaid"). An honest off-by-anything note is
+    # unmatchable by the watcher's exact-amount rule too — it lands in
+    # ops territory (admin mark-paid after eyeballing), never auto-credit.
+    intent = await handlers.get_intent_by_memo(conn, p["memo"])
+    if intent is not None:
+        expected_units = onchain_client.token_amount_for_intent(
+            p["memo"], intent["amount_cents"])
+        if p["amount_base_units"] != expected_units:
+            direction = ("underpaid" if p["amount_base_units"] < expected_units
+                         else "amount mismatch")
+            result = {
+                "success": False,
+                "error": (f"{direction}: intent expects exactly {expected_units} "
+                          f"base units (price + memo dust), got {p['amount_base_units']}"),
+            }
+            logger.error(
+                "MONEY RECEIVED BUT NOT CREDITED (onchain): note=%s memo=%s "
+                "units=%d expected_units=%d — amount does not match this "
+                "intent's dusted quote; verify the note was matched to the "
+                "right memo before any manual mark-paid",
+                p["note_id"], p["memo"], p["amount_base_units"], expected_units,
+            )
+            return {"handled": True, "result": result}
+    # intent None falls through: mark_paid_by_memo reports 'intent not
+    # found' through the standard fail-loud path.
 
     result = await handlers.mark_paid_by_memo(
         conn,

@@ -29,6 +29,7 @@ reason: the ledger must never credit a cent that wasn't fully paid.
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 
@@ -120,6 +121,48 @@ def cents_for_token_amount(base_units: int) -> int:
     return (base_units * ONCHAIN_CENTS_PER_TOKEN) // (10 ** ONCHAIN_TOKEN_DECIMALS)
 
 
+def memo_dust(memo: str) -> int:
+    """Deterministic sub-cent 'dust' derived from the intent memo.
+
+    The plain-send wallet path cannot attach the memo to the note, so the
+    ONLY thing that binds a committed note to an intent is its amount —
+    and a flat credits->amount mapping makes amounts collide (every
+    300-credit intent costs exactly the same), which is not a UX nit but
+    a theft vector: an attacker who sees a payment land on-chain can race
+    a same-amount intent of their own and have the watcher credit THEM.
+    Sender matching does not close this, because the miden_account labels
+    attached at wallet-bind are user-claimed and squattable.
+
+    So the amount itself is made per-intent: sha256(memo) reduced into
+    the sub-cent range, added on top of the exact price. The dust stays
+    strictly below one cent's worth of base units, so cents_for_token_amount
+    still floors to the intent's exact amount_cents — the underpay guard,
+    display prices, and accounting all see the undusted value. Derived,
+    never stored: any process holding the memo recomputes the identical
+    dust, so the quote, the matching table, and the webhook check can't
+    drift apart.
+
+    Degenerate configs where one cent is <= 1 base unit get dust 0 (there
+    is no sub-cent room); such tokens need a different disambiguator.
+    """
+    sub_cent_range = (10 ** ONCHAIN_TOKEN_DECIMALS) // ONCHAIN_CENTS_PER_TOKEN
+    if sub_cent_range <= 1:
+        return 0
+    return int.from_bytes(hashlib.sha256(memo.encode()).digest(), "big") % sub_cent_range
+
+
+def token_amount_for_intent(memo: str, amount_cents: int) -> int:
+    """The EXACT base units a payer must send for this intent: price + dust.
+
+    This is the matching key. The watcher matches a committed note to an
+    intent by this value alone; sender labels are at most a tie-breaker
+    hint. Both the send-side quote and the receive-side enforcement call
+    this same function, so the number the payer saw is the number the
+    webhook demands.
+    """
+    return token_amount_for_cents(amount_cents) + memo_dust(memo)
+
+
 async def create_payment_request(
     *,
     memo: str,
@@ -128,9 +171,12 @@ async def create_payment_request(
 ) -> dict:
     """Build the payment instructions for an intent bound to `memo`.
 
-    `memo` must ride in the P2ID note's attachment (NoteAttachment) — the
-    same correlation role as Stripe's `client_reference_id` — and comes
-    back to the ledger when the watcher matches the committed note.
+    `token_amount` is the intent's price PLUS a deterministic sub-cent
+    dust derived from the memo (see memo_dust) — the amount doubles as
+    the intent identifier, since the plain-send wallet path cannot carry
+    the memo on the note. The payer must send EXACTLY this amount.
+    Clients that can attach the memo (NoteAttachment) should still do so
+    as a second binding.
 
     Returns the same top-level shape as the other rails so callers can
     treat all providers uniformly:
@@ -148,7 +194,7 @@ async def create_payment_request(
     network call here.
     """
     _require_config()
-    base_units = token_amount_for_cents(amount_cents)
+    base_units = token_amount_for_intent(memo, amount_cents)
 
     return {
         # The wallet's QR format is address-only (`miden:<address>`); amount

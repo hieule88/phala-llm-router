@@ -96,6 +96,49 @@ class ParsePayloadTest(SetupMixin, unittest.TestCase):
         self._rejects(amount_base_units=None)
 
 
+class DustTest(SetupMixin, unittest.TestCase):
+    def test_dust_is_deterministic_and_sub_cent(self):
+        # 1 cent = 10^6/100 = 10^4 base units with the pinned config.
+        d1 = self.client.memo_dust("intent-abc")
+        self.assertEqual(d1, self.client.memo_dust("intent-abc"))
+        self.assertTrue(0 <= d1 < 10_000)
+
+    def test_different_memos_get_different_amounts(self):
+        # The whole point: two same-price intents demand different units.
+        # (Fixed memos, so this is deterministic — sha256 won't change.)
+        a = self.client.token_amount_for_intent("intent-victim", 300)
+        b = self.client.token_amount_for_intent("intent-thief", 300)
+        self.assertNotEqual(a, b)
+        self.assertEqual(a // 10_000, b // 10_000)   # same whole-cent price
+
+    def test_dust_never_changes_the_cents(self):
+        # The underpay guard, display price and accounting must all see
+        # the undusted value.
+        for memo in ("intent-a", "intent-b", "intent-c"):
+            units = self.client.token_amount_for_intent(memo, 300)
+            self.assertEqual(self.client.cents_for_token_amount(units), 300)
+
+    def test_degenerate_config_gets_zero_dust(self):
+        # No sub-cent room (1 cent <= 1 base unit) → dust must be 0, not
+        # a price change.
+        with patch.object(self.client, "ONCHAIN_TOKEN_DECIMALS", 2), \
+             patch.object(self.client, "ONCHAIN_CENTS_PER_TOKEN", 100):
+            self.assertEqual(self.client.memo_dust("intent-abc"), 0)
+
+    def test_quote_and_matching_table_agree(self):
+        # The payer's quote (create_payment_request) and the watcher's
+        # matching key (token_amount_for_intent) must be the same number.
+        async def go():
+            with patch.object(self.client, "ONCHAIN_GATEWAY_ADDRESS", GATEWAY):
+                r = await self.client.create_payment_request(
+                    memo="intent-abc", amount_cents=300)
+            return r["onchain"]["token_amount"]
+
+        quoted = run(go())
+        self.assertEqual(
+            quoted, str(self.client.token_amount_for_intent("intent-abc", 300)))
+
+
 class DispatchTest(SetupMixin, unittest.TestCase):
     def _with_intent(self, scenario, credits=300):
         from app.db import init_db
@@ -117,9 +160,14 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         cur = await conn.execute("SELECT balance FROM balances WHERE identity_id = 1")
         return (await cur.fetchone())[0]
 
-    def test_exact_payment_credits_the_intent(self):
+    def _units(self, memo, cents=300):
+        """What the payer was quoted for this intent: price + memo dust."""
+        return self.client.token_amount_for_intent(memo, cents)
+
+    def test_exact_dusted_payment_credits_the_intent(self):
         async def scenario(conn, memo):
-            out = await self.mod.dispatch(conn, _report(memo=memo))
+            out = await self.mod.dispatch(
+                conn, _report(memo=memo, amount_base_units=self._units(memo)))
             return out, await self._balance(conn)
 
         out, balance = self._with_intent(scenario)
@@ -131,7 +179,9 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         from app import handlers
 
         async def scenario(conn, memo):
-            await self.mod.dispatch(conn, _report(memo=memo, note_id="0xdeadbeef"))
+            await self.mod.dispatch(conn, _report(
+                memo=memo, note_id="0xdeadbeef",
+                amount_base_units=self._units(memo)))
             return await handlers.get_intent_by_memo(conn, memo)
 
         intent = self._with_intent(scenario)
@@ -140,8 +190,9 @@ class DispatchTest(SetupMixin, unittest.TestCase):
 
     def test_replay_deduplicates(self):
         async def scenario(conn, memo):
-            r1 = await self.mod.dispatch(conn, _report(memo=memo))
-            r2 = await self.mod.dispatch(conn, _report(memo=memo))
+            r = _report(memo=memo, amount_base_units=self._units(memo))
+            r1 = await self.mod.dispatch(conn, r)
+            r2 = await self.mod.dispatch(conn, r)
             return r1, r2, await self._balance(conn)
 
         r1, r2, balance = self._with_intent(scenario)
@@ -163,10 +214,10 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         self.assertEqual(balance, 0)
 
     def test_underpayment_is_refused(self):
-        # One base unit short: floor conversion gives 299 cents < 300.
+        # One base unit short of the dusted quote.
         async def scenario(conn, memo):
             out = await self.mod.dispatch(
-                conn, _report(memo=memo, amount_base_units=EXACT_UNITS - 1))
+                conn, _report(memo=memo, amount_base_units=self._units(memo) - 1))
             return out, await self._balance(conn)
 
         out, balance = self._with_intent(scenario)
@@ -174,15 +225,76 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         self.assertIn("underpaid", out["result"]["error"])
         self.assertEqual(balance, 0)
 
-    def test_overpayment_still_credits_the_intent_amount(self):
+    def test_undusted_exact_price_is_refused(self):
+        # A note carrying the bare price WITHOUT this memo's dust cannot
+        # be this intent's payment (it is some other intent's quote, or a
+        # hand-typed amount) — auto-credit must refuse it.
         async def scenario(conn, memo):
             out = await self.mod.dispatch(
-                conn, _report(memo=memo, amount_base_units=EXACT_UNITS + 12_345))
+                conn, _report(memo=memo,
+                              amount_base_units=self.client.token_amount_for_cents(300)))
+            return out, await self._balance(conn), self.client.memo_dust(memo)
+
+        out, balance, dust = self._with_intent(scenario)
+        if dust == 0:    # ~1/10^4 chance the random memo's dust is 0
+            self.assertTrue(out["result"]["success"])
+        else:
+            self.assertFalse(out["result"]["success"])
+            self.assertEqual(balance, 0)
+
+    def test_overpaid_note_is_not_auto_credited(self):
+        # >= would reopen the misattribution hole (mint intents until one
+        # undercuts an observed note, then claim it as overpay), so a
+        # too-large note is an ops case, never an auto-credit.
+        async def scenario(conn, memo):
+            out = await self.mod.dispatch(
+                conn, _report(memo=memo,
+                              amount_base_units=self._units(memo) + 12_345))
             return out, await self._balance(conn)
 
         out, balance = self._with_intent(scenario)
-        self.assertTrue(out["result"]["success"], out)
-        self.assertEqual(balance, 300)   # credits come from the intent, not the payment
+        self.assertFalse(out["result"]["success"])
+        self.assertIn("mismatch", out["result"]["error"])
+        self.assertEqual(balance, 0)
+
+    def test_note_for_one_intent_cannot_credit_a_same_price_one(self):
+        # The audit's theft scenario: victim and thief intents cost the
+        # same whole-cent price; the thief reports the victim's note
+        # (victim's dusted amount) against the thief's own memo.
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_victim")
+                await handlers.create_identity(conn, "api_key", "hash_thief")
+                v = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="onchain")
+                t = await handlers.create_intent(
+                    conn, identity_id=2, credits=300, provider="onchain")
+                # Fixed memos (dust known to differ, see DustTest) so the
+                # scenario is deterministic, not 9999/10000.
+                for old, new in ((v["memo"], "intent-victim"),
+                                 (t["memo"], "intent-thief")):
+                    await conn.execute(
+                        "UPDATE payment_intents SET memo = ? WHERE memo = ?",
+                        (new, old))
+                await conn.commit()
+
+                victim_units = self.client.token_amount_for_intent("intent-victim", 300)
+                out = await self.mod.dispatch(conn, _report(
+                    memo="intent-thief", amount_base_units=victim_units))
+                cur = await conn.execute(
+                    "SELECT balance FROM balances WHERE identity_id = 2")
+                thief_balance = (await cur.fetchone())[0]
+                return out, thief_balance
+            finally:
+                await conn.close()
+
+        out, thief_balance = run(go())
+        self.assertFalse(out["result"]["success"], out)
+        self.assertEqual(thief_balance, 0)
 
     def test_unknown_memo_reports_failure(self):
         async def scenario(conn, memo):
@@ -204,7 +316,8 @@ class DispatchTest(SetupMixin, unittest.TestCase):
                 "datetime(CURRENT_TIMESTAMP, '-1 hour') WHERE memo = ?", (memo,))
             await conn.commit()
             await handlers.mark_paid_by_memo(conn, memo)   # ops probe flips to 'expired'
-            out = await self.mod.dispatch(conn, _report(memo=memo))
+            out = await self.mod.dispatch(
+                conn, _report(memo=memo, amount_base_units=self._units(memo)))
             return out, await self._balance(conn)
 
         out, balance = self._with_intent(scenario)

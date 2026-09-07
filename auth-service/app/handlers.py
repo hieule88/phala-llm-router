@@ -1017,12 +1017,15 @@ async def list_pending_onchain_intents(
     addresses — the note-watcher's matching table.
 
     The plain-send payment path carries no memo on the note, so the
-    watcher matches a committed note by (sender account, exact amount);
+    matching KEY is the intent's exact dusted token amount (computed by
+    the route via onchain_client.token_amount_for_intent — unique-ish
+    per intent by construction and enforced by the webhook).
     `sender_accounts` holds the identity's `miden_account` credential
-    labels (public addresses, attached at wallet-bind time) for exactly
-    that. An intent whose identity has no bound address is still listed —
-    the watcher can then only match it by amount, but omitting it would
-    make its payment silently unmatchable.
+    labels for tie-breaking ONLY: they are attached at wallet-bind as
+    unverified, user-claimed values — anyone can bind a wallet while
+    claiming someone else's address — so they must never decide which
+    intent a payment credits. An intent whose identity has no bound
+    address is listed like any other.
 
     Deliberately NOT filtered by expires_at: money can land after the TTL
     and the webhook path honours it (allow_expired), so a stale-but-

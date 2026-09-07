@@ -916,9 +916,15 @@ async def onchain_webhook_endpoint(request: Request):
 @app.get("/v1/onchain/pending-intents", dependencies=[Depends(require_watcher_token)])
 @limiter.limit(RATE_LIMIT_VALIDATE)
 async def onchain_pending_intents(request: Request):
-    """The note-watcher's matching table: every pending 'onchain' intent,
-    with the exact token amount to expect (server-derived, base units)
-    and the identity's bound Miden addresses for sender matching.
+    """The note-watcher's matching table: every pending 'onchain' intent
+    with the exact DUSTED token amount to expect (server-derived, base
+    units — price + per-memo sub-cent dust, see onchain_client.memo_dust).
+
+    Matching contract: `token_amount` is the key — it is unique-ish per
+    intent by construction, and the webhook enforces it, so the watcher
+    matches a note by exact amount alone. `sender_accounts` are
+    UNVERIFIED, user-claimed labels (squattable at wallet-bind) — a
+    tie-breaker hint at most, never grounds to attribute a payment.
 
     Also carries the rail config (receiving address, faucet, decimals)
     so the watcher configures itself from the same source of truth that
@@ -929,7 +935,8 @@ async def onchain_pending_intents(request: Request):
     intents = await handlers.list_pending_onchain_intents(app.state.db)
     for intent in intents:
         intent["token_amount"] = str(
-            onchain_client.token_amount_for_cents(intent["amount_cents"]))
+            onchain_client.token_amount_for_intent(
+                intent["memo"], intent["amount_cents"]))
     return {
         "pay_to_address": onchain_client.ONCHAIN_GATEWAY_ADDRESS,
         "faucet_id": onchain_client.ONCHAIN_FAUCET_ID,
