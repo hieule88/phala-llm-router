@@ -754,6 +754,13 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
     Does NOT authenticate on api_key — anyone with the memo can request
     a checkout URL for it. That is safe: paying the URL always credits
     the intent's original identity, which was fixed at intent-create.
+
+    Switching rails UPDATES the intent's provider first: instructions
+    for rail X on a row recorded as rail Y would orphan the payment —
+    an on-chain payment against a 'stripe' row is invisible to the
+    note-watcher's matching table and refused by the onchain webhook,
+    so the money would arrive with nobody to credit it. A refused
+    switch (on-chain slot discipline) is a 409; create a new intent.
     """
     intent = await handlers.get_intent_by_memo(app.state.db, memo)
     if intent is None:
@@ -764,6 +771,13 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             detail=f"intent is {intent['status']}, cannot create checkout",
         )
     provider = TOPUP_PROVIDER_OVERRIDE or req.provider
+    if provider in handlers.ALLOWED_PROVIDERS and provider != intent["provider"]:
+        switched = await handlers.set_intent_provider(app.state.db, memo, provider)
+        if not switched.get("success"):
+            raise HTTPException(
+                status_code=409,
+                detail=switched.get("error", "cannot switch provider"),
+            )
     if provider == "stripe":
         try:
             invoice = await stripe_client.create_checkout_session(

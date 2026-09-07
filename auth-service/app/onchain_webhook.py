@@ -29,6 +29,21 @@ cannot replay a single real note — or an invented one — across the
 whole pending table. What the server cannot re-check — that note_id
 really exists on-chain with those assets — remains the watcher's job,
 which is why the endpoint is not public.
+
+Settlement rule: only pure P2ID notes are creditable (`note_kind` is a
+required field and 'p2id' is the only accepted value). A P2IDE note has
+a reclaim path — until the gateway consumes it, the sender can take the
+funds back after the timelock — so "committed on-chain" is NOT settled
+money for P2IDE, and crediting it would be Stripe's `payment_status ==
+"pending"`, not "paid". The watcher must classify the note's script
+root (P2ID vs P2IDE vs dApp scripts) and report only pure P2ID notes
+from committed blocks.
+
+Retry contract for the watcher: 4xx answers are PERMANENT — dead-letter
+the report and alert, never retry (the condition will not change);
+5xx / network errors are transient — retry with backoff. This mirrors
+Stripe's behaviour of giving up on non-retryable failures instead of
+spinning forever.
 """
 
 from __future__ import annotations
@@ -68,6 +83,20 @@ def parse_payload(payload: dict) -> dict:
     faucet_id = payload.get("faucet_id")
     if not isinstance(faucet_id, str) or not faucet_id:
         raise WebhookError(400, "faucet_id must be a non-empty string")
+
+    # Only pure P2ID settles at commit time. P2IDE carries a reclaim
+    # path (sender can pull the funds back after the timelock until the
+    # note is consumed), so crediting it on commit would pay out against
+    # money that can still leave. Requiring the field forces the watcher
+    # to actually classify the script root rather than forward anything
+    # that pattern-matched on amount.
+    note_kind = payload.get("note_kind")
+    if note_kind != "p2id":
+        raise WebhookError(
+            400,
+            "note_kind must be 'p2id' — P2IDE (reclaimable) and other "
+            "note scripts are not creditable",
+        )
 
     # bool is an int subclass; a watcher sending `true` here is broken.
     amount = payload.get("amount_base_units")
@@ -134,11 +163,6 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
         if p["amount_base_units"] != expected_units:
             direction = ("underpaid" if p["amount_base_units"] < expected_units
                          else "amount mismatch")
-            result = {
-                "success": False,
-                "error": (f"{direction}: intent expects exactly {expected_units} "
-                          f"base units (price + memo dust), got {p['amount_base_units']}"),
-            }
             logger.error(
                 "MONEY RECEIVED BUT NOT CREDITED (onchain): note=%s memo=%s "
                 "units=%d expected_units=%d — amount does not match this "
@@ -146,7 +170,13 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
                 "right memo before any manual mark-paid",
                 p["note_id"], p["memo"], p["amount_base_units"], expected_units,
             )
-            return {"handled": True, "result": result}
+            # Permanent: the note's amount will never change → 409, so
+            # the watcher dead-letters instead of retrying forever.
+            raise WebhookError(
+                409,
+                (f"{direction}: intent expects exactly {expected_units} "
+                 f"base units (price + memo dust), got {p['amount_base_units']}"),
+            )
     # intent None falls through: mark_paid_by_memo reports 'intent not
     # found' through the standard fail-loud path.
 
@@ -196,13 +226,27 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
             "onchain payment credited (note=%s memo=%s cents=%d dedup=%s)",
             p["note_id"], p["memo"], actual_cents, bool(result.get("deduplicated")),
         )
-    else:
-        # The tokens are on-chain in our account either way — this must
-        # never disappear into a silent log line.
+        return {"handled": True, "result": result}
+
+    error = result.get("error", "")
+    if "not found" in error:
+        # A claim against a memo that never existed is a watcher bug or
+        # an attack, not a stranded payment — no remediation command to
+        # print, and retrying can never succeed.
         logger.error(
-            "MONEY RECEIVED BUT NOT CREDITED (onchain): note=%s memo=%s "
-            "cents=%d error=%r — inspect the intent, then finalise via "
-            "POST /v1/payment-intents/%s/mark-paid (ADMIN)",
-            p["note_id"], p["memo"], actual_cents, result.get("error"), p["memo"],
+            "onchain report for nonexistent intent refused (note=%s memo=%s)",
+            p["note_id"], p["memo"],
         )
-    return {"handled": True, "result": result}
+        raise WebhookError(404, f"intent {p['memo']} not found")
+
+    # Cancelled intent (or any other terminal ledger refusal): the
+    # tokens are on-chain in our account either way — this must never
+    # disappear into a silent log line — but the condition is permanent,
+    # so 409 (dead-letter + ops) instead of the retried 500.
+    logger.error(
+        "MONEY RECEIVED BUT NOT CREDITED (onchain): note=%s memo=%s "
+        "cents=%d error=%r — inspect the intent, then finalise via "
+        "POST /v1/payment-intents/%s/mark-paid (ADMIN)",
+        p["note_id"], p["memo"], actual_cents, error, p["memo"],
+    )
+    raise WebhookError(409, f"payment not credited: {error}")

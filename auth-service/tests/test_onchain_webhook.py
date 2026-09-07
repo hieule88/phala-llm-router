@@ -33,10 +33,10 @@ GATEWAY = "mtst1gatewayreceivingaccount000000000"
 EXACT_UNITS = 3_000_000
 
 
-def _report(memo="intent-abc", note_id="0xnote1",
-            faucet_id=FAUCET, amount_base_units=EXACT_UNITS) -> dict:
-    return {"memo": memo, "note_id": note_id,
-            "faucet_id": faucet_id, "amount_base_units": amount_base_units}
+def _report(memo="intent-abc", note_id="0xnote1", faucet_id=FAUCET,
+            amount_base_units=EXACT_UNITS, note_kind="p2id") -> dict:
+    return {"memo": memo, "note_id": note_id, "faucet_id": faucet_id,
+            "amount_base_units": amount_base_units, "note_kind": note_kind}
 
 
 class SetupMixin:
@@ -94,6 +94,17 @@ class ParsePayloadTest(SetupMixin, unittest.TestCase):
         self._rejects(amount_base_units=True)   # bool is an int subclass
         self._rejects(amount_base_units="3.14")
         self._rejects(amount_base_units=None)
+
+    def test_non_p2id_notes_are_refused(self):
+        # P2IDE is reclaimable until consumed — committed is not settled.
+        self._rejects(note_kind="p2ide")
+        self._rejects(note_kind="")
+        self._rejects(note_kind=None)
+        with self.assertRaises(self.mod.WebhookError) as cm:
+            payload = _report()
+            del payload["note_kind"]
+            self.mod.parse_payload(payload)
+        self.assertEqual(cm.exception.status_code, 400)
 
 
 class DustTest(SetupMixin, unittest.TestCase):
@@ -214,15 +225,21 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         self.assertEqual(balance, 0)
 
     def test_underpayment_is_refused(self):
-        # One base unit short of the dusted quote.
+        # One base unit short of the dusted quote. Permanent → 409, not
+        # a retried 500.
         async def scenario(conn, memo):
-            out = await self.mod.dispatch(
-                conn, _report(memo=memo, amount_base_units=self._units(memo) - 1))
-            return out, await self._balance(conn)
+            try:
+                await self.mod.dispatch(
+                    conn, _report(memo=memo, amount_base_units=self._units(memo) - 1))
+                err = None
+            except self.mod.WebhookError as e:
+                err = e
+            return err, await self._balance(conn)
 
-        out, balance = self._with_intent(scenario)
-        self.assertFalse(out["result"]["success"])
-        self.assertIn("underpaid", out["result"]["error"])
+        err, balance = self._with_intent(scenario)
+        self.assertIsNotNone(err)
+        self.assertEqual(err.status_code, 409)
+        self.assertIn("underpaid", err.detail)
         self.assertEqual(balance, 0)
 
     def test_undusted_exact_price_is_refused(self):
@@ -230,16 +247,21 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         # be this intent's payment (it is some other intent's quote, or a
         # hand-typed amount) — auto-credit must refuse it.
         async def scenario(conn, memo):
-            out = await self.mod.dispatch(
-                conn, _report(memo=memo,
-                              amount_base_units=self.client.token_amount_for_cents(300)))
-            return out, await self._balance(conn), self.client.memo_dust(memo)
+            try:
+                out = await self.mod.dispatch(
+                    conn, _report(memo=memo,
+                                  amount_base_units=self.client.token_amount_for_cents(300)))
+                err = None
+            except self.mod.WebhookError as e:
+                out, err = None, e
+            return out, err, await self._balance(conn), self.client.memo_dust(memo)
 
-        out, balance, dust = self._with_intent(scenario)
+        out, err, balance, dust = self._with_intent(scenario)
         if dust == 0:    # ~1/10^4 chance the random memo's dust is 0
             self.assertTrue(out["result"]["success"])
         else:
-            self.assertFalse(out["result"]["success"])
+            self.assertIsNotNone(err)
+            self.assertEqual(err.status_code, 409)
             self.assertEqual(balance, 0)
 
     def test_overpaid_note_is_not_auto_credited(self):
@@ -247,14 +269,19 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         # undercuts an observed note, then claim it as overpay), so a
         # too-large note is an ops case, never an auto-credit.
         async def scenario(conn, memo):
-            out = await self.mod.dispatch(
-                conn, _report(memo=memo,
-                              amount_base_units=self._units(memo) + 12_345))
-            return out, await self._balance(conn)
+            try:
+                await self.mod.dispatch(
+                    conn, _report(memo=memo,
+                                  amount_base_units=self._units(memo) + 12_345))
+                err = None
+            except self.mod.WebhookError as e:
+                err = e
+            return err, await self._balance(conn)
 
-        out, balance = self._with_intent(scenario)
-        self.assertFalse(out["result"]["success"])
-        self.assertIn("mismatch", out["result"]["error"])
+        err, balance = self._with_intent(scenario)
+        self.assertIsNotNone(err)
+        self.assertEqual(err.status_code, 409)
+        self.assertIn("mismatch", err.detail)
         self.assertEqual(balance, 0)
 
     def test_note_for_one_intent_cannot_credit_a_same_price_one(self):
@@ -283,17 +310,22 @@ class DispatchTest(SetupMixin, unittest.TestCase):
                 await conn.commit()
 
                 victim_units = self.client.token_amount_for_intent("intent-victim", 300)
-                out = await self.mod.dispatch(conn, _report(
-                    memo="intent-thief", amount_base_units=victim_units))
+                try:
+                    await self.mod.dispatch(conn, _report(
+                        memo="intent-thief", amount_base_units=victim_units))
+                    err = None
+                except self.mod.WebhookError as e:
+                    err = e
                 cur = await conn.execute(
                     "SELECT balance FROM balances WHERE identity_id = 2")
                 thief_balance = (await cur.fetchone())[0]
-                return out, thief_balance
+                return err, thief_balance
             finally:
                 await conn.close()
 
-        out, thief_balance = run(go())
-        self.assertFalse(out["result"]["success"], out)
+        err, thief_balance = run(go())
+        self.assertIsNotNone(err)
+        self.assertEqual(err.status_code, 409)
         self.assertEqual(thief_balance, 0)
 
     def test_one_note_cannot_credit_two_intents(self):
@@ -410,14 +442,40 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         self.assertIsNotNone(dup_err)
         self.assertIn("payment_intents.provider_ref", dup_err)
 
-    def test_unknown_memo_reports_failure(self):
+    def test_unknown_memo_is_404(self):
+        # Permanent (watcher bug or attack, not a stranded payment) →
+        # 404 so the watcher dead-letters instead of retrying forever.
         async def scenario(conn, memo):
-            return await self.mod.dispatch(conn, _report(memo="intent-nonexistent"))
+            try:
+                await self.mod.dispatch(conn, _report(memo="intent-nonexistent"))
+                return None
+            except self.mod.WebhookError as e:
+                return e
 
-        out = self._with_intent(scenario)
-        self.assertTrue(out["handled"])
-        self.assertFalse(out["result"]["success"])
-        self.assertIn("not found", out["result"]["error"])
+        err = self._with_intent(scenario)
+        self.assertIsNotNone(err)
+        self.assertEqual(err.status_code, 404)
+
+    def test_cancelled_intent_is_409(self):
+        # Money on-chain against a cancelled intent: logged loudly (ops
+        # will see MONEY RECEIVED BUT NOT CREDITED) but permanent → 409.
+        from app import handlers
+
+        async def scenario(conn, memo):
+            await handlers.cancel_intent_by_memo(conn, memo)
+            try:
+                await self.mod.dispatch(
+                    conn, _report(memo=memo, amount_base_units=self._units(memo)))
+                err = None
+            except self.mod.WebhookError as e:
+                err = e
+            return err, await self._balance(conn)
+
+        err, balance = self._with_intent(scenario)
+        self.assertIsNotNone(err)
+        self.assertEqual(err.status_code, 409)
+        self.assertIn("cancelled", err.detail)
+        self.assertEqual(balance, 0)
 
     def test_paid_expired_intent_still_credits(self):
         # Same H3 guarantee as the other rails: an on-chain confirmation
@@ -501,6 +559,205 @@ class PendingIntentsTest(SetupMixin, unittest.TestCase):
 
         intent, out = run(go())
         self.assertEqual([i["memo"] for i in out], [intent["memo"]])
+
+    def test_lazily_flipped_expired_row_stays_matchable(self):
+        # An admin probe flips a stale row to status='expired'
+        # (handlers lazy sweep); the webhook still credits it via
+        # allow_expired, so the matching table must keep showing it —
+        # otherwise the payment lands with nobody to match it.
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_1")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="onchain")
+                await conn.execute(
+                    "UPDATE payment_intents SET expires_at = "
+                    "datetime(CURRENT_TIMESTAMP, '-1 hour') WHERE memo = ?",
+                    (intent["memo"],))
+                await conn.commit()
+                await handlers.mark_paid_by_memo(conn, intent["memo"])  # flips to 'expired'
+                return intent, await handlers.list_pending_onchain_intents(conn)
+            finally:
+                await conn.close()
+
+        intent, out = run(go())
+        self.assertEqual([i["memo"] for i in out], [intent["memo"]])
+
+    def test_ancient_intent_leaves_the_matching_table(self):
+        # Past the grace window the dust slot is released; a late
+        # payment becomes an ops case instead of an eternal listing.
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_1")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="onchain")
+                await conn.execute(
+                    "UPDATE payment_intents SET expires_at = "
+                    "datetime(CURRENT_TIMESTAMP, '-30 days') WHERE memo = ?",
+                    (intent["memo"],))
+                await conn.commit()
+                return await handlers.list_pending_onchain_intents(conn)
+            finally:
+                await conn.close()
+
+        self.assertEqual(run(go()), [])
+
+
+class IntentSlotDisciplineTest(SetupMixin, unittest.TestCase):
+    """create_intent's on-chain slot rules: per-identity cap, unique
+    dusted amount among live same-price quotes, short TTL."""
+
+    def _db(self, scenario):
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_x")
+                return await scenario(conn, handlers)
+            finally:
+                await conn.close()
+
+        return run(go())
+
+    def test_pending_cap_per_identity(self):
+        from app import handlers
+
+        async def scenario(conn, h):
+            with patch.object(handlers, "ONCHAIN_MAX_PENDING_PER_IDENTITY", 2):
+                r1 = await h.create_intent(conn, 1, 100, "onchain")
+                r2 = await h.create_intent(conn, 1, 200, "onchain")
+                r3 = await h.create_intent(conn, 1, 300, "onchain")
+                # other rails are not subject to the cap
+                r4 = await h.create_intent(conn, 1, 300, "stripe")
+            return r1, r2, r3, r4
+
+        r1, r2, r3, r4 = self._db(scenario)
+        self.assertTrue(r1["success"] and r2["success"])
+        self.assertFalse(r3["success"])
+        self.assertIn("too many", r3["error"])
+        self.assertTrue(r4["success"])
+
+    def test_colliding_dust_redraws_the_memo(self):
+        # dust sequence: create#1 candidate→7; create#2 sees existing
+        # memo (7), first candidate collides (7), redraw succeeds (8).
+        async def scenario(conn, h):
+            with patch.object(self.client, "memo_dust",
+                              side_effect=[7, 7, 7, 8]) as m:
+                a = await h.create_intent(conn, 1, 300, "onchain")
+                b = await h.create_intent(conn, 1, 300, "onchain")
+                return a, b, m.call_count
+
+        a, b, calls = self._db(scenario)
+        self.assertTrue(a["success"] and b["success"])
+        self.assertEqual(calls, 4)
+
+    def test_saturated_price_point_fails_closed(self):
+        # Every draw collides → refuse to mint an ambiguous quote.
+        async def scenario(conn, h):
+            with patch.object(self.client, "memo_dust", return_value=7):
+                a = await h.create_intent(conn, 1, 300, "onchain")
+                b = await h.create_intent(conn, 1, 300, "onchain")
+                # a DIFFERENT price point is unaffected
+                c = await h.create_intent(conn, 1, 200, "onchain")
+            return a, b, c
+
+        a, b, c = self._db(scenario)
+        self.assertTrue(a["success"])
+        self.assertFalse(b["success"])
+        self.assertIn("no unique payment amount", b["error"])
+        self.assertTrue(c["success"])
+
+    def test_onchain_ttl_is_short(self):
+        async def scenario(conn, h):
+            await h.create_intent(conn, 1, 300, "onchain")
+            await h.create_intent(conn, 1, 300, "stripe")
+            cur = await conn.execute(
+                "SELECT provider, "
+                "(julianday(expires_at) - julianday(CURRENT_TIMESTAMP)) * 86400 "
+                "FROM payment_intents")
+            return dict(await cur.fetchall())
+
+        ttls = self._db(scenario)
+        self.assertLess(ttls["onchain"], 2 * 86400)      # ~24h
+        self.assertGreater(ttls["stripe"], 20 * 86400)   # ~30d
+
+
+class SetIntentProviderTest(SetupMixin, unittest.TestCase):
+    def _db(self, scenario):
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_x")
+                return await scenario(conn, handlers)
+            finally:
+                await conn.close()
+
+        return run(go())
+
+    def test_switch_to_onchain_updates_row_and_matching_table(self):
+        async def scenario(conn, h):
+            intent = await h.create_intent(conn, 1, 300, "stripe")
+            out = await h.set_intent_provider(conn, intent["memo"], "onchain")
+            listed = await h.list_pending_onchain_intents(conn)
+            cur = await conn.execute(
+                "SELECT provider, "
+                "(julianday(expires_at) - julianday(CURRENT_TIMESTAMP)) * 86400 "
+                "FROM payment_intents WHERE memo = ?", (intent["memo"],))
+            row = await cur.fetchone()
+            return intent, out, listed, row
+
+        intent, out, listed, (provider, ttl) = self._db(scenario)
+        self.assertTrue(out["success"] and out["changed"])
+        self.assertEqual(provider, "onchain")
+        self.assertEqual([i["memo"] for i in listed], [intent["memo"]])
+        # the slot is not held for a hosted-checkout-sized lifetime
+        self.assertLess(ttl, 2 * 86400)
+
+    def test_switch_away_from_onchain_leaves_matching_table(self):
+        async def scenario(conn, h):
+            intent = await h.create_intent(conn, 1, 300, "onchain")
+            out = await h.set_intent_provider(conn, intent["memo"], "stripe")
+            return out, await h.list_pending_onchain_intents(conn)
+
+        out, listed = self._db(scenario)
+        self.assertTrue(out["success"])
+        self.assertEqual(listed, [])
+
+    def test_non_pending_intent_cannot_switch(self):
+        async def scenario(conn, h):
+            intent = await h.create_intent(conn, 1, 300, "stripe")
+            await h.mark_paid_by_memo(conn, intent["memo"])
+            return await h.set_intent_provider(conn, intent["memo"], "onchain")
+
+        out = self._db(scenario)
+        self.assertFalse(out["success"])
+        self.assertIn("paid", out["error"])
+
+    def test_switch_refused_when_dust_slot_is_taken(self):
+        # The fixed memo's dust collides with a live on-chain quote of
+        # the same price → refuse, tell the caller to mint a new intent.
+        async def scenario(conn, h):
+            with patch.object(self.client, "memo_dust", return_value=7):
+                await h.create_intent(conn, 1, 300, "onchain")
+                other = await h.create_intent(conn, 1, 300, "stripe")
+                return await h.set_intent_provider(conn, other["memo"], "onchain")
+
+        out = self._db(scenario)
+        self.assertFalse(out["success"])
+        self.assertIn("collides", out["error"])
 
 
 class WatcherTokenGateTest(unittest.TestCase):
