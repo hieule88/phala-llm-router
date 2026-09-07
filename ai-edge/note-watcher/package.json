@@ -1,0 +1,16 @@
+{
+  "name": "leviathan-note-watcher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Watches the Miden chain for P2ID payments to the gateway account and reports them to auth-service's onchain webhook.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/watcher.mjs",
+    "test": "node --test 'test/*.test.mjs'",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@miden-sdk/miden-sdk": "node"
+  }
+}
