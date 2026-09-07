@@ -209,6 +209,10 @@ async def create_payment_request(
             # Pure P2ID only: a P2IDE (reclaimable) note is not settled
             # money at commit time and the watcher will not credit it.
             "note_kind": "p2id",
+            # A private note is unobservable by the watcher — the money
+            # would arrive and never be credited. Frontends must pass
+            # noteType 'public' explicitly, never rely on wallet defaults.
+            "note_visibility": "public",
             "token_amount": str(base_units),
             "token_decimals": ONCHAIN_TOKEN_DECIMALS,
             "token_symbol": ONCHAIN_TOKEN_SYMBOL,
