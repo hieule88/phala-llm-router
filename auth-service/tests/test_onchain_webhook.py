@@ -296,6 +296,120 @@ class DispatchTest(SetupMixin, unittest.TestCase):
         self.assertFalse(out["result"]["success"], out)
         self.assertEqual(thief_balance, 0)
 
+    def test_one_note_cannot_credit_two_intents(self):
+        # A compromised watcher replaying one real note across the
+        # pending table: the second claim must be refused permanently.
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_1")
+                await handlers.create_identity(conn, "api_key", "hash_2")
+                a = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="onchain")
+                b = await handlers.create_intent(
+                    conn, identity_id=2, credits=300, provider="onchain")
+                r1 = await self.mod.dispatch(conn, _report(
+                    memo=a["memo"], note_id="0xnote_reused",
+                    amount_base_units=self._units(a["memo"])))
+                try:
+                    await self.mod.dispatch(conn, _report(
+                        memo=b["memo"], note_id="0xnote_reused",
+                        amount_base_units=self._units(b["memo"])))
+                    err = None
+                except self.mod.WebhookError as e:
+                    err = e
+                cur = await conn.execute(
+                    "SELECT balance FROM balances WHERE identity_id = 2")
+                b2 = (await cur.fetchone())[0]
+                return r1, err, b2
+            finally:
+                await conn.close()
+
+        r1, err, second_balance = run(go())
+        self.assertTrue(r1["result"]["success"])
+        self.assertIsNotNone(err)
+        self.assertEqual(err.status_code, 409)
+        self.assertEqual(second_balance, 0)
+
+    def test_same_note_same_memo_replay_still_dedups(self):
+        # The reuse guard must not break the ordinary retry: identical
+        # (note, memo) goes through to mark_paid's dedup path.
+        async def scenario(conn, memo):
+            r = _report(memo=memo, note_id="0xsame",
+                        amount_base_units=self._units(memo))
+            await self.mod.dispatch(conn, r)
+            out = await self.mod.dispatch(conn, r)
+            return out, await self._balance(conn)
+
+        out, balance = self._with_intent(scenario)
+        self.assertTrue(out["result"].get("deduplicated"))
+        self.assertEqual(balance, 300)
+
+    def test_non_onchain_intent_is_refused(self):
+        # Watcher bearer + a leaked Stripe memo must not credit anything.
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_x")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="stripe")
+                try:
+                    await self.mod.dispatch(conn, _report(memo=intent["memo"]))
+                    err = None
+                except self.mod.WebhookError as e:
+                    err = e
+                cur = await conn.execute(
+                    "SELECT balance FROM balances WHERE identity_id = 1")
+                return err, (await cur.fetchone())[0]
+            finally:
+                await conn.close()
+
+        err, balance = run(go())
+        self.assertIsNotNone(err)
+        self.assertEqual(err.status_code, 400)
+        self.assertEqual(balance, 0)
+
+    def test_db_index_is_the_backstop_for_note_reuse(self):
+        # Belt under the pre-check: writing the same miden ref twice must
+        # fail at the schema level, while non-miden refs stay repeatable.
+        import sqlite3 as _sqlite3
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_x")
+                for _ in range(4):
+                    await handlers.create_intent(
+                        conn, identity_id=1, credits=10, provider="onchain")
+                await conn.execute(
+                    "UPDATE payment_intents SET provider_ref = 'miden:0xdup' WHERE id = 1")
+                try:
+                    await conn.execute(
+                        "UPDATE payment_intents SET provider_ref = 'miden:0xdup' WHERE id = 2")
+                    dup_err = None
+                except _sqlite3.IntegrityError as e:
+                    dup_err = str(e)
+                # non-miden refs are deliberately unconstrained
+                await conn.execute(
+                    "UPDATE payment_intents SET provider_ref = 'stripe:cs_1' WHERE id = 3")
+                await conn.execute(
+                    "UPDATE payment_intents SET provider_ref = 'stripe:cs_1' WHERE id = 4")
+                return dup_err
+            finally:
+                await conn.close()
+
+        dup_err = run(go())
+        self.assertIsNotNone(dup_err)
+        self.assertIn("payment_intents.provider_ref", dup_err)
+
     def test_unknown_memo_reports_failure(self):
         async def scenario(conn, memo):
             return await self.mod.dispatch(conn, _report(memo="intent-nonexistent"))

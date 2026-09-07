@@ -20,14 +20,21 @@ rail, so replay dedup (topups.source UNIQUE), the underpaid guard, and
 the expired-intent escape hatch all apply unchanged. The dust check is
 what makes amounts intent-specific: a note that paid intent A cannot be
 re-attributed to a same-price intent B, because B demands different
-base units. What the server cannot re-check — that note_id really
-exists on-chain with those assets — is exactly the watcher's job, which
-is why the endpoint is not public.
+base units. On top of that, the named intent must actually belong to
+this rail (provider 'onchain' — memos of other rails leak through
+payment channels and must not become creditable here), and one note_id
+credits AT MOST one intent ever: a reuse pre-check plus a partial
+UNIQUE index on provider_ref ('miden:%') mean a compromised watcher
+cannot replay a single real note — or an invented one — across the
+whole pending table. What the server cannot re-check — that note_id
+really exists on-chain with those assets — remains the watcher's job,
+which is why the endpoint is not public.
 """
 
 from __future__ import annotations
 
 import logging
+import sqlite3
 
 import aiosqlite
 
@@ -110,6 +117,17 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
     # unmatchable by the watcher's exact-amount rule too — it lands in
     # ops territory (admin mark-paid after eyeballing), never auto-credit.
     intent = await handlers.get_intent_by_memo(conn, p["memo"])
+    if intent is not None and intent["provider"] != "onchain":
+        # Memos travel in payment channels that leak them (the intent
+        # status endpoint is public by design), so a watcher bearer plus
+        # a leaked Stripe memo must not become a crediting capability.
+        # Permanent condition → 4xx, not the retried 500.
+        logger.error(
+            "onchain report against a %r intent refused (note=%s memo=%s)",
+            intent["provider"], p["note_id"], p["memo"],
+        )
+        raise WebhookError(
+            400, f"intent {p['memo']} is not an onchain intent")
     if intent is not None:
         expected_units = onchain_client.token_amount_for_intent(
             p["memo"], intent["amount_cents"])
@@ -132,16 +150,47 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
     # intent None falls through: mark_paid_by_memo reports 'intent not
     # found' through the standard fail-loud path.
 
-    result = await handlers.mark_paid_by_memo(
-        conn,
-        p["memo"],
-        provider_ref=f"miden:{p['note_id']}",
-        actual_amount_cents=actual_cents,
-        # Same escape hatch as every webhook adapter: an on-chain
-        # confirmation that lands after the intent's TTL must be honoured
-        # at the intent's ORIGINAL price — the tokens are already ours.
-        allow_expired=True,
+    # One note, one credit — ever. A replay of the SAME (note, memo) pair
+    # is the ordinary retry case and proceeds into mark_paid's dedup; the
+    # same note against a DIFFERENT memo is a double-spend of one
+    # on-chain payment and is refused permanently (409, not the retried
+    # 500). The partial UNIQUE index on provider_ref is the backstop
+    # underneath this pre-check.
+    provider_ref = f"miden:{p['note_id']}"
+    cur = await conn.execute(
+        "SELECT memo FROM payment_intents WHERE provider_ref = ?",
+        (provider_ref,),
     )
+    prior = await cur.fetchone()
+    if prior is not None and prior[0] != p["memo"]:
+        logger.error(
+            "onchain note reuse refused: note=%s already credited memo=%s, "
+            "now claimed for memo=%s", p["note_id"], prior[0], p["memo"],
+        )
+        raise WebhookError(
+            409, f"note {p['note_id']} already credited another intent")
+
+    try:
+        result = await handlers.mark_paid_by_memo(
+            conn,
+            p["memo"],
+            provider_ref=provider_ref,
+            actual_amount_cents=actual_cents,
+            # Same escape hatch as every webhook adapter: an on-chain
+            # confirmation that lands after the intent's TTL must be honoured
+            # at the intent's ORIGINAL price — the tokens are already ours.
+            allow_expired=True,
+        )
+    except sqlite3.IntegrityError as e:
+        # The index caught what the pre-check raced past (or a code path
+        # that skipped it): same terminal answer as the pre-check.
+        # SQLite reports partial-index violations by column, not by
+        # index name: "UNIQUE constraint failed: payment_intents.provider_ref".
+        if "payment_intents.provider_ref" not in str(e):
+            raise
+        raise WebhookError(
+            409, f"note {p['note_id']} already credited another intent",
+        ) from None
     if result.get("success"):
         logger.info(
             "onchain payment credited (note=%s memo=%s cents=%d dedup=%s)",

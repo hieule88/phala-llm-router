@@ -104,6 +104,16 @@ CREATE INDEX IF NOT EXISTS idx_payment_intents_identity
 CREATE INDEX IF NOT EXISTS idx_payment_intents_status
     ON payment_intents(status);
 
+-- One on-chain note credits AT MOST one intent. The note-watcher path
+-- records provider_ref = 'miden:<note_id>' at mark-paid time; without
+-- this constraint a compromised or buggy watcher could replay a single
+-- real note (or an invented one) against every pending intent and
+-- credit them all. Partial: other rails' refs (e.g. 'stripe:...') are
+-- deliberately unconstrained — Stripe dedup lives in the memo/session
+-- binding, and admin refs may legitimately repeat.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_miden_note
+    ON payment_intents(provider_ref) WHERE provider_ref LIKE 'miden:%';
+
 CREATE TABLE IF NOT EXISTS balances (
     identity_id   INTEGER PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
     balance       INTEGER NOT NULL DEFAULT 0,         -- prove credits remaining
