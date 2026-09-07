@@ -33,7 +33,7 @@ services:
       # are capped per identity, and stay matchable only GRACE past TTL.
       - ONCHAIN_INTENT_TTL_SECONDS=${ONCHAIN_INTENT_TTL_SECONDS:-86400}
       - ONCHAIN_MAX_PENDING_PER_IDENTITY=${ONCHAIN_MAX_PENDING_PER_IDENTITY:-8}
-      - ONCHAIN_MATCH_GRACE_SECONDS=${ONCHAIN_MATCH_GRACE_SECONDS:-604800}
+      - ONCHAIN_MATCH_GRACE_SECONDS=${ONCHAIN_MATCH_GRACE_SECONDS:-172800}
       # Force every top-up onto one provider regardless of what clients ask
       # for (switch rails without redeploying any frontend). Empty = client picks.
       - TOPUP_PROVIDER_OVERRIDE=${TOPUP_PROVIDER_OVERRIDE:-}
@@ -41,6 +41,31 @@ services:
       - auth_data:/data
     expose:
       - "8000"
+    networks: [edge-net]
+
+  # On-chain receive side: watches the Miden chain for P2ID payments to
+  # the gateway account and reports them to auth-service. Holds NO key
+  # material — it only observes and reports; crediting is bounded by the
+  # server's own guards (dusted amount, one-note-one-intent, faucet).
+  # Optional: without ONCHAIN_WATCHER_TOKEN the service is not started
+  # usefully (auth-service answers 503) — scale it to 0 or leave the
+  # token unset until the on-chain rail goes live.
+  note-watcher:
+    build: ./note-watcher
+    container_name: leviathan-note-watcher
+    restart: always
+    environment:
+      - AUTH_URL=http://auth-service:8000
+      - ONCHAIN_WATCHER_TOKEN=${ONCHAIN_WATCHER_TOKEN:-}
+      - NODE_RPC_URL=${MIDEN_NODE_RPC_URL:-http://178.63.134.75:57291}
+      - POLL_INTERVAL_SEC=${WATCHER_POLL_INTERVAL_SEC:-10}
+      - FINALITY_DEPTH=${WATCHER_FINALITY_DEPTH:-0}
+      - SCAN_LOOKBACK_BLOCKS=${WATCHER_SCAN_LOOKBACK_BLOCKS:-100}
+      - UNMATCHED_TTL_SECONDS=${WATCHER_UNMATCHED_TTL_SECONDS:-172800}
+    volumes:
+      - watcher_state:/state
+    depends_on:
+      - auth-service
     networks: [edge-net]
 
   edge:
@@ -95,3 +120,6 @@ networks:
 volumes:
   auth_data:
   caddy_data:
+  # Note-watcher cursor + report bookkeeping. State, not cache: losing
+  # it re-scans (harmless, the server dedups) but forgets dead-letters.
+  watcher_state:

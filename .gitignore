@@ -22,5 +22,6 @@ wallet-verifier/vendor/
 
 # npm auth tokens for the private registry — NEVER commit (contains a token)
 .npmrc
+!ai-edge/note-watcher/.npmrc
 
 phala.env
