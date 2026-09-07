@@ -677,6 +677,49 @@ class IntentSlotDisciplineTest(SetupMixin, unittest.TestCase):
         self.assertIn("no unique payment amount", b["error"])
         self.assertTrue(c["success"])
 
+    def test_cap_ignores_expired_intents(self):
+        # A user who abandoned quotes must not stay locked out for the
+        # whole match-grace window: only LIVE pending rows count.
+        from app import handlers
+
+        async def scenario(conn, h):
+            with patch.object(handlers, "ONCHAIN_MAX_PENDING_PER_IDENTITY", 2):
+                a = await h.create_intent(conn, 1, 100, "onchain")
+                await h.create_intent(conn, 1, 200, "onchain")
+                blocked = await h.create_intent(conn, 1, 300, "onchain")
+                # one quote times out (still matchable within grace, but
+                # no longer counted against the cap)
+                await conn.execute(
+                    "UPDATE payment_intents SET expires_at = "
+                    "datetime(CURRENT_TIMESTAMP, '-1 hour') WHERE memo = ?",
+                    (a["memo"],))
+                await conn.commit()
+                unblocked = await h.create_intent(conn, 1, 300, "onchain")
+            return blocked, unblocked
+
+        blocked, unblocked = self._db(scenario)
+        self.assertFalse(blocked["success"])
+        self.assertTrue(unblocked["success"], unblocked)
+
+    def test_global_pending_cap_applies_to_every_provider(self):
+        # The stockpile cap: without it one api_key could pre-mint ~10^4
+        # capless Stripe intents as raw material for rail-switch games.
+        from app import handlers
+
+        async def scenario(conn, h):
+            with patch.object(handlers, "INTENT_MAX_PENDING_PER_IDENTITY", 3):
+                for _ in range(3):
+                    r = await h.create_intent(conn, 1, 300, "stripe")
+                    self.assertTrue(r["success"])
+                stripe_blocked = await h.create_intent(conn, 1, 300, "stripe")
+                onchain_blocked = await h.create_intent(conn, 1, 300, "onchain")
+            return stripe_blocked, onchain_blocked
+
+        stripe_blocked, onchain_blocked = self._db(scenario)
+        self.assertFalse(stripe_blocked["success"])
+        self.assertIn("too many unpaid intents", stripe_blocked["error"])
+        self.assertFalse(onchain_blocked["success"])
+
     def test_onchain_ttl_is_short(self):
         async def scenario(conn, h):
             await h.create_intent(conn, 1, 300, "onchain")
@@ -725,6 +768,46 @@ class SetIntentProviderTest(SetupMixin, unittest.TestCase):
         self.assertEqual([i["memo"] for i in listed], [intent["memo"]])
         # the slot is not held for a hosted-checkout-sized lifetime
         self.assertLess(ttl, 2 * 86400)
+
+    def test_switch_resets_the_time_anchor(self):
+        # The pre-mint bypass: stockpile a cheap Stripe intent, backdate
+        # it, switch onto the on-chain rail, and claim a note that was
+        # parked before the switch. matchable_since must be the SWITCH
+        # time, never the row's created_at.
+        async def scenario(conn, h):
+            intent = await h.create_intent(conn, 1, 300, "stripe")
+            await conn.execute(
+                "UPDATE payment_intents SET created_at = "
+                "datetime(CURRENT_TIMESTAMP, '-2 days') WHERE memo = ?",
+                (intent["memo"],))
+            await conn.commit()
+            out = await h.set_intent_provider(conn, intent["memo"], "onchain")
+            listed = await h.list_pending_onchain_intents(conn)
+            cur = await conn.execute(
+                "SELECT (julianday(CURRENT_TIMESTAMP) - julianday(onchain_since)) * 86400, "
+                "       (julianday(CURRENT_TIMESTAMP) - julianday(created_at)) * 86400 "
+                "FROM payment_intents WHERE memo = ?", (intent["memo"],))
+            anchor_age, created_age = await cur.fetchone()
+            return out, listed, anchor_age, created_age
+
+        out, listed, anchor_age, created_age = self._db(scenario)
+        self.assertTrue(out["success"])
+        self.assertLess(anchor_age, 60, "anchor must be the switch time")
+        self.assertGreater(created_age, 86400, "created_at stays historical")
+        # and the matching table serves the fresh anchor, not created_at
+        self.assertEqual(listed[0]["matchable_since"] == listed[0]["created_at"], False)
+
+    def test_created_as_onchain_gets_an_anchor(self):
+        async def scenario(conn, h):
+            await h.create_intent(conn, 1, 300, "onchain")
+            listed = await h.list_pending_onchain_intents(conn)
+            cur = await conn.execute(
+                "SELECT onchain_since IS NOT NULL FROM payment_intents")
+            return listed, (await cur.fetchone())[0]
+
+        listed, has_anchor = self._db(scenario)
+        self.assertTrue(has_anchor)
+        self.assertTrue(listed[0]["matchable_since"])
 
     def test_switch_away_from_onchain_leaves_matching_table(self):
         async def scenario(conn, h):

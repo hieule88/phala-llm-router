@@ -70,16 +70,27 @@ ONCHAIN_INTENT_TTL_SECONDS = int(os.getenv("ONCHAIN_INTENT_TTL_SECONDS", str(24 
 # needs many concurrent unpaid top-ups.
 ONCHAIN_MAX_PENDING_PER_IDENTITY = int(os.getenv("ONCHAIN_MAX_PENDING_PER_IDENTITY", "8"))
 
+# Cap on live pending intents per identity across ALL providers. The
+# on-chain cap alone left a farm door open: Stripe intents had no cap
+# and a 30-day TTL, so one api_key could stockpile ~10^4 of them at a
+# price point and later switch a dust-matching one onto the on-chain
+# rail. The switch now resets the time anchor (onchain_since), which
+# kills that attack outright — this cap just makes stockpiles expensive
+# everywhere. Generous: no honest client needs dozens of open invoices.
+INTENT_MAX_PENDING_PER_IDENTITY = int(os.getenv("INTENT_MAX_PENDING_PER_IDENTITY", "16"))
+
 # How long past expires_at an on-chain intent stays in the watcher's
 # matching table (and keeps occupying its dust slot). The webhook
 # honours late payments via allow_expired, so vanishing at the TTL edge
 # would strand a payment that was in flight; staying matchable forever
-# would leak slots. After the grace window a late payment becomes an
-# ops case (admin mark-paid).
-ONCHAIN_MATCH_GRACE_SECONDS = int(os.getenv("ONCHAIN_MATCH_GRACE_SECONDS", str(7 * 24 * 3600)))
+# would leak slots — and every extra hour of grace is extra time an
+# attacker can grind fresh intents against a parked note's amount. 48h
+# comfortably covers a slow confirmation without handing out a week.
+ONCHAIN_MATCH_GRACE_SECONDS = int(os.getenv("ONCHAIN_MATCH_GRACE_SECONDS", str(48 * 3600)))
 
 for _name, _val in (("ONCHAIN_INTENT_TTL_SECONDS", ONCHAIN_INTENT_TTL_SECONDS),
                     ("ONCHAIN_MAX_PENDING_PER_IDENTITY", ONCHAIN_MAX_PENDING_PER_IDENTITY),
+                    ("INTENT_MAX_PENDING_PER_IDENTITY", INTENT_MAX_PENDING_PER_IDENTITY),
                     ("ONCHAIN_MATCH_GRACE_SECONDS", ONCHAIN_MATCH_GRACE_SECONDS)):
     if _val <= 0:
         raise RuntimeError(f"{_name} must be > 0 (got {_val})")
@@ -880,12 +891,32 @@ async def create_intent(
         if not await cur.fetchone():
             return {"success": False, "error": "identity not found"}
 
+        # Global stockpile cap — every provider. See the constant's note.
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM payment_intents "
+            "WHERE identity_id = ? AND status = 'pending' "
+            "  AND expires_at > CURRENT_TIMESTAMP",
+            (identity_id,),
+        )
+        if (await cur.fetchone())[0] >= INTENT_MAX_PENDING_PER_IDENTITY:
+            return {
+                "success": False,
+                "error": ("too many unpaid intents "
+                          f"(max {INTENT_MAX_PENDING_PER_IDENTITY}); "
+                          "pay or let some expire first"),
+            }
+
         if provider == "onchain":
             grace = _grace_modifier()
+            # The cap counts only LIVE pending intents (expired ones in
+            # the grace window still hold their dust slot but must not
+            # lock a real user out of the rail for grace+TTL — with the
+            # 24h TTL an abandoned batch frees the cap within a day).
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM payment_intents "
-                f"WHERE identity_id = ? AND {_ONCHAIN_MATCHABLE_SQL}",
-                (identity_id, grace),
+                "WHERE identity_id = ? AND provider = 'onchain' "
+                "  AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP",
+                (identity_id,),
             )
             if (await cur.fetchone())[0] >= ONCHAIN_MAX_PENDING_PER_IDENTITY:
                 return {
@@ -924,11 +955,17 @@ async def create_intent(
         expires_modifier = f"+{ttl_seconds} seconds"
         cur = await conn.execute(
             "INSERT INTO payment_intents "
-            "  (identity_id, credits, amount_cents, memo, provider, status, expires_at) "
+            "  (identity_id, credits, amount_cents, memo, provider, status, expires_at, "
+            "   onchain_since) "
             "VALUES (?, ?, ?, ?, ?, 'pending', "
-            "        datetime(CURRENT_TIMESTAMP, ?)) "
+            "        datetime(CURRENT_TIMESTAMP, ?), "
+            # The watcher's time-order anchor: when the intent ENTERED the
+            # on-chain rail. NULL for other rails; a later rail switch
+            # sets it to the switch time, never inheriting created_at.
+            "        CASE WHEN ? = 'onchain' THEN CURRENT_TIMESTAMP END) "
             "RETURNING id, expires_at",
-            (identity_id, credits, amount_cents, memo, provider, expires_modifier),
+            (identity_id, credits, amount_cents, memo, provider, expires_modifier,
+             provider),
         )
         row = await cur.fetchone()
         return {
@@ -1146,10 +1183,12 @@ async def set_intent_provider(
 
         if provider == "onchain":
             grace = _grace_modifier()
+            # Same cap rule as create_intent: live pending only.
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM payment_intents "
-                f"WHERE identity_id = ? AND {_ONCHAIN_MATCHABLE_SQL}",
-                (identity_id, grace),
+                "WHERE identity_id = ? AND provider = 'onchain' "
+                "  AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP",
+                (identity_id,),
             )
             if (await cur.fetchone())[0] >= ONCHAIN_MAX_PENDING_PER_IDENTITY:
                 return {
@@ -1173,8 +1212,13 @@ async def set_intent_provider(
                               "with provider 'onchain' instead"),
                 }
             await conn.execute(
+                # onchain_since = NOW, never the row's created_at: the
+                # watcher refuses to match notes seen before this stamp,
+                # so a stockpiled old intent switched onto the rail can
+                # never claim a note that was already parked.
                 "UPDATE payment_intents SET provider = 'onchain', "
-                "expires_at = datetime(CURRENT_TIMESTAMP, ?) WHERE id = ?",
+                "expires_at = datetime(CURRENT_TIMESTAMP, ?), "
+                "onchain_since = CURRENT_TIMESTAMP WHERE id = ?",
                 (f"+{ONCHAIN_INTENT_TTL_SECONDS} seconds", intent_id),
             )
         else:
@@ -1215,7 +1259,11 @@ async def list_pending_onchain_intents(
     fresh intents.
     """
     cur = await conn.execute(
-        "SELECT id, identity_id, memo, credits, amount_cents, created_at, expires_at "
+        "SELECT id, identity_id, memo, credits, amount_cents, created_at, expires_at, "
+        # The watcher's time-order anchor: when the intent ENTERED the
+        # on-chain rail. COALESCE covers rows predating the column —
+        # those were created as onchain, so created_at IS their entry.
+        "       COALESCE(onchain_since, created_at) AS matchable_since "
         "FROM payment_intents "
         f"WHERE {_ONCHAIN_MATCHABLE_SQL} "
         "ORDER BY id",
@@ -1231,6 +1279,7 @@ async def list_pending_onchain_intents(
             "amount_cents": r[4],
             "created_at": r[5],
             "expires_at": r[6],
+            "matchable_since": r[7],
             "sender_accounts": [],
         }
         for r in rows
