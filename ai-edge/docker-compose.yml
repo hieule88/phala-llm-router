@@ -19,6 +19,15 @@ services:
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
       - STRIPE_SUCCESS_URL=${STRIPE_SUCCESS_URL:-}
       - STRIPE_CANCEL_URL=${STRIPE_CANCEL_URL:-}
+      # On-chain rail (Miden/Leviathan wallet). Address/faucet are PUBLIC
+      # values — the seed controlling the receiving account never goes here.
+      # Empty ONCHAIN_WATCHER_TOKEN disables the receive side (503).
+      - ONCHAIN_GATEWAY_ADDRESS=${ONCHAIN_GATEWAY_ADDRESS:-}
+      - ONCHAIN_FAUCET_ID=${ONCHAIN_FAUCET_ID:-}
+      - ONCHAIN_TOKEN_DECIMALS=${ONCHAIN_TOKEN_DECIMALS:-6}
+      - ONCHAIN_CENTS_PER_TOKEN=${ONCHAIN_CENTS_PER_TOKEN:-100}
+      - ONCHAIN_NETWORK=${ONCHAIN_NETWORK:-testnet}
+      - ONCHAIN_WATCHER_TOKEN=${ONCHAIN_WATCHER_TOKEN:-}
       # Force every top-up onto one provider regardless of what clients ask
       # for (switch rails without redeploying any frontend). Empty = client picks.
       - TOPUP_PROVIDER_OVERRIDE=${TOPUP_PROVIDER_OVERRIDE:-}

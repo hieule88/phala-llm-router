@@ -19,6 +19,8 @@ Endpoints under `/v1`:
   POST /v1/payment-intents/{memo}/mark-paid → finalize intent (ADMIN or webhook)
   POST /v1/payment-intents/{memo}/cancel  → cancel pending intent (ADMIN)
   POST /v1/webhooks/stripe                → Stripe events (HMAC-SHA256-authenticated)
+  POST /v1/webhooks/onchain               → note-watcher payment report (WATCHER token)
+  GET  /v1/onchain/pending-intents        → watcher's matching table (WATCHER token)
   GET  /health                            → liveness probe (no DB hit)
 
 Auth model:
@@ -44,6 +46,7 @@ Auth model:
 import hashlib
 import hmac
 import ipaddress
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -54,7 +57,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import handlers, onchain_client, stripe_client, stripe_webhook
+from . import handlers, onchain_client, onchain_webhook, stripe_client, stripe_webhook
 from .db import init_db
 from .tier_limit import TierRateLimiter
 
@@ -92,6 +95,21 @@ if ADMIN_TOKEN and len(ADMIN_TOKEN) < MIN_ADMIN_TOKEN_LEN:
 if PROXY_REFUND_TOKEN and len(PROXY_REFUND_TOKEN) < MIN_ADMIN_TOKEN_LEN:
     raise RuntimeError(
         f"PROXY_REFUND_TOKEN is set but shorter than {MIN_ADMIN_TOKEN_LEN} chars; "
+        "use `openssl rand -hex 32` for a secure value",
+    )
+
+# Bearer for the on-chain note-watcher: gates /v1/webhooks/onchain (report a
+# committed note paying an intent) and /v1/onchain/pending-intents (the
+# watcher's matching table). Distinct from ADMIN_TOKEN and PROXY_REFUND_TOKEN
+# so a compromised watcher can only report payments — bounded by the underpay
+# guard, the accepted-faucet check, and the intents that actually exist — and
+# can never topup arbitrarily, create identities, or debit balances. Unset =
+# the on-chain rail's receive side is off (503, fail-closed).
+ONCHAIN_WATCHER_TOKEN = os.getenv("ONCHAIN_WATCHER_TOKEN", "")
+
+if ONCHAIN_WATCHER_TOKEN and len(ONCHAIN_WATCHER_TOKEN) < MIN_ADMIN_TOKEN_LEN:
+    raise RuntimeError(
+        f"ONCHAIN_WATCHER_TOKEN is set but shorter than {MIN_ADMIN_TOKEN_LEN} chars; "
         "use `openssl rand -hex 32` for a secure value",
     )
 
@@ -307,6 +325,27 @@ def require_proxy_token(authorization: str | None = Header(default=None)):
     if ADMIN_TOKEN and hmac.compare_digest(token, ADMIN_TOKEN):
         return
     raise HTTPException(status_code=401, detail="invalid proxy token")
+
+
+def require_watcher_token(authorization: str | None = Header(default=None)):
+    """Gate on the note-watcher endpoints — accepts EITHER
+    ONCHAIN_WATCHER_TOKEN (the watcher's own secret) OR ADMIN_TOKEN (ops
+    replaying a missed note by hand). Refuses when the watcher token is
+    not configured: the on-chain receive side is opt-in, and an unset env
+    must not leave a crediting endpoint accidentally open."""
+    if not ONCHAIN_WATCHER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ONCHAIN_WATCHER_TOKEN not configured on server",
+        )
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = authorization[len("Bearer "):]
+    if hmac.compare_digest(token, ONCHAIN_WATCHER_TOKEN):
+        return
+    if ADMIN_TOKEN and hmac.compare_digest(token, ADMIN_TOKEN):
+        return
+    raise HTTPException(status_code=401, detail="invalid watcher token")
 
 
 # ─── Pydantic request models ──────────────────────────────────────────────
@@ -837,3 +876,64 @@ async def stripe_webhook_endpoint(request: Request):
             detail=f"payment confirmed but not credited: {result.get('error', 'unknown')}",
         )
     return out
+
+
+@app.post("/v1/webhooks/onchain", dependencies=[Depends(require_watcher_token)])
+@limiter.limit(RATE_LIMIT_WEBHOOK)
+async def onchain_webhook_endpoint(request: Request):
+    """On-chain payment report from OUR note-watcher (not a third party).
+
+    The watcher saw a P2ID note committed to the gateway's receiving
+    account and matched it to a pending intent; this endpoint re-checks
+    what the server can know independently (accepted faucet, amount
+    conversion at the server's own rate) and credits via the shared
+    mark_paid_by_memo path. Same fail-loud contract as the Stripe
+    receiver: tokens confirmed on-chain that FAIL to credit are answered
+    500 so the watcher keeps retrying (and ops get the MONEY RECEIVED BUT
+    NOT CREDITED log) instead of the payment vanishing behind a 200.
+
+    Not in the Caddy public allowlist — reachable only on the docker
+    network (plus the watcher bearer), so the internet sees a flat 404.
+    """
+    raw_body = await _read_bounded_body(request, WEBHOOK_MAX_BODY_BYTES)
+    try:
+        payload = json.loads(raw_body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="body must be JSON") from None
+    try:
+        out = await onchain_webhook.dispatch(app.state.db, payload)
+    except onchain_webhook.WebhookError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    result = out.get("result") or {}
+    if out.get("handled") and result.get("success") is False:
+        raise HTTPException(
+            status_code=500,
+            detail=f"payment confirmed but not credited: {result.get('error', 'unknown')}",
+        )
+    return out
+
+
+@app.get("/v1/onchain/pending-intents", dependencies=[Depends(require_watcher_token)])
+@limiter.limit(RATE_LIMIT_VALIDATE)
+async def onchain_pending_intents(request: Request):
+    """The note-watcher's matching table: every pending 'onchain' intent,
+    with the exact token amount to expect (server-derived, base units)
+    and the identity's bound Miden addresses for sender matching.
+
+    Also carries the rail config (receiving address, faucet, decimals)
+    so the watcher configures itself from the same source of truth that
+    priced the intents — a watcher pointed at different values would
+    match nothing or, worse, the wrong notes. Like the webhook, not
+    publicly routed; watcher/admin bearer only.
+    """
+    intents = await handlers.list_pending_onchain_intents(app.state.db)
+    for intent in intents:
+        intent["token_amount"] = str(
+            onchain_client.token_amount_for_cents(intent["amount_cents"]))
+    return {
+        "pay_to_address": onchain_client.ONCHAIN_GATEWAY_ADDRESS,
+        "faucet_id": onchain_client.ONCHAIN_FAUCET_ID,
+        "token_decimals": onchain_client.ONCHAIN_TOKEN_DECIMALS,
+        "network": onchain_client.ONCHAIN_NETWORK,
+        "intents": intents,
+    }

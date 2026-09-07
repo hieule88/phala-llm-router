@@ -1008,3 +1008,61 @@ async def cancel_intent_by_memo(
         if not row:
             return {"success": False, "error": "intent not found or not pending"}
         return {"success": True, "intent_id": row[0], "identity_id": row[1], "status": "cancelled"}
+
+
+async def list_pending_onchain_intents(
+    conn: aiosqlite.Connection,
+) -> list:
+    """Pending 'onchain' intents plus each identity's bound Miden account
+    addresses — the note-watcher's matching table.
+
+    The plain-send payment path carries no memo on the note, so the
+    watcher matches a committed note by (sender account, exact amount);
+    `sender_accounts` holds the identity's `miden_account` credential
+    labels (public addresses, attached at wallet-bind time) for exactly
+    that. An intent whose identity has no bound address is still listed —
+    the watcher can then only match it by amount, but omitting it would
+    make its payment silently unmatchable.
+
+    Deliberately NOT filtered by expires_at: money can land after the TTL
+    and the webhook path honours it (allow_expired), so a stale-but-
+    pending intent must stay matchable. expires_at is returned so the
+    watcher can prioritise fresh intents when amounts collide.
+    """
+    cur = await conn.execute(
+        "SELECT id, identity_id, memo, credits, amount_cents, created_at, expires_at "
+        "FROM payment_intents "
+        "WHERE provider = 'onchain' AND status = 'pending' "
+        "ORDER BY id",
+    )
+    rows = await cur.fetchall()
+    intents = [
+        {
+            "intent_id": r[0],
+            "identity_id": r[1],
+            "memo": r[2],
+            "credits": r[3],
+            "amount_cents": r[4],
+            "created_at": r[5],
+            "expires_at": r[6],
+            "sender_accounts": [],
+        }
+        for r in rows
+    ]
+    if not intents:
+        return []
+
+    identity_ids = sorted({i["identity_id"] for i in intents})
+    marks = ",".join("?" for _ in identity_ids)
+    cur = await conn.execute(
+        "SELECT identity_id, credential_value FROM credentials "
+        "WHERE credential_type = 'miden_account' AND revoked_at IS NULL "
+        f"AND identity_id IN ({marks})",
+        identity_ids,
+    )
+    accounts: dict = {}
+    for identity_id, value in await cur.fetchall():
+        accounts.setdefault(identity_id, []).append(value)
+    for intent in intents:
+        intent["sender_accounts"] = accounts.get(intent["identity_id"], [])
+    return intents
