@@ -66,6 +66,17 @@ services:
       - watcher_state:/state
     depends_on:
       - auth-service
+    # The watcher is a PULL loop — nobody notices when it stops pulling
+    # (Stripe pushes and retries; the chain does neither). Health =
+    # heartbeat freshness (progress), not process liveness: a wedged
+    # process goes unhealthy here first, then its in-process watchdog
+    # (WATCHDOG_STALL_SECONDS) exits so `restart: always` replaces it.
+    healthcheck:
+      test: ["CMD", "node", "scripts/healthcheck.mjs"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
     networks: [edge-net]
 
   edge:

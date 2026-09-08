@@ -53,8 +53,22 @@ export function configFromEnv(env = process.env) {
     // kept. The cursor is monotonic, so entries older than any possible
     // rescan exist only to keep the state file small-ish.
     pruneTtlSec: Number(env.PRUNE_TTL_SECONDS ?? 30 * 24 * 3600),
+    // Per-call time bounds. HTTP (auth-service) is on the same docker
+    // network — 30s is already generous; RPC crosses the internet to
+    // the Miden node and pays WASM parse costs — 60s.
+    httpTimeoutMs: Number(env.HTTP_TIMEOUT_MS ?? 30_000),
+    rpcTimeoutMs: Number(env.RPC_TIMEOUT_MS ?? 60_000),
+    // The stall watchdog: no tick PROGRESS (not merely "process alive")
+    // for this long → ALERT + exit(1), so `restart: always` actually
+    // rescues us. This is the backstop for what per-call timeouts can't
+    // cancel — a wedged WASM RPC client stays wedged until the process
+    // is replaced. Must comfortably exceed one worst-case tick.
+    watchdogStallSec: Number(env.WATCHDOG_STALL_SECONDS ?? 600),
     stateFile: env.STATE_FILE ?? '/state/watcher-state.json',
     deadLetterFile: env.DEAD_LETTER_FILE ?? '/state/dead-letter.jsonl',
+    // Touched on every unit of progress; the docker healthcheck reads
+    // its age. Ops visibility only — the watchdog does the restarting.
+    heartbeatFile: env.HEARTBEAT_FILE ?? '/state/heartbeat',
   };
 }
 
@@ -134,9 +148,15 @@ function disposition({ note, intents, state, log, faucetId, now }) {
   };
 }
 
-/** One full tick. Exported for tests; the main loop just repeats it. */
-export async function runTick({ cfg, state, chain, ledger, log, now = Date.now() }) {
+/** One full tick. Exported for tests; the main loop just repeats it.
+ *  `beat` is called on every unit of PROGRESS (table fetched, report
+ *  drained, page scanned) — the stall watchdog and the heartbeat file
+ *  hang off it, so a long-but-moving tick never trips the watchdog
+ *  while a genuinely stuck one does. */
+export async function runTick({ cfg, state, chain, ledger, log,
+                                now = Date.now(), beat = () => {} }) {
   const table = await ledger.fetchPendingIntents();
+  beat();
   const gateway = table.pay_to_address;
   const faucet = table.faucet_id;
   if (!gateway || !faucet) {
@@ -177,6 +197,7 @@ export async function runTick({ cfg, state, chain, ledger, log, now = Date.now()
 
   // 1. Retry reports that didn't land last tick.
   await drainPending({ state, ledger, log, deadLetterFile: cfg.deadLetterFile });
+  beat();
 
   // 2. Re-match parked notes against the fresh table (they may have
   //    raced intent creation), and expire the ones past the TTL.
@@ -235,10 +256,12 @@ export async function runTick({ cfg, state, chain, ledger, log, now = Date.now()
     if (next <= state.cursor) break; // defensive: node made no progress
     state.cursor = next;
     await saveState(cfg.stateFile, state); // page-granular crash safety
+    beat();
   }
 
   // 4. Push what the scan just matched.
   await drainPending({ state, ledger, log, deadLetterFile: cfg.deadLetterFile });
+  beat();
 
   await saveState(cfg.stateFile, state);
   return state;
@@ -256,31 +279,79 @@ export function makeLog() {
 
 async function main() {
   const log = makeLog();
+  const { promises: fsp } = await import('node:fs');
+  const path = await import('node:path');
+
+  const writeHeartbeat = async (file) => {
+    try {
+      await fsp.mkdir(path.dirname(file), { recursive: true });
+      await fsp.writeFile(file, String(Date.now()));
+    } catch (err) {
+      log.warn(`cannot write heartbeat ${file}: ${err}`);
+    }
+  };
+
   let cfg;
   try {
     cfg = configFromEnv();
   } catch (err) {
     // The service ships in the compose file with the token unset until
     // the rail goes live. Exiting would make `restart: always` a crash
-    // loop, so idle with a clear log line instead.
+    // loop, so idle with a clear log line instead — still heartbeating,
+    // so the healthcheck reads "healthy but idle", not "wedged".
     log.warn(`not configured (${err.message}) — idling; set the env and restart`);
-    await new Promise(() => {});
-    return;
+    const file = process.env.HEARTBEAT_FILE ?? '/state/heartbeat';
+    for (;;) {
+      await writeHeartbeat(file);
+      await new Promise(r => setTimeout(r, 30_000));
+    }
   }
+
   const { makeChain } = await import('./chain.mjs'); // WASM only in prod path
-  const chain = makeChain({ rpcUrl: cfg.rpcUrl });
-  const ledger = makeLedger({ authUrl: cfg.authUrl, token: cfg.watcherToken });
+  const chain = makeChain({ rpcUrl: cfg.rpcUrl, timeoutMs: cfg.rpcTimeoutMs });
+  const ledger = makeLedger({
+    authUrl: cfg.authUrl, token: cfg.watcherToken, timeoutMs: cfg.httpTimeoutMs,
+  });
   let state = await loadState(cfg.stateFile);
   log.info(`note-watcher up: auth=${cfg.authUrl} rpc=${cfg.rpcUrl} `
-    + `cursor=${state.cursor} poll=${cfg.pollIntervalSec}s`);
+    + `cursor=${state.cursor} poll=${cfg.pollIntervalSec}s `
+    + `timeouts http=${cfg.httpTimeoutMs}ms rpc=${cfg.rpcTimeoutMs}ms `
+    + `watchdog=${cfg.watchdogStallSec}s`);
+
+  // Progress tracking. Per-call timeouts make ticks fail fast in the
+  // normal case; the watchdog is the backstop for what JS cannot cancel
+  // (a wedged WASM client keeps its promise pending forever). "Alive"
+  // is not the bar — PROGRESS is: beat() fires per table fetch, per
+  // drained report batch and per scanned page.
+  let lastProgress = Date.now();
+  const beat = () => {
+    lastProgress = Date.now();
+    void writeHeartbeat(cfg.heartbeatFile);
+  };
+  beat();
+
+  const watchdog = setInterval(() => {
+    const stalledMs = Date.now() - lastProgress;
+    if (stalledMs > cfg.watchdogStallSec * 1000) {
+      log.alert(`WATCHDOG: no tick progress for ${Math.round(stalledMs / 1000)}s `
+        + `(> ${cfg.watchdogStallSec}s) — exiting so docker restarts us with a `
+        + `fresh process; state is page-safe, the server dedups replays`);
+      process.exit(1);
+    }
+  }, 15_000);
+  watchdog.unref?.();
 
   for (;;) {
     try {
-      state = await runTick({ cfg, state, chain, ledger, log });
+      state = await runTick({ cfg, state, chain, ledger, log, beat });
     } catch (err) {
-      // A failed tick (auth-service down, node RPC down) is transient:
-      // state was saved page-by-page, next tick resumes where we were.
+      // A failed tick (auth-service down, node RPC down, a call timing
+      // out) is transient: state was saved page-by-page, next tick
+      // resumes where we were. It still COUNTS as progress — the loop
+      // is demonstrably running; the watchdog is for silence, not for
+      // outages the retry already handles.
       log.warn(`tick failed, will retry: ${err}`);
+      beat();
     }
     await new Promise(r => setTimeout(r, cfg.pollIntervalSec * 1000));
   }

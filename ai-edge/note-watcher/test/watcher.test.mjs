@@ -252,6 +252,20 @@ test('notes are anchored in block time, not watcher wall-clock', async () => {
   assert.equal(state.unmatched['0xn1'].firstSeenAt, blockTimeMs);
 });
 
+test('beat() fires on every unit of tick progress', async () => {
+  // The stall watchdog and the heartbeat file hang off beat(): a tick
+  // that is long but moving must keep beating (table fetch, drains,
+  // each scanned page).
+  const cfg = makeCfg();
+  let beats = 0;
+  await runTick({
+    cfg, state: fresh(), chain: makeChain([note()]),
+    ledger: makeLedger({ intents: [tableIntent()] }), log: makeLogCapture(),
+    beat: () => { beats += 1; },
+  });
+  assert.ok(beats >= 4, `expected >=4 beats (table, drain, page, drain), got ${beats}`);
+});
+
 test('settled bookkeeping is pruned after the prune TTL', async () => {
   const cfg = { ...makeCfg(), pruneTtlSec: 60 };
   const log = makeLogCapture();

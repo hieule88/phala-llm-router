@@ -28,8 +28,18 @@ import {
   RpcClient,
 } from '@miden-sdk/miden-sdk';
 
-export function makeChain({ rpcUrl }) {
+import { withTimeout } from './util.mjs';
+
+const DEFAULT_RPC_TIMEOUT_MS = 60_000;
+
+export function makeChain({ rpcUrl, timeoutMs = DEFAULT_RPC_TIMEOUT_MS }) {
   const rpc = new RpcClient(new Endpoint(rpcUrl));
+  // Every RPC await is time-bounded: a hung gRPC stream would otherwise
+  // park the tick forever with no error and no restart. On timeout the
+  // WASM call may still be wedged underneath (not cancellable from JS)
+  // — repeated failures then trip the process watchdog, which exits so
+  // docker hands us a fresh process and a fresh client.
+  const timed = (p, label) => withTimeout(p, timeoutMs, label);
   let roots; // lazily resolved: the scripts come from the WASM module
 
   function scriptRoots() {
@@ -59,7 +69,8 @@ export function makeChain({ rpcUrl }) {
     },
 
     async tip() {
-      return (await rpc.getBlockHeaderByNumber()).blockNum();
+      return (await timed(rpc.getBlockHeaderByNumber(), 'getBlockHeaderByNumber'))
+        .blockNum();
     },
 
     /**
@@ -73,7 +84,7 @@ export function makeChain({ rpcUrl }) {
       const tag = NoteTag.withAccountTarget(
         Address.fromBech32(gatewayBech32).accountId());
 
-      const info = await rpc.syncNotes(from, to, [tag]);
+      const info = await timed(rpc.syncNotes(from, to, [tag]), 'syncNotes');
       const notes = [];
       for (const block of info.blocks()) {
         // The block's own timestamp anchors the note in CHAIN time, not
@@ -85,7 +96,7 @@ export function makeChain({ rpcUrl }) {
         for (const committed of block.notes()) {
           const noteId = committed.noteId();
           const noteIdHex = noteId.toString();
-          const fetched = await rpc.getNotesById([noteId]);
+          const fetched = await timed(rpc.getNotesById([noteId]), 'getNotesById');
           const note = fetched[0]?.note;
           if (!note) continue; // private note — unobservable, skip
 

@@ -19,6 +19,7 @@ COPY package.json .npmrc ./
 RUN npm install --omit=dev
 
 COPY src ./src
+COPY scripts ./scripts
 
 # Cursor + report bookkeeping live here — MUST be a volume: losing it
 # re-scans (harmless, the server dedups) but forgets dead-letters.
