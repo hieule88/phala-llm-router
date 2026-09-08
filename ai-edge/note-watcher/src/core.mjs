@@ -98,6 +98,44 @@ export function parseCreatedAt(value) {
   return Number.isNaN(ms) ? null : ms;
 }
 
+/**
+ * Near-miss detector for unmatched notes: intents within one cent of
+ * the note's amount but NOT exactly equal. The dust is the only
+ * binding on the plain-send path, and it lives entirely in the
+ * sub-cent digits — so "right price, wrong dust" is the signature of a
+ * hand-typed amount (someone sent 3.00 for a 3.004217 quote). Those
+ * notes can NEVER auto-credit (exact match is the security boundary),
+ * but they deserve a specific, actionable ALERT naming the likely
+ * intent instead of a generic "no matching intent" 48 hours later:
+ * ops can eyeball the note and finalise via admin mark-paid (the
+ * whole-cent price is intact, so the ledger's cents guard passes).
+ *
+ * Candidates respect the same time-order rule as real matches — a
+ * minted-after-the-note intent must not even be SUGGESTED to ops.
+ *
+ * @param {{amount: string, seenAt: number}} note
+ * @param {Array<{memo, token_amount, createdAtMs}>} intents
+ * @param {number} subCentUnits  base units in one cent
+ *                               (10^decimals / cents_per_token)
+ * @returns {Array<{memo: string, expected: string}>}
+ */
+export function findNearMisses(note, intents, subCentUnits) {
+  if (!Number.isFinite(subCentUnits) || subCentUnits <= 1) return [];
+  const got = BigInt(note.amount);
+  const window = BigInt(subCentUnits);
+  return intents
+    .filter(i =>
+      i.token_amount !== note.amount
+      && i.createdAtMs !== null && i.createdAtMs !== undefined
+      && i.createdAtMs <= note.seenAt + CREATED_AT_SKEW_MS)
+    .filter(i => {
+      const want = BigInt(i.token_amount);
+      const diff = want > got ? want - got : got - want;
+      return diff < window;
+    })
+    .map(i => ({ memo: i.memo, expected: i.token_amount }));
+}
+
 /** The webhook payload for a matched note. Amount stays a decimal
  *  string end to end — base units can exceed 2^53-1. */
 export function buildReport(note, memo, faucetId) {

@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  CREATED_AT_SKEW_MS, buildReport, classifyReport, disqualify, matchNote,
-  parseCreatedAt,
+  CREATED_AT_SKEW_MS, buildReport, classifyReport, disqualify,
+  findNearMisses, matchNote, parseCreatedAt,
 } from '../src/core.mjs';
 
 // createdAtMs defaults to 0 (epoch) — before any test note's seenAt.
@@ -75,6 +75,29 @@ test('retry contract classification', () => {
   assert.equal(classifyReport(403), 'retry');
   assert.equal(classifyReport(408), 'retry');
   assert.equal(classifyReport(429), 'retry');
+});
+
+test('near-miss flags a hand-typed amount, never an exact or distant one', () => {
+  const SUB_CENT = 10_000; // 6 decimals, 100 cents/token
+  const quote = intent('intent-a', '3004217');
+
+  // 3.00 typed for a 3.004217 quote → within one cent → flagged
+  const near = findNearMisses(note('3000000'), [quote], SUB_CENT);
+  assert.deepEqual(near, [{ memo: 'intent-a', expected: '3004217' }]);
+
+  // exact payment is a MATCH, not a near-miss
+  assert.deepEqual(findNearMisses(note('3004217'), [quote], SUB_CENT), []);
+
+  // a different price (2.99) is not "nearly this intent"
+  assert.deepEqual(findNearMisses(note('2990000'), [quote], SUB_CENT), []);
+
+  // time order applies to suggestions too: an intent minted after the
+  // note must not even be hinted at ops
+  const late = intent('intent-late', '3004217', [], NOW + CREATED_AT_SKEW_MS + 1);
+  assert.deepEqual(findNearMisses(note('3000000'), [late], SUB_CENT), []);
+
+  // degenerate config disables the heuristic
+  assert.deepEqual(findNearMisses(note('3000000'), [quote], 0), []);
 });
 
 test('parseCreatedAt handles the SQLite UTC format and garbage', () => {

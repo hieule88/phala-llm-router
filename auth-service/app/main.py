@@ -1000,6 +1000,11 @@ async def onchain_pending_intents(request: Request):
         "pay_to_address": onchain_client.ONCHAIN_GATEWAY_ADDRESS,
         "faucet_id": onchain_client.ONCHAIN_FAUCET_ID,
         "token_decimals": onchain_client.ONCHAIN_TOKEN_DECIMALS,
+        # Lets the watcher size the sub-cent range without hardcoding
+        # the rate — used to flag "near-miss" notes (right whole-cent
+        # price, wrong or missing dust: almost always a hand-typed
+        # amount) with a specific ALERT instead of a generic unmatched.
+        "cents_per_token": onchain_client.ONCHAIN_CENTS_PER_TOKEN,
         "network": onchain_client.ONCHAIN_NETWORK,
         "intents": intents,
     }

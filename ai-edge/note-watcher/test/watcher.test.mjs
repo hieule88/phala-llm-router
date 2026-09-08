@@ -55,7 +55,7 @@ function makeLedger({ intents = [], reportStatus = 200, reportBody = null } = {}
     reports,
     fetchPendingIntents: async () => ({
       pay_to_address: GATEWAY, faucet_id: FAUCET,
-      token_decimals: 6, network: 'testnet', intents,
+      token_decimals: 6, cents_per_token: 100, network: 'testnet', intents,
     }),
     report: async (payload) => {
       reports.push(payload);
@@ -250,6 +250,26 @@ test('notes are anchored in block time, not watcher wall-clock', async () => {
   assert.ok(state.unmatched['0xn1'], 'parked — the intent postdates the block');
   // and the park keeps the CHAIN time anchor for later ticks
   assert.equal(state.unmatched['0xn1'].firstSeenAt, blockTimeMs);
+});
+
+test('hand-typed amount gets a specific near-miss ALERT, once, and never credits', async () => {
+  const cfg = makeCfg();
+  const log = makeLogCapture();
+  // quote was 3001234; the user typed 3.00
+  const ledger = makeLedger({ intents: [tableIntent({ token_amount: '3001234' })] });
+  const typo = note({ amount: '3000000' });
+
+  let state = await runTick({ cfg, state: fresh(), chain: makeChain([typo]), ledger, log });
+  assert.equal(ledger.reports.length, 0, 'never auto-credited');
+  assert.ok(state.unmatched['0xn1'], 'parked like any unmatched note');
+  const alerts = log.lines.alert.filter(l => l.includes('near-miss'));
+  assert.equal(alerts.length, 1);
+  assert.ok(alerts[0].includes('intent-a') && alerts[0].includes('3001234'),
+    'alert names the likely memo and the expected amount');
+
+  // next tick re-matches but must NOT alert again
+  state = await runTick({ cfg, state, chain: makeChain([]), ledger, log });
+  assert.equal(log.lines.alert.filter(l => l.includes('near-miss')).length, 1);
 });
 
 test('beat() fires on every unit of tick progress', async () => {

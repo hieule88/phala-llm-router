@@ -20,7 +20,10 @@
  * retry path — a colliding intent expiring can resolve them.
  */
 
-import { buildReport, classifyReport, disqualify, matchNote, parseCreatedAt } from './core.mjs';
+import {
+  buildReport, classifyReport, disqualify, findNearMisses, matchNote,
+  parseCreatedAt,
+} from './core.mjs';
 import { appendDeadLetter, loadState, saveState } from './state.mjs';
 import { makeLedger } from './ledger.mjs';
 
@@ -121,7 +124,7 @@ async function drainPending({ state, ledger, log, deadLetterFile }) {
 }
 
 /** Decide the fate of one qualified note against the current table. */
-function disposition({ note, intents, state, log, faucetId, now }) {
+function disposition({ note, intents, state, log, faucetId, now, subCentUnits }) {
   const verdict = matchNote(note, intents);
   if (verdict.kind === 'match') {
     if (verdict.tieBroken) {
@@ -139,6 +142,24 @@ function disposition({ note, intents, state, log, faucetId, now }) {
     log.alert(`ambiguous amount ${note.amount} across memos ${verdict.memos.join(',')} `
       + `— server slot discipline violated? (note=${note.noteId})`);
   }
+
+  // No exact match — before parking generically, check for a
+  // near-miss: an intent within one cent is almost always a hand-typed
+  // amount that dropped the dust digits (the dApp path sends the exact
+  // quote programmatically; only manual senders can be off). Never
+  // auto-credited — exact match IS the security boundary — but ops get
+  // an actionable ALERT naming the likely memo now, not a generic
+  // "no matching intent" at the 48h dead-letter. Alerted once per note,
+  // not once per tick: re-matching runs every tick.
+  const near = verdict.kind === 'ambiguous'
+    ? [] : findNearMisses(note, intents, subCentUnits);
+  if (near.length > 0 && !state.unmatched[note.noteId]?.nearMissAlerted) {
+    const hints = near.map(n => `${n.memo} (expected ${n.expected})`).join(', ');
+    log.alert(`amount near-miss: note=${note.noteId} paid ${note.amount} — `
+      + `likely a hand-typed amount missing the dust for ${hints}; `
+      + `verify the note, then finalise via admin mark-paid`);
+  }
+
   // unmatched (or still-ambiguous): keep for re-matching — the intent
   // may not have been in the table yet when the note was scanned.
   // firstSeenAt keeps the note's own time anchor (block time when
@@ -146,6 +167,7 @@ function disposition({ note, intents, state, log, faucetId, now }) {
   state.unmatched[note.noteId] ??= {
     amount: note.amount, sender: note.sender, firstSeenAt: note.seenAt ?? now,
   };
+  if (near.length > 0) state.unmatched[note.noteId].nearMissAlerted = true;
 }
 
 /** One full tick. Exported for tests; the main loop just repeats it.
@@ -192,6 +214,12 @@ export async function runTick({ cfg, state, chain, ledger, log,
     };
   });
 
+  // Base units in one cent — sizes the near-miss window. Server-fed
+  // (same source that priced the intents); 0 disables the heuristic
+  // when the config is absent or degenerate.
+  const subCentUnits = Math.floor(
+    (10 ** Number(table.token_decimals ?? 0)) / Number(table.cents_per_token ?? 0)) || 0;
+
   // 0. Trim settled bookkeeping so the state file stays bounded.
   pruneState(state, now, cfg.pruneTtlSec * 1000);
 
@@ -216,7 +244,7 @@ export async function runTick({ cfg, state, chain, ledger, log,
       // seenAt stays the FIRST observation: an intent minted after the
       // note was parked can never claim it, no matter how many ticks pass.
       note: { noteId, amount: u.amount, sender: u.sender, seenAt: u.firstSeenAt },
-      intents, state, log, faucetId: faucet, now,
+      intents, state, log, faucetId: faucet, now, subCentUnits,
     });
   }
 
@@ -249,7 +277,7 @@ export async function runTick({ cfg, state, chain, ledger, log,
       // exactly the watcher's downtime (or a long tick's duration).
       disposition({
         note: { ...note, seenAt: note.blockTimeMs ?? Date.now() },
-        intents, state, log, faucetId: faucet, now,
+        intents, state, log, faucetId: faucet, now, subCentUnits,
       });
     }
     const next = blockTo + 1;
