@@ -14,6 +14,7 @@
  */
 
 import { makeChain } from '../src/chain.mjs';
+import { decodeMemoAttachment } from '../src/core.mjs';
 
 const need = (name) => {
   const v = process.env[name];
@@ -46,8 +47,12 @@ while (cursor <= tip) {
   pages += 1;
   total += notes.length;
   for (const n of notes) {
+    const memoHint = decodeMemoAttachment(n.attachment);
+    const att = memoHint ? `memo=${memoHint}`
+      : n.attachment ? `attachment(scheme=${n.attachment.scheme}, undecodable)`
+        : 'no attachment';
     console.log(`  note=${n.noteId} kind=${n.kind} targetOk=${n.targetOk} `
-      + `amount=${n.amount} sender=${n.sender}`);
+      + `amount=${n.amount} sender=${n.sender} ${att}`);
   }
   if (blockTo + 1 <= cursor) break;
   cursor = blockTo + 1;

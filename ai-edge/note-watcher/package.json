@@ -8,7 +8,8 @@
   "scripts": {
     "start": "node src/watcher.mjs",
     "test": "node --test 'test/*.test.mjs'",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:attachment": "node scripts/smoke-attachment.mjs"
   },
   "dependencies": {
     "@miden-sdk/miden-sdk": "0.15.0-node.5e72c326"

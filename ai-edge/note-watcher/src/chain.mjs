@@ -23,6 +23,9 @@
  *    transaction put the intent memo there (codec in core.mjs).
  */
 
+// Order matters: the preload shims browser globals and hands the WASM
+// bytes to the loader BEFORE the SDK's top-level init runs under node.
+import './wasm-preload.mjs';
 import {
   AccountId,
   Address,
