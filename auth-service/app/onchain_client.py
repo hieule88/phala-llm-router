@@ -175,8 +175,9 @@ async def create_payment_request(
     dust derived from the memo (see memo_dust) — the amount doubles as
     the intent identifier, since the plain-send wallet path cannot carry
     the memo on the note. The payer must send EXACTLY this amount.
-    Clients that can attach the memo (NoteAttachment) should still do so
-    as a second binding.
+    Clients that can attach the memo (NoteAttachment, scheme 0x4C565431
+    "LVT1"; codec in ai-edge/note-watcher/src/core.mjs) should do so —
+    the watcher then matches by memo, with this amount as a second binding.
 
     Returns the same top-level shape as the other rails so callers can
     treat all providers uniformly:

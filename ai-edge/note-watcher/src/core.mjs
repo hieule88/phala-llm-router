@@ -4,7 +4,10 @@
  * SDK; watcher.mjs wires these decisions to the real chain and ledger.
  *
  * Matching contract (mirrors auth-service):
- *  - The KEY is the exact dusted token amount. The server guarantees it
+ *  - A note whose ATTACHMENT names a live intent's memo matches by that
+ *    memo (explicit declaration beats inference); the exact dusted
+ *    amount is still required — wrong amount refuses the note outright.
+ *  - Otherwise the KEY is the exact dusted token amount. The server guarantees it
  *    is unique among live same-price on-chain intents (create_intent
  *    redraws memos), and the webhook enforces exact equality — so an
  *    exact-amount match is authoritative.
@@ -21,30 +24,123 @@
 export const CREATED_AT_SKEW_MS = 120_000;
 
 /**
+ * NoteAttachment scheme for "this note pays a Leviathan top-up intent"
+ * ("LVT1"). dApps that can build Custom transactions attach the intent
+ * memo to the note under this scheme (reference encoder below; the
+ * client-side copy lives in test_frontend/src/onchain-attach.js — keep
+ * them in lockstep). Payments carrying it match by MEMO, not by amount
+ * guessing — the dusted amount stays as a second, independent check.
+ */
+export const TOPUP_ATTACHMENT_SCHEME = 0x4c565431;
+
+/** Max memo byte length the codec accepts. Server memos are ~23 bytes
+ *  ("intent-" + 16 hex); the cap just bounds hostile input. */
+const MEMO_MAX_BYTES = 64;
+
+/**
+ * memo string → attachment {scheme, felts: string[]} (decimal strings —
+ * felts stay strings end to end, same rule as amounts).
+ * Layout: felt[0] = byte length n (1..=64); felt[i] = big-endian integer
+ * of memo bytes [7(i-1), min(7i, n)). 7 bytes/felt keeps every value
+ * < 2^56, far below the field modulus; the length prefix makes the
+ * chunking reversible (leading-zero bytes survive).
+ */
+export function encodeMemoAttachment(memo) {
+  const bytes = new TextEncoder().encode(memo);
+  if (bytes.length < 1 || bytes.length > MEMO_MAX_BYTES) {
+    throw new Error(`memo must encode to 1..${MEMO_MAX_BYTES} bytes, got ${bytes.length}`);
+  }
+  const felts = [String(bytes.length)];
+  for (let off = 0; off < bytes.length; off += 7) {
+    let v = 0n;
+    for (const b of bytes.subarray(off, off + 7)) v = (v << 8n) | BigInt(b);
+    felts.push(v.toString());
+  }
+  return { scheme: TOPUP_ATTACHMENT_SCHEME, felts };
+}
+
+/**
+ * attachment {scheme, felts} → memo string, or null. Null (never throw)
+ * on ANYTHING unexpected — wrong scheme, bad lengths, oversized chunks,
+ * non-printable bytes: the attachment is attacker-controlled on-chain
+ * data, and a malformed one simply demotes the note to plain
+ * amount-matching (fail closed into the stricter path).
+ */
+export function decodeMemoAttachment(attachment) {
+  if (!attachment || attachment.scheme !== TOPUP_ATTACHMENT_SCHEME) return null;
+  const felts = attachment.felts;
+  if (!Array.isArray(felts) || felts.length < 2) return null;
+  let len;
+  try { len = Number(BigInt(felts[0])); } catch { return null; }
+  if (!Number.isInteger(len) || len < 1 || len > MEMO_MAX_BYTES) return null;
+  const chunks = Math.ceil(len / 7);
+  if (felts.length !== 1 + chunks) return null;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < chunks; i++) {
+    let v;
+    try { v = BigInt(felts[1 + i]); } catch { return null; }
+    if (v < 0n || v >= (1n << 56n)) return null;
+    const n = Math.min(7, len - i * 7);
+    for (let j = n - 1; j >= 0; j--) { bytes[i * 7 + j] = Number(v & 0xffn); v >>= 8n; }
+    if (v !== 0n) return null; // value wider than the chunk's declared bytes
+  }
+  let memo;
+  try { memo = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return null; }
+  return /^[\x21-\x7e]+$/.test(memo) ? memo : null; // printable ASCII, no spaces
+}
+
+/**
  * Decide what a candidate note pays for.
  * @param {{noteId: string, amount: string, sender: string|null,
- *          seenAt: number}} note
+ *          seenAt: number, memoHint?: string|null}} note
  *   `sender` is the hex account id from note metadata (or null);
- *   `seenAt` is when the watcher first observed the note (ms epoch).
+ *   `seenAt` is when the watcher first observed the note (ms epoch);
+ *   `memoHint` is the memo decoded from the note's own attachment
+ *   (decodeMemoAttachment), or null when absent/malformed.
  * @param {Array<{memo: string, token_amount: string,
  *                sender_account_ids: string[],
  *                createdAtMs: number|null}>} intents
  *   The matching table, with sender_accounts pre-decoded to hex ids and
  *   created_at pre-parsed to ms epoch (null when unparseable).
- * @returns {{kind: 'match', memo: string, tieBroken: boolean}
+ * @returns {{kind: 'match', memo: string, tieBroken: boolean, viaAttachment?: boolean}
+ *          |{kind: 'attachment_mismatch', memo: string, expected: string}
  *          |{kind: 'unmatched'}
  *          |{kind: 'ambiguous', memos: string[]}}
  *
- * Time ordering is a hard filter: a payment cannot be FOR an intent
- * that did not exist yet when the note was first seen. Without it, a
- * note parked as unmatched (paid after grace, mistyped amount) invites
- * grinding — mint same-price intents until one's dust equals the parked
- * note's visible amount, then collect the credit. An intent whose
- * created_at fails to parse is excluded (fail closed): a wrongly
- * excluded honest payment parks and alerts loudly, a wrongly included
- * one hands an attacker money.
+ * Attachment first: a note that NAMES an intent memo on-chain is an
+ * explicit declaration by the payer. When the named intent is live and
+ * the amount is the intent's exact dusted amount, that match is
+ * authoritative — and it deliberately SKIPS the time-order filter
+ * below: memos are server-drawn 8-byte-random values, so naming one
+ * proves the payer held the payment instructions; an intent minted
+ * AFTER a parked note can never carry a memo the note already named.
+ * When the named intent is live but the amount is WRONG, the note is
+ * refused outright ('attachment_mismatch', never credited) even if its
+ * amount exactly equals some OTHER intent's dust — crediting B from a
+ * note explicitly labeled for A is precisely the misattribution the
+ * attachment exists to kill. A memoHint naming NO live intent falls
+ * through to plain amount matching (foreign dApps may use attachments
+ * for their own purposes; ours may also have raced the intent listing).
+ *
+ * Time ordering (amount path) is a hard filter: a payment cannot be
+ * FOR an intent that did not exist yet when the note was first seen.
+ * Without it, a note parked as unmatched (paid after grace, mistyped
+ * amount) invites grinding — mint same-price intents until one's dust
+ * equals the parked note's visible amount, then collect the credit. An
+ * intent whose created_at fails to parse is excluded (fail closed): a
+ * wrongly excluded honest payment parks and alerts loudly, a wrongly
+ * included one hands an attacker money.
  */
 export function matchNote(note, intents) {
+  if (note.memoHint) {
+    const named = intents.find(i => i.memo === note.memoHint);
+    if (named) {
+      if (named.token_amount === note.amount) {
+        return { kind: 'match', memo: named.memo, tieBroken: false, viaAttachment: true };
+      }
+      return { kind: 'attachment_mismatch', memo: named.memo, expected: named.token_amount };
+    }
+  }
   const candidates = intents.filter(i =>
     i.token_amount === note.amount
     && i.createdAtMs !== null && i.createdAtMs !== undefined

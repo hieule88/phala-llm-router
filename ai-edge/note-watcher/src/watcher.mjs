@@ -3,8 +3,10 @@
  *
  * Loop: pull the matching table from auth-service, scan the chain for
  * committed notes tagged at the gateway account, qualify them (pure
- * P2ID, real target = gateway, accepted faucet), match by EXACT dusted
- * amount, and report each payment to POST /v1/webhooks/onchain.
+ * P2ID, real target = gateway, accepted faucet), match them — by the
+ * memo carried in the note's own attachment when present (Custom-tx
+ * dApp path), else by EXACT dusted amount — and report each payment to
+ * POST /v1/webhooks/onchain.
  *
  * Retry contract (server-documented): 2xx done (deduplicated included);
  * 4xx PERMANENT → dead-letter file + alert, never retried; 5xx/network
@@ -21,8 +23,8 @@
  */
 
 import {
-  buildReport, classifyReport, disqualify, findNearMisses, matchNote,
-  parseCreatedAt,
+  buildReport, classifyReport, decodeMemoAttachment, disqualify,
+  findNearMisses, matchNote, parseCreatedAt,
 } from './core.mjs';
 import { appendDeadLetter, loadState, saveState } from './state.mjs';
 import { makeLedger } from './ledger.mjs';
@@ -131,11 +133,31 @@ function disposition({ note, intents, state, log, faucetId, now, subCentUnits })
       log.alert(`amount collision resolved by sender hint — should be impossible, `
         + `check server slot discipline (note=${note.noteId})`);
     }
+    if (verdict.viaAttachment) {
+      log.info(`note ${note.noteId} matched via on-note attachment memo`);
+    }
     state.pending[note.noteId] = {
       payload: buildReport(note, verdict.memo, faucetId),
       firstSeenAt: state.unmatched[note.noteId]?.firstSeenAt ?? now,
     };
     delete state.unmatched[note.noteId];
+    return;
+  }
+  if (verdict.kind === 'attachment_mismatch') {
+    // The note NAMES an intent on-chain but pays the wrong amount.
+    // Never credited (exact amount stays the boundary, and honoring an
+    // amount-match against a DIFFERENT intent would credit B from a
+    // note labeled for A) — park it and hand ops the named memo, once.
+    if (!state.unmatched[note.noteId]?.mismatchAlerted) {
+      log.alert(`attachment mismatch: note=${note.noteId} names memo ${verdict.memo} `
+        + `but paid ${note.amount}, expected ${verdict.expected} — never auto-credited; `
+        + `verify the note, then finalise via admin mark-paid`);
+    }
+    state.unmatched[note.noteId] ??= {
+      amount: note.amount, sender: note.sender, firstSeenAt: note.seenAt ?? now,
+      memoHint: note.memoHint ?? null,
+    };
+    state.unmatched[note.noteId].mismatchAlerted = true;
     return;
   }
   if (verdict.kind === 'ambiguous') {
@@ -164,8 +186,11 @@ function disposition({ note, intents, state, log, faucetId, now, subCentUnits })
   // may not have been in the table yet when the note was scanned.
   // firstSeenAt keeps the note's own time anchor (block time when
   // available), so later ticks and the TTL reason about chain time.
+  // memoHint is stored too: a memo-carrying note that raced the intent
+  // listing must still match by memo on a later tick.
   state.unmatched[note.noteId] ??= {
     amount: note.amount, sender: note.sender, firstSeenAt: note.seenAt ?? now,
+    memoHint: note.memoHint ?? null,
   };
   if (near.length > 0) state.unmatched[note.noteId].nearMissAlerted = true;
 }
@@ -243,7 +268,8 @@ export async function runTick({ cfg, state, chain, ledger, log,
     disposition({
       // seenAt stays the FIRST observation: an intent minted after the
       // note was parked can never claim it, no matter how many ticks pass.
-      note: { noteId, amount: u.amount, sender: u.sender, seenAt: u.firstSeenAt },
+      note: { noteId, amount: u.amount, sender: u.sender, seenAt: u.firstSeenAt,
+              memoHint: u.memoHint ?? null },
       intents, state, log, faucetId: faucet, now, subCentUnits,
     });
   }
@@ -275,8 +301,12 @@ export async function runTick({ cfg, state, chain, ledger, log,
       // Anchor the note in CHAIN time when the block header provides
       // it: wall-clock stamping would loosen the time-order filter by
       // exactly the watcher's downtime (or a long tick's duration).
+      // The attachment (if any) is decoded ONCE here — chain.mjs hands
+      // over raw felts, core.mjs owns the codec; a malformed or foreign
+      // attachment yields null and the note matches by amount only.
       disposition({
-        note: { ...note, seenAt: note.blockTimeMs ?? Date.now() },
+        note: { ...note, seenAt: note.blockTimeMs ?? Date.now(),
+                memoHint: decodeMemoAttachment(note.attachment) },
         intents, state, log, faucetId: faucet, now, subCentUnits,
       });
     }

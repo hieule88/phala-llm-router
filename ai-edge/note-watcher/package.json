@@ -11,6 +11,6 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "@miden-sdk/miden-sdk": "node"
+    "@miden-sdk/miden-sdk": "0.15.0-node.5e72c326"
   }
 }

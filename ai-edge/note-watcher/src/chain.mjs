@@ -17,6 +17,10 @@
  *    cannot be observed by the watcher — documented client rule).
  *  - P2ID note storage layout is [account_id_suffix, account_id_prefix]
  *    (miden-standards p2id.rs), recombined via AccountId.fromPrefixSuffix.
+ *  - NoteMetadata.attachment() → NoteAttachment; attachmentKind() 2 =
+ *    Array, asArray() → FeltArray (get(i).asInt() → bigint),
+ *    attachmentScheme().asU32() → scheme. dApps paying via a Custom
+ *    transaction put the intent memo there (codec in core.mjs).
  */
 
 import {
@@ -104,6 +108,7 @@ export function makeChain({ rpcUrl, timeoutMs = DEFAULT_RPC_TIMEOUT_MS }) {
           let targetOk = false;
           let sender = null;
           let amount = 0n;
+          let attachment = null;
           try {
             const recipient = note.recipient();
             kind = classifyRoot(recipient.script().root().toHex());
@@ -118,7 +123,23 @@ export function makeChain({ rpcUrl, timeoutMs = DEFAULT_RPC_TIMEOUT_MS }) {
                 amount += asset.amount();
               }
             }
-            sender = note.metadata().sender().toString();
+            const metadata = note.metadata();
+            sender = metadata.sender().toString();
+            // Attachment (kind 2 = Array of felts): reduced to plain
+            // decimal strings; core.mjs decides whether it decodes to a
+            // top-up memo (scheme + codec live there, not here). Word
+            // and None kinds carry no memo — left null.
+            const att = metadata.attachment();
+            if (att.attachmentKind() === 2) {
+              const arr = att.asArray();
+              if (arr) {
+                const felts = [];
+                for (let i = 0; i < arr.length(); i++) {
+                  felts.push(arr.get(i).asInt().toString());
+                }
+                attachment = { scheme: att.attachmentScheme().asU32(), felts };
+              }
+            }
           } catch {
             // Unparseable pieces leave the note disqualified rather than
             // crashing the scan — one weird note must not stall the rail.
@@ -129,6 +150,7 @@ export function makeChain({ rpcUrl, timeoutMs = DEFAULT_RPC_TIMEOUT_MS }) {
             targetOk,
             amount: amount.toString(),
             sender,
+            attachment,
             blockTimeMs,
           });
         }
