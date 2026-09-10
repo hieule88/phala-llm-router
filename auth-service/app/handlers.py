@@ -56,36 +56,27 @@ ALLOWED_PROVIDERS = frozenset({"manual", "stripe", "onchain"})
 # Overridable via env for tests / dev.
 INTENT_TTL_SECONDS = int(os.getenv("INTENT_TTL_SECONDS", str(30 * 24 * 3600)))
 
-# On-chain intents get their own, much shorter TTL. Their dusted amount
-# IS the matching key, and the sub-cent dust space is only ~10^4 slots
-# per price point — a 30-day lifetime would let an attacker (or mere
-# accretion) occupy slots long enough to exhaust the space and make
-# honest payments ambiguous. 24h comfortably covers wallet payment +
-# chain confirmation.
+# On-chain intents get their own, much shorter TTL: a quote's price
+# must not stay payable for a month, and the watcher's matching table
+# should hold only intents someone is plausibly about to pay. 24h
+# comfortably covers wallet payment + chain confirmation.
 ONCHAIN_INTENT_TTL_SECONDS = int(os.getenv("ONCHAIN_INTENT_TTL_SECONDS", str(24 * 3600)))
 
-# Cap on simultaneously matchable on-chain intents per identity. Slots
-# are a shared, finite resource (see above); without a cap one identity
-# can blanket a price point's whole dust space. Nobody legitimately
-# needs many concurrent unpaid top-ups.
+# Cap on simultaneously live on-chain intents per identity. Pure
+# anti-abuse: nobody legitimately needs many concurrent unpaid top-ups,
+# and the cap bounds matching-table growth.
 ONCHAIN_MAX_PENDING_PER_IDENTITY = int(os.getenv("ONCHAIN_MAX_PENDING_PER_IDENTITY", "8"))
 
-# Cap on live pending intents per identity across ALL providers. The
-# on-chain cap alone left a farm door open: Stripe intents had no cap
-# and a 30-day TTL, so one api_key could stockpile ~10^4 of them at a
-# price point and later switch a dust-matching one onto the on-chain
-# rail. The switch now resets the time anchor (onchain_since), which
-# kills that attack outright — this cap just makes stockpiles expensive
-# everywhere. Generous: no honest client needs dozens of open invoices.
+# Cap on live pending intents per identity across ALL providers —
+# makes intent stockpiles expensive everywhere. Generous: no honest
+# client needs dozens of open invoices.
 INTENT_MAX_PENDING_PER_IDENTITY = int(os.getenv("INTENT_MAX_PENDING_PER_IDENTITY", "16"))
 
 # How long past expires_at an on-chain intent stays in the watcher's
-# matching table (and keeps occupying its dust slot). The webhook
-# honours late payments via allow_expired, so vanishing at the TTL edge
-# would strand a payment that was in flight; staying matchable forever
-# would leak slots — and every extra hour of grace is extra time an
-# attacker can grind fresh intents against a parked note's amount. 48h
-# comfortably covers a slow confirmation without handing out a week.
+# matching table. The webhook honours late payments via allow_expired,
+# so vanishing at the TTL edge would strand a payment that was in
+# flight; staying matchable forever would grow the table without bound.
+# 48h comfortably covers a slow confirmation without handing out a week.
 ONCHAIN_MATCH_GRACE_SECONDS = int(os.getenv("ONCHAIN_MATCH_GRACE_SECONDS", str(48 * 3600)))
 
 for _name, _val in (("ONCHAIN_INTENT_TTL_SECONDS", ONCHAIN_INTENT_TTL_SECONDS),
@@ -94,12 +85,6 @@ for _name, _val in (("ONCHAIN_INTENT_TTL_SECONDS", ONCHAIN_INTENT_TTL_SECONDS),
                     ("ONCHAIN_MATCH_GRACE_SECONDS", ONCHAIN_MATCH_GRACE_SECONDS)):
     if _val <= 0:
         raise RuntimeError(f"{_name} must be > 0 (got {_val})")
-
-# Attempts at drawing a memo whose dust doesn't collide with a live
-# same-price intent before giving up. With 10^4 slots, 64 draws fail
-# only when the price point is already ~90%+ occupied — at which point
-# failing closed IS the defence (see create_intent).
-ONCHAIN_MEMO_DRAW_ATTEMPTS = 64
 
 # SQL fragment selecting on-chain intents that are still MATCHABLE by
 # the note-watcher: pending, or lazily flipped to 'expired' but still
@@ -866,16 +851,13 @@ async def create_intent(
     reference/tag when they pay. Deduplication at mark_paid time
     piggybacks on `topups.source` UNIQUE (memo == source).
 
-    On-chain intents get extra slot discipline, because their dusted
-    amount is the payment's matching key and the sub-cent dust space is
-    finite (~10^4 per price point): the memo is re-drawn until its dust
-    collides with NO still-matchable same-price on-chain intent (so
-    every live quote is unique by construction, not just by 1/10^4
-    luck), each identity holds at most ONCHAIN_MAX_PENDING_PER_IDENTITY
-    matchable intents (a shared-resource cap — one account must not
-    blanket a price point), and the TTL is the short on-chain one. When
-    the space at a price point is genuinely saturated we fail CLOSED
-    with an error instead of minting an ambiguous quote.
+    On-chain intents: the payment is bound to the intent by the memo
+    the payer embeds in the note's NoteAttachment (amounts are plain
+    prices and collide across same-price intents by design), so no
+    amount-uniqueness discipline is needed. Each identity still holds
+    at most ONCHAIN_MAX_PENDING_PER_IDENTITY live on-chain intents
+    (anti-abuse: nobody legitimately needs many concurrent unpaid
+    top-ups) and the TTL is the short on-chain one.
     """
     if credits <= 0:
         return {"success": False, "error": "credits must be positive"}
@@ -907,11 +889,10 @@ async def create_intent(
             }
 
         if provider == "onchain":
-            grace = _grace_modifier()
             # The cap counts only LIVE pending intents (expired ones in
-            # the grace window still hold their dust slot but must not
-            # lock a real user out of the rail for grace+TTL — with the
-            # 24h TTL an abandoned batch frees the cap within a day).
+            # the grace window stay matchable but must not lock a real
+            # user out of the rail for grace+TTL — with the 24h TTL an
+            # abandoned batch frees the cap within a day).
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM payment_intents "
                 "WHERE identity_id = ? AND provider = 'onchain' "
@@ -925,25 +906,7 @@ async def create_intent(
                               f"(max {ONCHAIN_MAX_PENDING_PER_IDENTITY}); "
                               "pay or let one expire first"),
                 }
-            cur = await conn.execute(
-                "SELECT memo FROM payment_intents "
-                f"WHERE amount_cents = ? AND {_ONCHAIN_MATCHABLE_SQL}",
-                (amount_cents, grace),
-            )
-            taken = {onchain_client.memo_dust(row[0])
-                     for row in await cur.fetchall()}
-            memo = None
-            for _ in range(ONCHAIN_MEMO_DRAW_ATTEMPTS):
-                candidate = _new_memo()
-                if onchain_client.memo_dust(candidate) not in taken:
-                    memo = candidate
-                    break
-            if memo is None:
-                return {
-                    "success": False,
-                    "error": ("no unique payment amount available at this "
-                              "price right now; retry shortly"),
-                }
+            memo = _new_memo()
             ttl_seconds = ONCHAIN_INTENT_TTL_SECONDS
         else:
             memo = _new_memo()
@@ -1155,25 +1118,23 @@ async def set_intent_provider(
     with nobody to credit it — and no MONEY RECEIVED log, since the
     webhook refuses foreign-rail memos.
 
-    Switching TO 'onchain' applies the same slot discipline as creating
-    an on-chain intent — the memo is already fixed, so if its dust
-    collides with a live same-price on-chain quote the switch is refused
-    (create a fresh intent instead) — and shortens expires_at to the
-    on-chain TTL so the slot is not held for a hosted-checkout-sized
+    Switching TO 'onchain' applies the same per-identity cap as
+    creating an on-chain intent and shortens expires_at to the on-chain
+    TTL so the quote is not payable for a hosted-checkout-sized
     lifetime.
     """
     if provider not in ALLOWED_PROVIDERS:
         return {"success": False, "error": f"unknown provider {provider!r}"}
     async with transaction(conn):
         cur = await conn.execute(
-            "SELECT id, identity_id, amount_cents, provider, status "
+            "SELECT id, identity_id, provider, status "
             "FROM payment_intents WHERE memo = ?",
             (memo,),
         )
         row = await cur.fetchone()
         if not row:
             return {"success": False, "error": "intent not found"}
-        intent_id, identity_id, amount_cents, old_provider, status_ = row
+        intent_id, identity_id, old_provider, status_ = row
         if status_ != "pending":
             return {"success": False,
                     "error": f"intent is {status_}, cannot switch provider"}
@@ -1182,7 +1143,6 @@ async def set_intent_provider(
                     "provider": provider, "changed": False}
 
         if provider == "onchain":
-            grace = _grace_modifier()
             # Same cap rule as create_intent: live pending only.
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM payment_intents "
@@ -1196,20 +1156,6 @@ async def set_intent_provider(
                     "error": ("too many unpaid on-chain intents "
                               f"(max {ONCHAIN_MAX_PENDING_PER_IDENTITY}); "
                               "pay or let one expire first"),
-                }
-            cur = await conn.execute(
-                "SELECT memo FROM payment_intents "
-                f"WHERE amount_cents = ? AND memo != ? AND {_ONCHAIN_MATCHABLE_SQL}",
-                (amount_cents, memo, grace),
-            )
-            taken = {onchain_client.memo_dust(row[0])
-                     for row in await cur.fetchall()}
-            if onchain_client.memo_dust(memo) in taken:
-                return {
-                    "success": False,
-                    "error": ("this intent's payment amount collides with a "
-                              "live on-chain quote — create a new intent "
-                              "with provider 'onchain' instead"),
                 }
             await conn.execute(
                 # onchain_since = NOW, never the row's created_at: the
@@ -1239,24 +1185,25 @@ async def list_pending_onchain_intents(
     """Matchable 'onchain' intents plus each identity's bound Miden
     account addresses — the note-watcher's matching table.
 
-    The plain-send payment path carries no memo on the note, so the
-    matching KEY is the intent's exact dusted token amount (computed by
-    the route via onchain_client.token_amount_for_intent — unique among
-    live same-price quotes by construction at create_intent time, and
-    enforced by the webhook). `sender_accounts` holds the identity's
-    `miden_account` credential labels for tie-breaking ONLY: they are
-    attached at wallet-bind as unverified, user-claimed values — anyone
-    can bind a wallet while claiming someone else's address — so they
-    must never decide which intent a payment credits.
+    The matching KEY is the intent MEMO the payer embeds in the note's
+    NoteAttachment; the watcher reads it off the note and looks it up
+    in this table. `token_amount` (the exact price in base units,
+    computed by the route via onchain_client.token_amount_for_cents) is
+    a secondary EXACT check — a named intent paid the wrong amount is
+    refused, never credited. `sender_accounts` holds the identity's
+    `miden_account` credential labels for logs/diagnostics ONLY: they
+    are attached at wallet-bind as unverified, user-claimed values —
+    anyone can bind a wallet while claiming someone else's address —
+    so they must never decide which intent a payment credits.
 
     Matchable = pending OR lazily flipped to 'expired', within the
     grace window past expires_at: the webhook credits late payments via
     allow_expired, so rows must not vanish from the table at the TTL
     edge (an admin probe flipping a row to 'expired' must not strand an
-    in-flight payment either) — but they also must not occupy their
-    dust slot forever, so past the grace window a late payment becomes
-    an ops case. expires_at is returned so the watcher can prioritise
-    fresh intents.
+    in-flight payment either) — but they also must not stay matchable
+    forever, so past the grace window a late payment becomes an ops
+    case. expires_at is returned so the watcher can prioritise fresh
+    intents.
     """
     cur = await conn.execute(
         "SELECT id, identity_id, memo, credits, amount_cents, created_at, expires_at, "

@@ -65,48 +65,38 @@ test('decode fails closed to null on anything unexpected', () => {
 // ── matching ─────────────────────────────────────────────────────────────
 
 const intents = () => ([
-  { memo: 'intent-a', token_amount: '3001234', sender_account_ids: [], createdAtMs: 1000 },
-  { memo: 'intent-b', token_amount: '3005678', sender_account_ids: [], createdAtMs: 1000 },
+  { memo: 'intent-a', token_amount: '3001234' },
+  { memo: 'intent-b', token_amount: '3005678' },
 ]);
 
 test('attachment memo matches its intent at the exact amount', () => {
   const v = matchNote(
-    { noteId: '0xn', amount: '3001234', sender: null, seenAt: 5000, memoHint: 'intent-a' },
+    { noteId: '0xn', amount: '3001234', memoHint: 'intent-a' },
     intents());
-  assert.deepEqual(v, { kind: 'match', memo: 'intent-a', tieBroken: false, viaAttachment: true });
-});
-
-test('attachment match skips the time-order filter (memo is unforgeable in advance)', () => {
-  const late = [{ memo: 'intent-a', token_amount: '3001234', sender_account_ids: [],
-                  createdAtMs: 10_000_000 }];
-  const v = matchNote(
-    { noteId: '0xn', amount: '3001234', sender: null, seenAt: 5000, memoHint: 'intent-a' },
-    late);
-  assert.equal(v.kind, 'match');
-  assert.equal(v.viaAttachment, true);
+  assert.deepEqual(v, { kind: 'match', memo: 'intent-a', viaAttachment: true });
 });
 
 test('named intent + wrong amount is refused even when another intent matches exactly', () => {
   // note pays intent-b's exact amount but NAMES intent-a: crediting b
   // would be exactly the misattribution the attachment exists to kill.
   const v = matchNote(
-    { noteId: '0xn', amount: '3005678', sender: null, seenAt: 5000, memoHint: 'intent-a' },
+    { noteId: '0xn', amount: '3005678', memoHint: 'intent-a' },
     intents());
   assert.deepEqual(v, { kind: 'attachment_mismatch', memo: 'intent-a', expected: '3001234' });
 });
 
-test('memoHint naming no live intent falls through to amount matching', () => {
+test('memoHint naming no live intent is unmatched — kept for re-matching', () => {
   const v = matchNote(
-    { noteId: '0xn', amount: '3001234', sender: null, seenAt: 5000, memoHint: 'intent-zzz' },
+    { noteId: '0xn', amount: '3001234', memoHint: 'intent-zzz' },
     intents());
-  assert.deepEqual(v, { kind: 'match', memo: 'intent-a', tieBroken: false });
+  assert.equal(v.kind, 'unmatched');
 });
 
-test('no memoHint keeps the plain amount path byte-identical', () => {
+test('no memoHint is unattached — never matched by amount', () => {
   const v = matchNote(
-    { noteId: '0xn', amount: '3001234', sender: null, seenAt: 5000 },
+    { noteId: '0xn', amount: '3001234' },
     intents());
-  assert.deepEqual(v, { kind: 'match', memo: 'intent-a', tieBroken: false });
+  assert.equal(v.kind, 'unattached');
 });
 
 // ── end-to-end tick ──────────────────────────────────────────────────────
@@ -156,10 +146,7 @@ test('runTick credits a note carrying a valid memo attachment', async () => {
       sender: null, blockTimeMs: 5000,
       attachment: encodeMemoAttachment('intent-a'),
     }],
-    // intent enters the table AFTER the note's block time: the amount
-    // path would exclude it (time order) — the attachment must not.
-    intents: [{ memo: 'intent-a', token_amount: '3001234', sender_accounts: [],
-                created_at: '2030-01-01 00:00:00' }],
+    intents: [{ memo: 'intent-a', token_amount: '3001234' }],
   });
   const state = await runTick(h);
   assert.equal(h.ledger.reports.length, 1);
@@ -176,8 +163,7 @@ test('runTick parks + alerts once on attachment/amount mismatch, keeps hint for 
       sender: null, blockTimeMs: Date.now(),
       attachment: encodeMemoAttachment('intent-a'),
     }],
-    intents: [{ memo: 'intent-a', token_amount: '3001234', sender_accounts: [],
-                created_at: '2020-01-01 00:00:00' }],
+    intents: [{ memo: 'intent-a', token_amount: '3001234' }],
   });
   let state = await runTick(h);
   assert.equal(h.ledger.reports.length, 0);
@@ -192,18 +178,17 @@ test('runTick parks + alerts once on attachment/amount mismatch, keeps hint for 
   assert.equal(alerts2, 1);
 });
 
-test('runTick: malformed attachment demotes the note to plain amount matching', async () => {
+test('runTick: malformed/foreign attachment is unattached — parked, never credited', async () => {
   const h = harness({
     notes: [{
       noteId: '0xmal', kind: 'p2id', targetOk: true, amount: '3001234',
       sender: null, blockTimeMs: Date.now(),
       attachment: { scheme: 12345, felts: ['1', '2', '3'] }, // foreign scheme
     }],
-    intents: [{ memo: 'intent-a', token_amount: '3001234', sender_accounts: [],
-                created_at: '2020-01-01 00:00:00' }],
+    intents: [{ memo: 'intent-a', token_amount: '3001234' }],
   });
   const state = await runTick(h);
-  assert.equal(h.ledger.reports.length, 1);
-  assert.equal(h.ledger.reports[0].memo, 'intent-a');
-  assert.equal(state.reported['0xmal'].memo, 'intent-a');
+  assert.equal(h.ledger.reports.length, 0, 'amount alone must never credit');
+  assert.ok(state.unmatched['0xmal'], 'parked as an ops case');
+  assert.ok(h.log.lines.alert.some(m => m.includes('unattached')));
 });

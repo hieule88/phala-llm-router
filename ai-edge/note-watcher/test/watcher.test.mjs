@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { runTick } from '../src/watcher.mjs';
+import { encodeMemoAttachment } from '../src/core.mjs';
 import { loadState } from '../src/state.mjs';
 
 // ── fakes ────────────────────────────────────────────────────────────────
@@ -64,16 +65,16 @@ function makeLedger({ intents = [], reportStatus = 200, reportBody = null } = {}
   };
 }
 
+// The default note carries intent-a's memo in its attachment — the dApp
+// Custom-transaction path, which is the only auto-creditable one.
 const note = (over = {}) => ({
   noteId: '0xn1', kind: 'p2id', targetOk: true,
-  amount: '3001234', sender: null, ...over,
+  amount: '3000000', sender: null,
+  attachment: encodeMemoAttachment('intent-a'), ...over,
 });
 
-// created_at long in the past (server SQLite format) so time ordering
-// never interferes with tests that aren't about it.
 const tableIntent = (over = {}) => ({
-  memo: 'intent-a', token_amount: '3001234', sender_accounts: [],
-  created_at: '2020-01-01 00:00:00', ...over,
+  memo: 'intent-a', token_amount: '3000000', sender_accounts: [], ...over,
 });
 
 function fresh() {
@@ -93,7 +94,7 @@ test('happy path: scan → match → report → reported; cursor advances', asyn
   assert.equal(ledger.reports.length, 1);
   assert.deepEqual(ledger.reports[0], {
     memo: 'intent-a', note_id: '0xn1', faucet_id: FAUCET,
-    amount_base_units: '3001234', note_kind: 'p2id',
+    amount_base_units: '3000000', note_kind: 'p2id',
   });
   assert.equal(state.reported['0xn1'].memo, 'intent-a');
   assert.deepEqual(state.pending, {});
@@ -176,8 +177,8 @@ test('note racing the intent listing is parked, then matched next tick', async (
   assert.ok(state.unmatched['0xn1']);
   assert.equal(ledger1.reports.length, 0);
 
-  // tick 2: the intent shows up — created BEFORE the note was seen, so
-  // the parked note is matched and reported
+  // tick 2: the intent shows up — the parked note's stored memoHint
+  // matches it and the report goes out
   const ledger2 = makeLedger({ intents: [tableIntent()] });
   state = await runTick({ cfg, state, chain: makeChain([]), ledger: ledger2, log });
   assert.equal(ledger2.reports.length, 1);
@@ -185,91 +186,56 @@ test('note racing the intent listing is parked, then matched next tick', async (
   assert.deepEqual(state.unmatched, {});
 });
 
-test('grind defence: an intent minted after the note was parked never claims it', async () => {
-  const cfg = makeCfg();
-  const log = makeLogCapture();
-
-  // tick 1: note lands, no intent → parked
-  let state = await runTick({
-    cfg, state: fresh(), chain: makeChain([note()]),
-    ledger: makeLedger({ intents: [] }), log,
-  });
-  assert.ok(state.unmatched['0xn1']);
-
-  // tick 2: a same-amount intent appears, but created AFTER the note
-  // was first seen (the griefer minting until the dust collides)
-  const future = new Date(Date.now() + 3600_000)
-    .toISOString().slice(0, 19).replace('T', ' ');
-  const ledger2 = makeLedger({
-    intents: [tableIntent({ memo: 'intent-grind', created_at: future })],
-  });
-  state = await runTick({ cfg, state, chain: makeChain([]), ledger: ledger2, log });
-  assert.equal(ledger2.reports.length, 0);
-  assert.ok(state.unmatched['0xn1'], 'still parked — the late intent is ineligible');
-});
-
-test('matchable_since outranks created_at (rail-switch attack)', async () => {
-  // A stockpiled Stripe intent switched onto the on-chain rail keeps an
-  // old created_at, but the server stamps matchable_since at switch
-  // time — and THAT is the anchor the filter must use.
-  const cfg = makeCfg();
-  const log = makeLogCapture();
-  const switchedNow = new Date(Date.now() + 3600_000)
-    .toISOString().slice(0, 19).replace('T', ' ');
-  const ledger = makeLedger({
-    intents: [tableIntent({
-      memo: 'intent-switched',
-      created_at: '2020-01-01 00:00:00',      // looks ancient…
-      matchable_since: switchedNow,           // …but entered the rail late
-    })],
-  });
-  const state = await runTick({
-    cfg, state: fresh(), chain: makeChain([note()]), ledger, log,
-  });
-  assert.equal(ledger.reports.length, 0);
-  assert.ok(state.unmatched['0xn1'], 'the switched intent must not claim the note');
-});
-
-test('notes are anchored in block time, not watcher wall-clock', async () => {
+test('parked notes keep the block-time anchor for the TTL', async () => {
   // Downtime scenario: the watcher restarts and scans a note whose
-  // block committed an hour ago. An intent minted 30 minutes ago (after
-  // the block, before the restart) must NOT be able to claim it — with
-  // wall-clock seenAt it would.
+  // block committed an hour ago. The unmatched TTL must count from
+  // CHAIN time, not from when the watcher happened to see it.
   const cfg = makeCfg();
   const log = makeLogCapture();
   const blockTimeMs = Date.now() - 3600_000;
-  const mintedAfterBlock = new Date(Date.now() - 1800_000)
-    .toISOString().slice(0, 19).replace('T', ' ');
-  const ledger = makeLedger({
-    intents: [tableIntent({ memo: 'intent-late', created_at: mintedAfterBlock })],
-  });
+  const ledger = makeLedger({ intents: [] }); // nothing to match yet
   const state = await runTick({
     cfg, state: fresh(), chain: makeChain([note({ blockTimeMs })]), ledger, log,
   });
-  assert.equal(ledger.reports.length, 0);
-  assert.ok(state.unmatched['0xn1'], 'parked — the intent postdates the block');
-  // and the park keeps the CHAIN time anchor for later ticks
+  assert.ok(state.unmatched['0xn1']);
   assert.equal(state.unmatched['0xn1'].firstSeenAt, blockTimeMs);
 });
 
-test('hand-typed amount gets a specific near-miss ALERT, once, and never credits', async () => {
+test('unattached note alerts once with same-amount shortlist, never credits', async () => {
   const cfg = makeCfg();
   const log = makeLogCapture();
-  // quote was 3001234; the user typed 3.00
-  const ledger = makeLedger({ intents: [tableIntent({ token_amount: '3001234' })] });
-  const typo = note({ amount: '3000000' });
+  // a manual payment: right price, but no memo on the note
+  const ledger = makeLedger({ intents: [tableIntent()] });
+  const manual = note({ attachment: null });
 
-  let state = await runTick({ cfg, state: fresh(), chain: makeChain([typo]), ledger, log });
+  let state = await runTick({ cfg, state: fresh(), chain: makeChain([manual]), ledger, log });
   assert.equal(ledger.reports.length, 0, 'never auto-credited');
-  assert.ok(state.unmatched['0xn1'], 'parked like any unmatched note');
-  const alerts = log.lines.alert.filter(l => l.includes('near-miss'));
+  assert.ok(state.unmatched['0xn1'], 'parked as an ops case');
+  const alerts = log.lines.alert.filter(l => l.includes('unattached'));
   assert.equal(alerts.length, 1);
-  assert.ok(alerts[0].includes('intent-a') && alerts[0].includes('3001234'),
-    'alert names the likely memo and the expected amount');
+  assert.ok(alerts[0].includes('intent-a'),
+    'alert shortlists the same-amount intents for ops');
 
-  // next tick re-matches but must NOT alert again
+  // next tick must NOT alert again (re-matching cannot help this note)
   state = await runTick({ cfg, state, chain: makeChain([]), ledger, log });
-  assert.equal(log.lines.alert.filter(l => l.includes('near-miss')).length, 1);
+  assert.equal(log.lines.alert.filter(l => l.includes('unattached')).length, 1);
+});
+
+test('named intent with the wrong amount alerts once and never credits', async () => {
+  const cfg = makeCfg();
+  const log = makeLogCapture();
+  const ledger = makeLedger({ intents: [tableIntent()] });
+  const wrong = note({ amount: '2990000' }); // names intent-a, pays short
+
+  let state = await runTick({ cfg, state: fresh(), chain: makeChain([wrong]), ledger, log });
+  assert.equal(ledger.reports.length, 0, 'never auto-credited');
+  assert.ok(state.unmatched['0xn1']);
+  const alerts = log.lines.alert.filter(l => l.includes('attachment mismatch'));
+  assert.equal(alerts.length, 1);
+  assert.ok(alerts[0].includes('intent-a') && alerts[0].includes('3000000'));
+
+  state = await runTick({ cfg, state, chain: makeChain([]), ledger, log });
+  assert.equal(log.lines.alert.filter(l => l.includes('attachment mismatch')).length, 1);
 });
 
 test('beat() fires on every unit of tick progress', async () => {
@@ -323,7 +289,7 @@ test('unmatched note past TTL is dead-lettered with an alert', async () => {
   assert.ok(log.lines.alert.some(l => l.includes('UNMATCHED')));
 });
 
-test('ambiguous amounts alert and are never guessed', async () => {
+test('same-price intents: the memo on the note picks the winner', async () => {
   const cfg = makeCfg();
   const log = makeLogCapture();
   const two = [
@@ -331,11 +297,11 @@ test('ambiguous amounts alert and are never guessed', async () => {
     tableIntent({ memo: 'intent-b' }),
   ];
   const state = await runTick({
-    cfg, state: fresh(), chain: makeChain([note()]),
+    cfg, state: fresh(),
+    chain: makeChain([note({ attachment: encodeMemoAttachment('intent-b') })]),
     ledger: makeLedger({ intents: two }), log,
   });
-  assert.ok(state.unmatched['0xn1'], 'parked, not reported');
-  assert.ok(log.lines.alert.some(l => l.includes('ambiguous')));
+  assert.equal(state.reported['0xn1'].memo, 'intent-b');
 });
 
 test('p2ide, wrong-target and wrong-faucet notes are ignored', async () => {

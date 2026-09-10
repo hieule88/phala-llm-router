@@ -2,64 +2,46 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  CREATED_AT_SKEW_MS, buildReport, classifyReport, disqualify,
-  findNearMisses, matchNote, parseCreatedAt,
+  buildReport, classifyReport, disqualify, encodeMemoAttachment,
+  matchNote, sameAmountMemos,
 } from '../src/core.mjs';
 
-// createdAtMs defaults to 0 (epoch) — before any test note's seenAt.
-const intent = (memo, amount, senders = [], createdAtMs = 0) =>
-  ({ memo, token_amount: amount, sender_account_ids: senders, createdAtMs });
+const intent = (memo, amount) => ({ memo, token_amount: amount });
+const note = (amount, memoHint = null) => ({ noteId: 'n', amount, memoHint });
 
-const NOW = 1_700_000_000_000;
-const note = (amount, sender = null, seenAt = NOW) =>
-  ({ noteId: 'n', amount, sender, seenAt });
-
-test('exact amount with one candidate matches', () => {
-  const v = matchNote(note('3001234'),
-    [intent('intent-a', '3001234'), intent('intent-b', '2005678')]);
-  assert.deepEqual(v, { kind: 'match', memo: 'intent-a', tieBroken: false });
+test('memo naming a live intent matches at the exact amount', () => {
+  const v = matchNote(note('3000000', 'intent-a'),
+    [intent('intent-a', '3000000'), intent('intent-b', '2000000')]);
+  assert.deepEqual(v, { kind: 'match', memo: 'intent-a', viaAttachment: true });
 });
 
-test('no candidate is unmatched', () => {
-  const v = matchNote(note('999'), [intent('intent-a', '3001234')]);
+test('same-price intents are fine — the memo picks the winner', () => {
+  // Amounts are plain prices and COLLIDE by design; only the memo decides.
+  const two = [intent('intent-a', '3000000'), intent('intent-b', '3000000')];
+  assert.equal(matchNote(note('3000000', 'intent-b'), two).memo, 'intent-b');
+  assert.equal(matchNote(note('3000000', 'intent-a'), two).memo, 'intent-a');
+});
+
+test('named intent + wrong amount is refused, never re-attributed', () => {
+  // The note names A but pays B's (identical-format) price ± anything:
+  // refuse outright — crediting anything from a mislabeled note is the
+  // misattribution the attachment exists to kill.
+  const v = matchNote(note('2990000', 'intent-a'),
+    [intent('intent-a', '3000000'), intent('intent-b', '2990000')]);
+  assert.deepEqual(v,
+    { kind: 'attachment_mismatch', memo: 'intent-a', expected: '3000000' });
+});
+
+test('no decodable memo can never match — unattached', () => {
+  // Exact same-amount intent exists; without a memo it must NOT credit.
+  const v = matchNote(note('3000000'), [intent('intent-a', '3000000')]);
+  assert.equal(v.kind, 'unattached');
+});
+
+test('memo naming no live intent is unmatched (re-match later)', () => {
+  const v = matchNote(note('3000000', 'intent-zzz'),
+    [intent('intent-a', '3000000')]);
   assert.equal(v.kind, 'unmatched');
-});
-
-test('an intent created after the note was seen can never claim it', () => {
-  // The grind defence: park a note, mint same-price intents until the
-  // dust collides — time ordering makes the minted intent ineligible.
-  const late = intent('intent-grind', '3001234', [], NOW + CREATED_AT_SKEW_MS + 1);
-  assert.equal(matchNote(note('3001234'), [late]).kind, 'unmatched');
-
-  // within clock skew still matches (honest same-moment creation)
-  const nearby = intent('intent-a', '3001234', [], NOW + CREATED_AT_SKEW_MS - 1);
-  assert.equal(matchNote(note('3001234'), [nearby]).kind, 'match');
-});
-
-test('unparseable created_at is excluded, fail closed', () => {
-  const broken = intent('intent-a', '3001234', [], null);
-  assert.equal(matchNote(note('3001234'), [broken]).kind, 'unmatched');
-});
-
-test('collision resolved only when sender singles out exactly one', () => {
-  const two = [
-    intent('intent-a', '3001234', ['0xaaa']),
-    intent('intent-b', '3001234', ['0xbbb']),
-  ];
-  const bySender = matchNote(note('3001234', '0xbbb'), two);
-  assert.deepEqual(bySender, { kind: 'match', memo: 'intent-b', tieBroken: true });
-
-  // sender matches neither → ambiguous, never a guess
-  const unknown = matchNote(note('3001234', '0xccc'), two);
-  assert.equal(unknown.kind, 'ambiguous');
-  assert.deepEqual(unknown.memos, ['intent-a', 'intent-b']);
-
-  // sender matches BOTH (squatted label) → still ambiguous
-  const both = [
-    intent('intent-a', '3001234', ['0xeee']),
-    intent('intent-b', '3001234', ['0xeee']),
-  ];
-  assert.equal(matchNote(note('3001234', '0xeee'), both).kind, 'ambiguous');
 });
 
 test('retry contract classification', () => {
@@ -77,43 +59,23 @@ test('retry contract classification', () => {
   assert.equal(classifyReport(429), 'retry');
 });
 
-test('near-miss flags a hand-typed amount, never an exact or distant one', () => {
-  const SUB_CENT = 10_000; // 6 decimals, 100 cents/token
-  const quote = intent('intent-a', '3004217');
-
-  // 3.00 typed for a 3.004217 quote → within one cent → flagged
-  const near = findNearMisses(note('3000000'), [quote], SUB_CENT);
-  assert.deepEqual(near, [{ memo: 'intent-a', expected: '3004217' }]);
-
-  // exact payment is a MATCH, not a near-miss
-  assert.deepEqual(findNearMisses(note('3004217'), [quote], SUB_CENT), []);
-
-  // a different price (2.99) is not "nearly this intent"
-  assert.deepEqual(findNearMisses(note('2990000'), [quote], SUB_CENT), []);
-
-  // time order applies to suggestions too: an intent minted after the
-  // note must not even be hinted at ops
-  const late = intent('intent-late', '3004217', [], NOW + CREATED_AT_SKEW_MS + 1);
-  assert.deepEqual(findNearMisses(note('3000000'), [late], SUB_CENT), []);
-
-  // degenerate config disables the heuristic
-  assert.deepEqual(findNearMisses(note('3000000'), [quote], 0), []);
-});
-
-test('parseCreatedAt handles the SQLite UTC format and garbage', () => {
-  assert.equal(parseCreatedAt('2026-09-07 10:00:00'),
-    Date.parse('2026-09-07T10:00:00Z'));
-  assert.equal(parseCreatedAt('not a date'), null);
-  assert.equal(parseCreatedAt(''), null);
-  assert.equal(parseCreatedAt(undefined), null);
+test('sameAmountMemos shortlists ops candidates for an unattached note', () => {
+  const table = [
+    intent('intent-a', '3000000'),
+    intent('intent-b', '3000000'),
+    intent('intent-c', '2000000'),
+  ];
+  assert.deepEqual(sameAmountMemos(note('3000000'), table),
+    ['intent-a', 'intent-b']);
+  assert.deepEqual(sameAmountMemos(note('999'), table), []);
 });
 
 test('report payload shape matches the webhook contract', () => {
   assert.deepEqual(
-    buildReport({ noteId: '0xn1', amount: '3001234' }, 'intent-a', 'mtst1faucet'),
+    buildReport({ noteId: '0xn1', amount: '3000000' }, 'intent-a', 'mtst1faucet'),
     {
       memo: 'intent-a', note_id: '0xn1', faucet_id: 'mtst1faucet',
-      amount_base_units: '3001234', note_kind: 'p2id',
+      amount_base_units: '3000000', note_kind: 'p2id',
     });
 });
 
@@ -122,4 +84,14 @@ test('disqualify: p2ide, wrong target, wrong faucet', () => {
   assert.match(disqualify({ kind: 'p2id', targetOk: false, amount: '5' }), /target/);
   assert.match(disqualify({ kind: 'p2id', targetOk: true, amount: '0' }), /faucet/);
   assert.equal(disqualify({ kind: 'p2id', targetOk: true, amount: '5' }), null);
+});
+
+test('encode → matchNote end to end (codec output is the memoHint)', () => {
+  // The hint the watcher decodes from a real attachment is exactly the
+  // memo the server issued — sanity-check the two ends line up.
+  const att = encodeMemoAttachment('intent-0123456789abcdef');
+  assert.ok(att.felts.length > 1);
+  const v = matchNote({ noteId: 'n', amount: '42', memoHint: 'intent-0123456789abcdef' },
+    [intent('intent-0123456789abcdef', '42')]);
+  assert.equal(v.kind, 'match');
 });

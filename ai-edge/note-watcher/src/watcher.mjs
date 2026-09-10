@@ -3,10 +3,12 @@
  *
  * Loop: pull the matching table from auth-service, scan the chain for
  * committed notes tagged at the gateway account, qualify them (pure
- * P2ID, real target = gateway, accepted faucet), match them — by the
- * memo carried in the note's own attachment when present (Custom-tx
- * dApp path), else by EXACT dusted amount — and report each payment to
- * POST /v1/webhooks/onchain.
+ * P2ID, real target = gateway, accepted faucet), match them by the
+ * intent memo carried in the note's own NoteAttachment, and report
+ * each payment to POST /v1/webhooks/onchain. The memo is the ONLY
+ * matching key: amounts are plain prices that collide across
+ * same-price intents, so a note without a decodable memo can never
+ * auto-credit — it alerts immediately and parks as an ops case.
  *
  * Retry contract (server-documented): 2xx done (deduplicated included);
  * 4xx PERMANENT → dead-letter file + alert, never retried; 5xx/network
@@ -14,17 +16,15 @@
  * tick. The server is idempotent (topups.source UNIQUE + one-note-one-
  * intent index), so replays after a crash are safe by construction.
  *
- * Unmatched qualified notes are NOT dropped: the note may have raced
- * the intent listing (user paid quickly), so they are re-matched
+ * Unmatched memo-carrying notes are NOT dropped: the note may have
+ * raced the intent listing (user paid quickly), so they are re-matched
  * against a fresh table every tick until UNMATCHED_TTL_SECONDS, then
- * dead-lettered for ops. Ambiguous matches (server slot discipline
- * should make them impossible) alert immediately and follow the same
- * retry path — a colliding intent expiring can resolve them.
+ * dead-lettered for ops.
  */
 
 import {
   buildReport, classifyReport, decodeMemoAttachment, disqualify,
-  findNearMisses, matchNote, parseCreatedAt,
+  matchNote, sameAmountMemos,
 } from './core.mjs';
 import { appendDeadLetter, loadState, saveState } from './state.mjs';
 import { makeLedger } from './ledger.mjs';
@@ -49,10 +49,9 @@ export function configFromEnv(env = process.env) {
     // the watcher going live.
     scanLookback: Number(env.SCAN_LOOKBACK_BLOCKS ?? 100),
     // 48h, aligned with the server's ONCHAIN_MATCH_GRACE default: past
-    // it a parked note is an ops case. Every extra hour a note sits
-    // parked is grinding time for someone minting same-price intents
-    // against its (publicly visible) amount — the time-order filter is
-    // the real defence, this bounds the exposure window on top.
+    // it a parked note stops being re-matched and dead-letters for ops.
+    // Safe to keep generous — a parked note's memo is fixed on-chain,
+    // so nobody can mint an intent that claims it later.
     unmatchedTtlSec: Number(env.UNMATCHED_TTL_SECONDS ?? 48 * 3600),
     // How long settled bookkeeping (reported / dead-lettered ids) is
     // kept. The cursor is monotonic, so entries older than any possible
@@ -126,16 +125,10 @@ async function drainPending({ state, ledger, log, deadLetterFile }) {
 }
 
 /** Decide the fate of one qualified note against the current table. */
-function disposition({ note, intents, state, log, faucetId, now, subCentUnits }) {
+function disposition({ note, intents, state, log, faucetId, now }) {
   const verdict = matchNote(note, intents);
   if (verdict.kind === 'match') {
-    if (verdict.tieBroken) {
-      log.alert(`amount collision resolved by sender hint — should be impossible, `
-        + `check server slot discipline (note=${note.noteId})`);
-    }
-    if (verdict.viaAttachment) {
-      log.info(`note ${note.noteId} matched via on-note attachment memo`);
-    }
+    log.info(`note ${note.noteId} matched via on-note attachment memo`);
     state.pending[note.noteId] = {
       payload: buildReport(note, verdict.memo, faucetId),
       firstSeenAt: state.unmatched[note.noteId]?.firstSeenAt ?? now,
@@ -143,56 +136,53 @@ function disposition({ note, intents, state, log, faucetId, now, subCentUnits })
     delete state.unmatched[note.noteId];
     return;
   }
+
+  const park = () => {
+    state.unmatched[note.noteId] ??= {
+      amount: note.amount, sender: note.sender, firstSeenAt: note.seenAt ?? now,
+      memoHint: note.memoHint ?? null,
+    };
+    return state.unmatched[note.noteId];
+  };
+
   if (verdict.kind === 'attachment_mismatch') {
     // The note NAMES an intent on-chain but pays the wrong amount.
-    // Never credited (exact amount stays the boundary, and honoring an
-    // amount-match against a DIFFERENT intent would credit B from a
-    // note labeled for A) — park it and hand ops the named memo, once.
+    // Never credited (exact amount stays a hard requirement) — park it
+    // and hand ops the named memo, once.
     if (!state.unmatched[note.noteId]?.mismatchAlerted) {
       log.alert(`attachment mismatch: note=${note.noteId} names memo ${verdict.memo} `
         + `but paid ${note.amount}, expected ${verdict.expected} — never auto-credited; `
         + `verify the note, then finalise via admin mark-paid`);
     }
-    state.unmatched[note.noteId] ??= {
-      amount: note.amount, sender: note.sender, firstSeenAt: note.seenAt ?? now,
-      memoHint: note.memoHint ?? null,
-    };
-    state.unmatched[note.noteId].mismatchAlerted = true;
+    park().mismatchAlerted = true;
     return;
   }
-  if (verdict.kind === 'ambiguous') {
-    log.alert(`ambiguous amount ${note.amount} across memos ${verdict.memos.join(',')} `
-      + `— server slot discipline violated? (note=${note.noteId})`);
+
+  if (verdict.kind === 'unattached') {
+    // No decodable memo on the note: with plain-price amounts this can
+    // NEVER auto-credit (same-price intents are indistinguishable), so
+    // it is an ops case from the first sighting — alert now, not at
+    // the 48h dead-letter, and shortlist same-amount intents as a
+    // starting point. Alerted once per note; re-matching cannot help.
+    if (!state.unmatched[note.noteId]?.unattachedAlerted) {
+      const hints = sameAmountMemos(note, intents);
+      const hint = hints.length > 0
+        ? `same-amount intents: ${hints.join(', ')}`
+        : 'no same-amount intent live';
+      log.alert(`unattached payment: note=${note.noteId} paid ${note.amount} `
+        + `with no readable memo attachment — cannot auto-credit; ${hint}; `
+        + `verify the note, then finalise via admin mark-paid`);
+    }
+    park().unattachedAlerted = true;
+    return;
   }
 
-  // No exact match — before parking generically, check for a
-  // near-miss: an intent within one cent is almost always a hand-typed
-  // amount that dropped the dust digits (the dApp path sends the exact
-  // quote programmatically; only manual senders can be off). Never
-  // auto-credited — exact match IS the security boundary — but ops get
-  // an actionable ALERT naming the likely memo now, not a generic
-  // "no matching intent" at the 48h dead-letter. Alerted once per note,
-  // not once per tick: re-matching runs every tick.
-  const near = verdict.kind === 'ambiguous'
-    ? [] : findNearMisses(note, intents, subCentUnits);
-  if (near.length > 0 && !state.unmatched[note.noteId]?.nearMissAlerted) {
-    const hints = near.map(n => `${n.memo} (expected ${n.expected})`).join(', ');
-    log.alert(`amount near-miss: note=${note.noteId} paid ${note.amount} — `
-      + `likely a hand-typed amount missing the dust for ${hints}; `
-      + `verify the note, then finalise via admin mark-paid`);
-  }
-
-  // unmatched (or still-ambiguous): keep for re-matching — the intent
-  // may not have been in the table yet when the note was scanned.
+  // unmatched: memo present but names no live intent yet — keep for
+  // re-matching (the note may have raced the intent listing).
   // firstSeenAt keeps the note's own time anchor (block time when
-  // available), so later ticks and the TTL reason about chain time.
-  // memoHint is stored too: a memo-carrying note that raced the intent
-  // listing must still match by memo on a later tick.
-  state.unmatched[note.noteId] ??= {
-    amount: note.amount, sender: note.sender, firstSeenAt: note.seenAt ?? now,
-    memoHint: note.memoHint ?? null,
-  };
-  if (near.length > 0) state.unmatched[note.noteId].nearMissAlerted = true;
+  // available), so the TTL reasons about chain time; memoHint is
+  // stored so later ticks re-match by memo.
+  park();
 }
 
 /** One full tick. Exported for tests; the main loop just repeats it.
@@ -214,36 +204,13 @@ export async function runTick({ cfg, state, chain, ledger, log,
     return state;
   }
 
-  // Pre-decode sender labels and parse the time anchor once per tick:
-  // hex-vs-hex and ms-vs-ms from here on. The anchor is the server's
-  // matchable_since — when the intent ENTERED the on-chain rail — not
-  // created_at: a rail-switched intent must not inherit its row's age
-  // (pre-minted Stripe intents would sail past the time-order filter).
-  // created_at is only a fallback for servers predating the field. An
-  // unparseable anchor is kept as null — matchNote excludes it (fail
-  // closed) — and logged.
-  const intents = (table.intents ?? []).map(i => {
-    const createdAtMs = parseCreatedAt(i.matchable_since ?? i.created_at);
-    if (createdAtMs === null) {
-      log.warn(`intent ${i.memo}: unparseable time anchor `
-        + `${JSON.stringify(i.matchable_since ?? i.created_at)} `
-        + `— excluded from matching (fail closed)`);
-    }
-    return {
-      memo: i.memo,
-      token_amount: i.token_amount,
-      createdAtMs,
-      sender_account_ids: (i.sender_accounts ?? [])
-        .map(b => chain.bech32ToHex(b))
-        .filter(Boolean),
-    };
-  });
-
-  // Base units in one cent — sizes the near-miss window. Server-fed
-  // (same source that priced the intents); 0 disables the heuristic
-  // when the config is absent or degenerate.
-  const subCentUnits = Math.floor(
-    (10 ** Number(table.token_decimals ?? 0)) / Number(table.cents_per_token ?? 0)) || 0;
+  // Matching needs only (memo, exact token_amount) — the memo comes off
+  // the note's own attachment, so no time anchors and no sender labels
+  // enter the decision.
+  const intents = (table.intents ?? []).map(i => ({
+    memo: i.memo,
+    token_amount: i.token_amount,
+  }));
 
   // 0. Trim settled bookkeeping so the state file stays bounded.
   pruneState(state, now, cfg.pruneTtlSec * 1000);
@@ -270,7 +237,7 @@ export async function runTick({ cfg, state, chain, ledger, log,
       // note was parked can never claim it, no matter how many ticks pass.
       note: { noteId, amount: u.amount, sender: u.sender, seenAt: u.firstSeenAt,
               memoHint: u.memoHint ?? null },
-      intents, state, log, faucetId: faucet, now, subCentUnits,
+      intents, state, log, faucetId: faucet, now,
     });
   }
 
@@ -307,7 +274,7 @@ export async function runTick({ cfg, state, chain, ledger, log,
       disposition({
         note: { ...note, seenAt: note.blockTimeMs ?? Date.now(),
                 memoHint: decodeMemoAttachment(note.attachment) },
-        intents, state, log, faucetId: faucet, now, subCentUnits,
+        intents, state, log, faucetId: faucet, now,
       });
     }
     const next = blockTo + 1;

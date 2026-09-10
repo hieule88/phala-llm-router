@@ -976,14 +976,14 @@ async def onchain_webhook_endpoint(request: Request):
 @limiter.limit(RATE_LIMIT_VALIDATE)
 async def onchain_pending_intents(request: Request):
     """The note-watcher's matching table: every pending 'onchain' intent
-    with the exact DUSTED token amount to expect (server-derived, base
-    units — price + per-memo sub-cent dust, see onchain_client.memo_dust).
+    with the exact token amount to expect (server-derived, base units —
+    the intent's plain price, see onchain_client.token_amount_for_cents).
 
-    Matching contract: `token_amount` is the key — it is unique-ish per
-    intent by construction, and the webhook enforces it, so the watcher
-    matches a note by exact amount alone. `sender_accounts` are
-    UNVERIFIED, user-claimed labels (squattable at wallet-bind) — a
-    tie-breaker hint at most, never grounds to attribute a payment.
+    Matching contract: the KEY is the intent memo the payer embeds in
+    the note's NoteAttachment; `token_amount` is a secondary EXACT
+    check the webhook also enforces. `sender_accounts` are UNVERIFIED,
+    user-claimed labels (squattable at wallet-bind) — for logs and
+    diagnostics only, never grounds to attribute a payment.
 
     Also carries the rail config (receiving address, faucet, decimals)
     so the watcher configures itself from the same source of truth that
@@ -994,16 +994,11 @@ async def onchain_pending_intents(request: Request):
     intents = await handlers.list_pending_onchain_intents(app.state.db)
     for intent in intents:
         intent["token_amount"] = str(
-            onchain_client.token_amount_for_intent(
-                intent["memo"], intent["amount_cents"]))
+            onchain_client.token_amount_for_cents(intent["amount_cents"]))
     return {
         "pay_to_address": onchain_client.ONCHAIN_GATEWAY_ADDRESS,
         "faucet_id": onchain_client.ONCHAIN_FAUCET_ID,
         "token_decimals": onchain_client.ONCHAIN_TOKEN_DECIMALS,
-        # Lets the watcher size the sub-cent range without hardcoding
-        # the rate — used to flag "near-miss" notes (right whole-cent
-        # price, wrong or missing dust: almost always a hand-typed
-        # amount) with a specific ALERT instead of a generic unmatched.
         "cents_per_token": onchain_client.ONCHAIN_CENTS_PER_TOKEN,
         "network": onchain_client.ONCHAIN_NETWORK,
         "intents": intents,

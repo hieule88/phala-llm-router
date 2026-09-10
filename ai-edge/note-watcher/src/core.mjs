@@ -4,32 +4,24 @@
  * SDK; watcher.mjs wires these decisions to the real chain and ledger.
  *
  * Matching contract (mirrors auth-service):
- *  - A note whose ATTACHMENT names a live intent's memo matches by that
- *    memo (explicit declaration beats inference); the exact dusted
- *    amount is still required — wrong amount refuses the note outright.
- *  - Otherwise the KEY is the exact dusted token amount. The server guarantees it
- *    is unique among live same-price on-chain intents (create_intent
- *    redraws memos), and the webhook enforces exact equality — so an
- *    exact-amount match is authoritative.
+ *  - The KEY is the intent memo the payer embedded in the note's own
+ *    NoteAttachment. Amounts are plain prices and COLLIDE across
+ *    same-price intents by design, so a note without a decodable
+ *    attachment memo can never be auto-credited — it parks as an ops
+ *    case. The exact amount is still required on a memo match: a named
+ *    intent paid the wrong amount is refused outright.
  *  - sender_accounts are UNVERIFIED user-claimed labels (squattable at
- *    wallet-bind). They may tie-break an ambiguity that should never
- *    happen, and they appear in logs — they must never override an
- *    amount decision.
+ *    wallet-bind) — logs and diagnostics only, never an input to
+ *    matching.
  */
-
-/**
- * Clock-skew allowance between auth-service's created_at stamps and the
- * watcher's own clock when enforcing note/intent time ordering.
- */
-export const CREATED_AT_SKEW_MS = 120_000;
 
 /**
  * NoteAttachment scheme for "this note pays a Leviathan top-up intent"
- * ("LVT1"). dApps that can build Custom transactions attach the intent
- * memo to the note under this scheme (reference encoder below; the
+ * ("LVT1"). Paying dApps attach the intent memo to the note under this
+ * scheme via a wallet Custom transaction (reference encoder below; the
  * client-side copy lives in test_frontend/src/onchain-attach.js — keep
- * them in lockstep). Payments carrying it match by MEMO, not by amount
- * guessing — the dusted amount stays as a second, independent check.
+ * them in lockstep). The memo is the ONLY matching key; the exact
+ * price amount is a second server-enforced check.
  */
 export const TOPUP_ATTACHMENT_SCHEME = 0x4c565431;
 
@@ -91,77 +83,36 @@ export function decodeMemoAttachment(attachment) {
 
 /**
  * Decide what a candidate note pays for.
- * @param {{noteId: string, amount: string, sender: string|null,
- *          seenAt: number, memoHint?: string|null}} note
- *   `sender` is the hex account id from note metadata (or null);
- *   `seenAt` is when the watcher first observed the note (ms epoch);
+ * @param {{noteId: string, amount: string, memoHint?: string|null}} note
  *   `memoHint` is the memo decoded from the note's own attachment
  *   (decodeMemoAttachment), or null when absent/malformed.
- * @param {Array<{memo: string, token_amount: string,
- *                sender_account_ids: string[],
- *                createdAtMs: number|null}>} intents
- *   The matching table, with sender_accounts pre-decoded to hex ids and
- *   created_at pre-parsed to ms epoch (null when unparseable).
- * @returns {{kind: 'match', memo: string, tieBroken: boolean, viaAttachment?: boolean}
+ * @param {Array<{memo: string, token_amount: string}>} intents
+ *   The matching table.
+ * @returns {{kind: 'match', memo: string, viaAttachment: true}
  *          |{kind: 'attachment_mismatch', memo: string, expected: string}
- *          |{kind: 'unmatched'}
- *          |{kind: 'ambiguous', memos: string[]}}
+ *          |{kind: 'unattached'}
+ *          |{kind: 'unmatched'}}
  *
- * Attachment first: a note that NAMES an intent memo on-chain is an
- * explicit declaration by the payer. When the named intent is live and
- * the amount is the intent's exact dusted amount, that match is
- * authoritative — and it deliberately SKIPS the time-order filter
- * below: memos are server-drawn 8-byte-random values, so naming one
- * proves the payer held the payment instructions; an intent minted
- * AFTER a parked note can never carry a memo the note already named.
- * When the named intent is live but the amount is WRONG, the note is
- * refused outright ('attachment_mismatch', never credited) even if its
- * amount exactly equals some OTHER intent's dust — crediting B from a
- * note explicitly labeled for A is precisely the misattribution the
- * attachment exists to kill. A memoHint naming NO live intent falls
- * through to plain amount matching (foreign dApps may use attachments
- * for their own purposes; ours may also have raced the intent listing).
- *
- * Time ordering (amount path) is a hard filter: a payment cannot be
- * FOR an intent that did not exist yet when the note was first seen.
- * Without it, a note parked as unmatched (paid after grace, mistyped
- * amount) invites grinding — mint same-price intents until one's dust
- * equals the parked note's visible amount, then collect the credit. An
- * intent whose created_at fails to parse is excluded (fail closed): a
- * wrongly excluded honest payment parks and alerts loudly, a wrongly
- * included one hands an attacker money.
+ * The attachment memo is the ONLY matching key. Amounts are plain
+ * prices and collide across same-price intents by design, so a note
+ * without a decodable memo ('unattached') can NEVER auto-credit — it
+ * is an ops case from the moment it is seen. A memo naming a live
+ * intent matches iff the amount is the intent's exact price; a
+ * named-but-wrong-amount note is refused outright
+ * ('attachment_mismatch', never credited). A memo naming NO live
+ * intent is 'unmatched' — kept for re-matching, because the note may
+ * have raced the intent listing (the memo is server-drawn randomness:
+ * if it never turns up in the table, nobody can mint an intent that
+ * claims it later, so re-matching is safe by construction).
  */
 export function matchNote(note, intents) {
-  if (note.memoHint) {
-    const named = intents.find(i => i.memo === note.memoHint);
-    if (named) {
-      if (named.token_amount === note.amount) {
-        return { kind: 'match', memo: named.memo, tieBroken: false, viaAttachment: true };
-      }
-      return { kind: 'attachment_mismatch', memo: named.memo, expected: named.token_amount };
-    }
+  if (!note.memoHint) return { kind: 'unattached' };
+  const named = intents.find(i => i.memo === note.memoHint);
+  if (!named) return { kind: 'unmatched' };
+  if (named.token_amount === note.amount) {
+    return { kind: 'match', memo: named.memo, viaAttachment: true };
   }
-  const candidates = intents.filter(i =>
-    i.token_amount === note.amount
-    && i.createdAtMs !== null && i.createdAtMs !== undefined
-    && i.createdAtMs <= note.seenAt + CREATED_AT_SKEW_MS);
-  if (candidates.length === 1) {
-    return { kind: 'match', memo: candidates[0].memo, tieBroken: false };
-  }
-  if (candidates.length === 0) return { kind: 'unmatched' };
-
-  // Server-side slot discipline makes this unreachable unless something
-  // is wrong (config drift, server bug). Try the sender hint, but only
-  // accept it when it singles out EXACTLY one candidate — a squatted
-  // label plus a colliding amount must not pick a winner.
-  if (note.sender) {
-    const bySender = candidates.filter(
-      i => (i.sender_account_ids ?? []).includes(note.sender));
-    if (bySender.length === 1) {
-      return { kind: 'match', memo: bySender[0].memo, tieBroken: true };
-    }
-  }
-  return { kind: 'ambiguous', memos: candidates.map(i => i.memo) };
+  return { kind: 'attachment_mismatch', memo: named.memo, expected: named.token_amount };
 }
 
 /**
@@ -185,51 +136,22 @@ export function classifyReport(status) {
   return 'retry';
 }
 
-/** auth-service stamps created_at as SQLite UTC 'YYYY-MM-DD HH:MM:SS';
- *  returns ms epoch, or null when the value doesn't parse (fail closed
- *  in matchNote). */
-export function parseCreatedAt(value) {
-  if (typeof value !== 'string' || !value) return null;
-  const ms = Date.parse(value.replace(' ', 'T') + 'Z');
-  return Number.isNaN(ms) ? null : ms;
-}
-
 /**
- * Near-miss detector for unmatched notes: intents within one cent of
- * the note's amount but NOT exactly equal. The dust is the only
- * binding on the plain-send path, and it lives entirely in the
- * sub-cent digits — so "right price, wrong dust" is the signature of a
- * hand-typed amount (someone sent 3.00 for a 3.004217 quote). Those
- * notes can NEVER auto-credit (exact match is the security boundary),
- * but they deserve a specific, actionable ALERT naming the likely
- * intent instead of a generic "no matching intent" 48 hours later:
- * ops can eyeball the note and finalise via admin mark-paid (the
- * whole-cent price is intact, so the ledger's cents guard passes).
+ * Ops hint for an UNATTACHED note (no decodable memo — a manual
+ * payment, or a wallet path that cannot attach): live intents whose
+ * exact price equals the note's amount. Never an input to crediting —
+ * matching is memo-only — but the alert that parks the note can name
+ * the plausible candidates so ops start from a shortlist instead of
+ * the whole table.
  *
- * Candidates respect the same time-order rule as real matches — a
- * minted-after-the-note intent must not even be SUGGESTED to ops.
- *
- * @param {{amount: string, seenAt: number}} note
- * @param {Array<{memo, token_amount, createdAtMs}>} intents
- * @param {number} subCentUnits  base units in one cent
- *                               (10^decimals / cents_per_token)
- * @returns {Array<{memo: string, expected: string}>}
+ * @param {{amount: string}} note
+ * @param {Array<{memo, token_amount}>} intents
+ * @returns {string[]} memos of same-amount intents
  */
-export function findNearMisses(note, intents, subCentUnits) {
-  if (!Number.isFinite(subCentUnits) || subCentUnits <= 1) return [];
-  const got = BigInt(note.amount);
-  const window = BigInt(subCentUnits);
+export function sameAmountMemos(note, intents) {
   return intents
-    .filter(i =>
-      i.token_amount !== note.amount
-      && i.createdAtMs !== null && i.createdAtMs !== undefined
-      && i.createdAtMs <= note.seenAt + CREATED_AT_SKEW_MS)
-    .filter(i => {
-      const want = BigInt(i.token_amount);
-      const diff = want > got ? want - got : got - want;
-      return diff < window;
-    })
-    .map(i => ({ memo: i.memo, expected: i.token_amount }));
+    .filter(i => i.token_amount === note.amount)
+    .map(i => i.memo);
 }
 
 /** The webhook payload for a matched note. Amount stays a decimal

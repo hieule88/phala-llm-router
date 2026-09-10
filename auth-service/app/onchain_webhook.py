@@ -13,14 +13,16 @@ identities, or debit balances.
 Trust model: the watcher's claim is re-checked server-side wherever the
 server has independent knowledge — the faucet must be the one accepted
 rail-wide (a note of the wrong token must never credit), the reported
-amount must EQUAL the intent's dusted amount (token_amount_for_intent:
-price + per-memo sub-cent dust, the value the payer was quoted), and
+amount must EQUAL the intent's exact price in base units
+(token_amount_for_cents — the value the payer was quoted), and
 crediting goes through the same mark_paid_by_memo path as every other
 rail, so replay dedup (topups.source UNIQUE), the underpaid guard, and
-the expired-intent escape hatch all apply unchanged. The dust check is
-what makes amounts intent-specific: a note that paid intent A cannot be
-re-attributed to a same-price intent B, because B demands different
-base units. On top of that, the named intent must actually belong to
+the expired-intent escape hatch all apply unchanged. Note-to-intent
+attribution itself lives ON the note: the payer embeds the intent memo
+as a NoteAttachment (scheme "LVT1") and the watcher reads it back —
+same-price intents have identical amounts, so a note without the
+attachment is not auto-creditable at all (parked, ops case). On top of
+that, the named intent must actually belong to
 this rail (provider 'onchain' — memos of other rails leak through
 payment channels and must not become creditable here), and one note_id
 credits AT MOST one intent ever: a reuse pre-check plus a partial
@@ -137,14 +139,14 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
     except onchain_client.OnchainError as e:
         raise WebhookError(e.status_code, e.detail) from None
 
-    # Dusted-amount guard, enforced HERE and not merely advised to the
-    # watcher: the payer was quoted price + memo_dust, and the note must
-    # match that figure EXACTLY. Less is an underpayment; more is NOT
-    # accepted as overpay, because a >= rule reopens the misattribution
-    # hole (mint intents until one's dust undercuts the observed note,
-    # then claim it as "overpaid"). An honest off-by-anything note is
-    # unmatchable by the watcher's exact-amount rule too — it lands in
-    # ops territory (admin mark-paid after eyeballing), never auto-credit.
+    # Exact-amount guard, enforced HERE and not merely advised to the
+    # watcher: the payer was quoted the intent's exact price in base
+    # units, and the note must match that figure EXACTLY. Less is an
+    # underpayment; more is NOT accepted as overpay, because a >= rule
+    # would let a wrong-order-of-magnitude payment credit silently. An
+    # honest off-by-anything note lands in ops territory (admin
+    # mark-paid after eyeballing), never auto-credit. Attribution is
+    # NOT this check's job — the memo came off the note's attachment.
     intent = await handlers.get_intent_by_memo(conn, p["memo"])
     if intent is not None and intent["provider"] != "onchain":
         # Memos travel in payment channels that leak them (the intent
@@ -158,15 +160,15 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
         raise WebhookError(
             400, f"intent {p['memo']} is not an onchain intent")
     if intent is not None:
-        expected_units = onchain_client.token_amount_for_intent(
-            p["memo"], intent["amount_cents"])
+        expected_units = onchain_client.token_amount_for_cents(
+            intent["amount_cents"])
         if p["amount_base_units"] != expected_units:
             direction = ("underpaid" if p["amount_base_units"] < expected_units
                          else "amount mismatch")
             logger.error(
                 "MONEY RECEIVED BUT NOT CREDITED (onchain): note=%s memo=%s "
                 "units=%d expected_units=%d — amount does not match this "
-                "intent's dusted quote; verify the note was matched to the "
+                "intent's quoted price; verify the note was matched to the "
                 "right memo before any manual mark-paid",
                 p["note_id"], p["memo"], p["amount_base_units"], expected_units,
             )
@@ -175,7 +177,7 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
             raise WebhookError(
                 409,
                 (f"{direction}: intent expects exactly {expected_units} "
-                 f"base units (price + memo dust), got {p['amount_base_units']}"),
+                 f"base units, got {p['amount_base_units']}"),
             )
     # intent None falls through: mark_paid_by_memo reports 'intent not
     # found' through the standard fail-loud path.
