@@ -39,6 +39,11 @@ services:
   wallet-verifier:
     container_name: leviathan-wallet-verifier-test
 
+  note-watcher:
+    # Inherited from the base compose; renamed so a future production
+    # watcher (leviathan-note-watcher) never clashes with the test one.
+    container_name: leviathan-note-watcher-test
+
   edge:
     container_name: leviathan-ai-edge-test
     # Direct localhost port for health checks / debugging (prod edge has none).

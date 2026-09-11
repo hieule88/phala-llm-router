@@ -51,7 +51,12 @@ services:
   # usefully (auth-service answers 503) — scale it to 0 or leave the
   # token unset until the on-chain rail goes live.
   note-watcher:
-    build: ./note-watcher
+    build:
+      context: ./note-watcher
+      # The private Gitea registry needs auth even for reads; the token
+      # is a BUILD arg only (never an ENV in the image — see Dockerfile).
+      args:
+        GITEA_NPM_TOKEN: ${GITEA_NPM_TOKEN:-}
     container_name: leviathan-note-watcher
     restart: always
     environment:
