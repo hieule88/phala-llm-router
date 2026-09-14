@@ -544,7 +544,9 @@ class PendingIntentsTest(SetupMixin, unittest.TestCase):
 
 
 class IntentSlotDisciplineTest(SetupMixin, unittest.TestCase):
-    """create_intent's on-chain rules: per-identity cap, short TTL."""
+    """create_intent's budget rules: a PER-RAIL per-identity cap on live
+    pending intents, and the short on-chain TTL. Rails never share a
+    budget — see test_a_full_stripe_rail_never_blocks_the_onchain_rail."""
 
     def _db(self, scenario):
         from app.db import init_db
@@ -568,7 +570,7 @@ class IntentSlotDisciplineTest(SetupMixin, unittest.TestCase):
                 r1 = await h.create_intent(conn, 1, 100, "onchain")
                 r2 = await h.create_intent(conn, 1, 200, "onchain")
                 r3 = await h.create_intent(conn, 1, 300, "onchain")
-                # other rails are not subject to the cap
+                # a different rail has its own budget, untouched by this one
                 r4 = await h.create_intent(conn, 1, 300, "stripe")
             return r1, r2, r3, r4
 
@@ -614,9 +616,9 @@ class IntentSlotDisciplineTest(SetupMixin, unittest.TestCase):
         self.assertFalse(blocked["success"])
         self.assertTrue(unblocked["success"], unblocked)
 
-    def test_global_pending_cap_applies_to_every_provider(self):
-        # The stockpile cap: without it one api_key could pre-mint ~10^4
-        # capless Stripe intents as raw material for rail-switch games.
+    def test_each_rail_has_its_own_cap(self):
+        # Non-on-chain rails are capped too — and per rail, so filling
+        # 'stripe' leaves 'manual' untouched.
         from app import handlers
 
         async def scenario(conn, h):
@@ -625,13 +627,42 @@ class IntentSlotDisciplineTest(SetupMixin, unittest.TestCase):
                     r = await h.create_intent(conn, 1, 300, "stripe")
                     self.assertTrue(r["success"])
                 stripe_blocked = await h.create_intent(conn, 1, 300, "stripe")
-                onchain_blocked = await h.create_intent(conn, 1, 300, "onchain")
-            return stripe_blocked, onchain_blocked
+                other_rail = await h.create_intent(conn, 1, 300, "manual")
+            return stripe_blocked, other_rail
 
-        stripe_blocked, onchain_blocked = self._db(scenario)
+        stripe_blocked, other_rail = self._db(scenario)
         self.assertFalse(stripe_blocked["success"])
-        self.assertIn("too many unpaid intents", stripe_blocked["error"])
+        self.assertIn("too many unpaid stripe intents", stripe_blocked["error"])
+        self.assertTrue(other_rail["success"], other_rail)
+
+    def test_a_full_stripe_rail_never_blocks_the_onchain_rail(self):
+        # H1 regression. Caps used to share one counter across rails
+        # while TTLs differed 30x (stripe 30d, on-chain 24h), so a user
+        # who clicked "pay by card" a few times without paying locked
+        # HIMSELF out of both rails for a month — and cancel is
+        # admin-only, so there was no way back.
+        from app import handlers
+
+        async def scenario(conn, h):
+            with patch.object(handlers, "INTENT_MAX_PENDING_PER_IDENTITY", 3):
+                for _ in range(3):
+                    self.assertTrue(
+                        (await h.create_intent(conn, 1, 300, "stripe"))["success"])
+                # stripe is full...
+                stripe_blocked = await h.create_intent(conn, 1, 300, "stripe")
+                # ...the on-chain rail must still be wide open
+                onchain = [await h.create_intent(conn, 1, 300, "onchain")
+                           for _ in range(handlers.ONCHAIN_MAX_PENDING_PER_IDENTITY)]
+                onchain_blocked = await h.create_intent(conn, 1, 300, "onchain")
+            return stripe_blocked, onchain, onchain_blocked
+
+        stripe_blocked, onchain, onchain_blocked = self._db(scenario)
+        self.assertFalse(stripe_blocked["success"])
+        self.assertTrue(all(r["success"] for r in onchain),
+                        "a full stripe rail must not consume on-chain slots")
+        # and the on-chain rail still enforces its OWN budget
         self.assertFalse(onchain_blocked["success"])
+        self.assertIn("too many unpaid onchain intents", onchain_blocked["error"])
 
     def test_onchain_ttl_is_short(self):
         async def scenario(conn, h):

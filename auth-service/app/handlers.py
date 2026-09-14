@@ -62,14 +62,30 @@ INTENT_TTL_SECONDS = int(os.getenv("INTENT_TTL_SECONDS", str(30 * 24 * 3600)))
 # comfortably covers wallet payment + chain confirmation.
 ONCHAIN_INTENT_TTL_SECONDS = int(os.getenv("ONCHAIN_INTENT_TTL_SECONDS", str(24 * 3600)))
 
-# Cap on simultaneously live on-chain intents per identity. Pure
-# anti-abuse: nobody legitimately needs many concurrent unpaid top-ups,
-# and the cap bounds matching-table growth.
+# Caps on simultaneously LIVE pending intents per identity, counted
+# PER RAIL. Budgets are deliberately not shared between rails: their
+# TTLs differ by 30x (30 days for a hosted checkout vs 24h on-chain),
+# so one shared counter let a handful of abandoned Stripe intents
+# occupy every slot for a month and starve the on-chain rail — a user
+# who clicked "pay by card" a few times and never paid locked himself
+# out of BOTH ways to pay, with no self-service way back (cancel is
+# admin-only). Per-rail budgets mean a rail can only ever block itself.
+#
+# The cross-rail counter originally existed for a different reason: it
+# stopped an attacker stockpiling capless Stripe intents as ammunition
+# for a rail SWITCH onto a dust-matching on-chain quote. Both halves of
+# that attack are gone — matching is the note's attachment memo (no
+# dust), and an intent's rail is fixed at creation (no switch) — so the
+# shared counter was charging a real cost for a benefit that no longer
+# existed.
+#
+# Per-rail totals stay bounded (8 on-chain + 16 per other rail), which
+# is all the "don't let one identity mint unbounded rows" guard needs.
 ONCHAIN_MAX_PENDING_PER_IDENTITY = int(os.getenv("ONCHAIN_MAX_PENDING_PER_IDENTITY", "8"))
 
-# Cap on live pending intents per identity across ALL providers —
-# makes intent stockpiles expensive everywhere. Generous: no honest
-# client needs dozens of open invoices.
+# Same, for every rail that is not on-chain (stripe, manual), each
+# counted separately. Generous: no honest client needs dozens of open
+# invoices on one rail.
 INTENT_MAX_PENDING_PER_IDENTITY = int(os.getenv("INTENT_MAX_PENDING_PER_IDENTITY", "16"))
 
 # How long past expires_at an on-chain intent stays in the watcher's
@@ -854,10 +870,12 @@ async def create_intent(
     On-chain intents: the payment is bound to the intent by the memo
     the payer embeds in the note's NoteAttachment (amounts are plain
     prices and collide across same-price intents by design), so no
-    amount-uniqueness discipline is needed. Each identity still holds
-    at most ONCHAIN_MAX_PENDING_PER_IDENTITY live on-chain intents
-    (anti-abuse: nobody legitimately needs many concurrent unpaid
-    top-ups) and the TTL is the short on-chain one.
+    amount-uniqueness discipline is needed — just the short on-chain
+    TTL.
+
+    Each rail carries its OWN per-identity cap on live pending intents,
+    never a shared one: rail TTLs differ by 30x, so a shared budget let
+    abandoned intents on the slow rail starve the fast one for a month.
     """
     if credits <= 0:
         return {"success": False, "error": "credits must be positive"}
@@ -873,44 +891,29 @@ async def create_intent(
         if not await cur.fetchone():
             return {"success": False, "error": "identity not found"}
 
-        # Global stockpile cap — every provider. See the constant's note.
+        # Per-RAIL cap (see the constants' note): a rail may only ever
+        # block itself. Counts only LIVE pending intents — an expired
+        # one still inside the watcher's match grace stays matchable but
+        # must not hold a slot, so an abandoned batch frees the rail
+        # within its own TTL.
+        cap = (ONCHAIN_MAX_PENDING_PER_IDENTITY if provider == "onchain"
+               else INTENT_MAX_PENDING_PER_IDENTITY)
         cur = await conn.execute(
             "SELECT COUNT(*) FROM payment_intents "
-            "WHERE identity_id = ? AND status = 'pending' "
+            "WHERE identity_id = ? AND provider = ? AND status = 'pending' "
             "  AND expires_at > CURRENT_TIMESTAMP",
-            (identity_id,),
+            (identity_id, provider),
         )
-        if (await cur.fetchone())[0] >= INTENT_MAX_PENDING_PER_IDENTITY:
+        if (await cur.fetchone())[0] >= cap:
             return {
                 "success": False,
-                "error": ("too many unpaid intents "
-                          f"(max {INTENT_MAX_PENDING_PER_IDENTITY}); "
-                          "pay or let some expire first"),
+                "error": (f"too many unpaid {provider} intents (max {cap}); "
+                          "pay or let one expire first"),
             }
 
-        if provider == "onchain":
-            # The cap counts only LIVE pending intents (expired ones in
-            # the grace window stay matchable but must not lock a real
-            # user out of the rail for grace+TTL — with the 24h TTL an
-            # abandoned batch frees the cap within a day).
-            cur = await conn.execute(
-                "SELECT COUNT(*) FROM payment_intents "
-                "WHERE identity_id = ? AND provider = 'onchain' "
-                "  AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP",
-                (identity_id,),
-            )
-            if (await cur.fetchone())[0] >= ONCHAIN_MAX_PENDING_PER_IDENTITY:
-                return {
-                    "success": False,
-                    "error": ("too many unpaid on-chain intents "
-                              f"(max {ONCHAIN_MAX_PENDING_PER_IDENTITY}); "
-                              "pay or let one expire first"),
-                }
-            memo = _new_memo()
-            ttl_seconds = ONCHAIN_INTENT_TTL_SECONDS
-        else:
-            memo = _new_memo()
-            ttl_seconds = INTENT_TTL_SECONDS
+        memo = _new_memo()
+        ttl_seconds = (ONCHAIN_INTENT_TTL_SECONDS if provider == "onchain"
+                       else INTENT_TTL_SECONDS)
 
         # Pre-format the datetime modifier as a plain string so SQLite
         # sees a literal like '+86400 seconds' — the concatenation form

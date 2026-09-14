@@ -28,12 +28,17 @@ services:
       - ONCHAIN_CENTS_PER_TOKEN=${ONCHAIN_CENTS_PER_TOKEN:-100}
       - ONCHAIN_NETWORK=${ONCHAIN_NETWORK:-testnet}
       - ONCHAIN_WATCHER_TOKEN=${ONCHAIN_WATCHER_TOKEN:-}
-      # Slot discipline: dusted amounts are the matching key and the
-      # sub-cent space is finite, so on-chain intents live short (24h),
-      # are capped per identity, and stay matchable only GRACE past TTL.
+      # On-chain intents live short (24h — a quote's price must not stay
+      # payable for a month) and stay matchable only GRACE past the TTL,
+      # so a late payment still finds its order.
       - ONCHAIN_INTENT_TTL_SECONDS=${ONCHAIN_INTENT_TTL_SECONDS:-86400}
-      - ONCHAIN_MAX_PENDING_PER_IDENTITY=${ONCHAIN_MAX_PENDING_PER_IDENTITY:-8}
       - ONCHAIN_MATCH_GRACE_SECONDS=${ONCHAIN_MATCH_GRACE_SECONDS:-172800}
+      # Live unpaid intents allowed per identity, counted PER RAIL. The
+      # budgets are separate on purpose: rail TTLs differ by 30x, so a
+      # shared counter let abandoned card checkouts (30d) occupy every
+      # slot and starve the on-chain rail (24h) for a month.
+      - ONCHAIN_MAX_PENDING_PER_IDENTITY=${ONCHAIN_MAX_PENDING_PER_IDENTITY:-8}
+      - INTENT_MAX_PENDING_PER_IDENTITY=${INTENT_MAX_PENDING_PER_IDENTITY:-16}
       # Force every top-up onto one provider regardless of what clients ask
       # for (switch rails without redeploying any frontend). Empty = client picks.
       - TOPUP_PROVIDER_OVERRIDE=${TOPUP_PROVIDER_OVERRIDE:-}
