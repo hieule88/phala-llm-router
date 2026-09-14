@@ -1,11 +1,20 @@
 """Route-level tests for POST /v1/payment-intents/{memo}/checkout.
 
-These exist because the bug they pin was ROUTE-level: an earlier
-revision mutated the intent's provider before validating the request,
-so an unauthenticated `provider=manual` call flipped a victim's
-on-chain intent off the matching table and answered 400 — row already
-changed. Every scenario here asserts BOTH the HTTP status and that the
-intent's rail did not move (via the watcher matching table).
+The endpoint rebuilds payment instructions for an existing pending
+intent; it must NEVER move the intent to another rail. Two separate
+bugs live in that sentence, and both are pinned here:
+
+  * An earlier revision mutated the intent's provider before validating
+    the request, so an unauthenticated `provider=manual` call flipped a
+    victim's on-chain intent off the matching table and answered 400 —
+    row already changed.
+  * Rail switching itself was then removed: a switch away from Stripe
+    does not cancel the Checkout Session already handed to the payer,
+    so one order became payable on both rails at once — paid twice,
+    credited once (topups UNIQUE), refunded by hand.
+
+Every scenario asserts BOTH the HTTP status and that the intent's rail
+did not move (via the watcher matching table).
 
 Uses a real FastAPI TestClient with the app's own lifespan; the DB is a
 fresh temp file per class, and module config (tokens, provider config)
@@ -45,7 +54,6 @@ GATEWAY = "mtst1gatewayreceivingaccount000000000"
 FAUCET = "mtst1azftenneus72ugqqsj9rk7cveqk0eraz"
 
 KEY_HASH_OWNER = hashlib.sha256(b"lev_owner").hexdigest()
-KEY_HASH_OTHER = hashlib.sha256(b"lev_other").hexdigest()
 
 
 class CheckoutRouteTest(unittest.TestCase):
@@ -74,15 +82,14 @@ class CheckoutRouteTest(unittest.TestCase):
         cls.client = TestClient(main.app)
         cls.client.__enter__()   # runs lifespan → opens the temp DB
 
-        # Two identities, seeded over the admin API so everything runs
-        # in the TestClient's own event loop.
-        for value in (KEY_HASH_OWNER, KEY_HASH_OTHER):
-            r = cls.client.post(
-                "/v1/identities",
-                headers={"authorization": f"Bearer {ADMIN}"},
-                json={"credential_type": "api_key", "credential_value": value},
-            )
-            assert r.status_code == 201, r.text
+        # One identity, seeded over the admin API so everything runs in
+        # the TestClient's own event loop.
+        r = cls.client.post(
+            "/v1/identities",
+            headers={"authorization": f"Bearer {ADMIN}"},
+            json={"credential_type": "api_key", "credential_value": KEY_HASH_OWNER},
+        )
+        assert r.status_code == 201, r.text
 
     @classmethod
     def tearDownClass(cls):
@@ -101,11 +108,8 @@ class CheckoutRouteTest(unittest.TestCase):
         self.assertEqual(r.status_code, 201, r.text)
         return r.json()
 
-    def _checkout(self, memo, provider, credential=None):
-        body = {"provider": provider}
-        if credential is not None:
-            body["credential_type"] = "api_key"
-            body["credential_value"] = credential
+    def _checkout(self, memo, provider=None):
+        body = {} if provider is None else {"provider": provider}
         return self.client.post(f"/v1/payment-intents/{memo}/checkout", json=body)
 
     def _matching_memos(self):
@@ -114,34 +118,36 @@ class CheckoutRouteTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         return [i["memo"] for i in r.json()["intents"]]
 
-    # ── the pinned regression: no mutation before validation ─────────
+    # ── the rail is fixed at creation ─────────────────────────────────
 
-    def test_unauthenticated_manual_switch_is_400_and_row_unmoved(self):
+    def test_garbage_provider_is_400_and_row_unmoved(self):
+        # 'manual' is a legal intent provider but has no checkout to build.
         intent = self._create_intent("onchain", credits=101)
         r = self._checkout(intent["memo"], "manual")
         self.assertEqual(r.status_code, 400)
         self.assertIn(intent["memo"], self._matching_memos(),
                       "row must still be on the on-chain rail")
 
-    def test_unauthenticated_switch_is_401_and_row_unmoved(self):
+    def test_asking_for_the_other_rail_is_409_and_row_unmoved(self):
+        # No credential can move it either: there is no switch to
+        # authenticate. The answer points at creating a new intent.
         intent = self._create_intent("onchain", credits=102)
         r = self._checkout(intent["memo"], "stripe")
-        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("create a new intent", r.json()["detail"])
         self.assertIn(intent["memo"], self._matching_memos())
 
-    def test_wrong_owner_switch_is_403_and_row_unmoved(self):
-        intent = self._create_intent("onchain", credits=103)
-        r = self._checkout(intent["memo"], "stripe", credential=KEY_HASH_OTHER)
-        self.assertEqual(r.status_code, 403)
-        self.assertIn(intent["memo"], self._matching_memos())
-
-    def test_switch_to_unconfigured_rail_is_503_and_row_unmoved(self):
-        # Even the OWNER must not be able to move an intent onto a dead
-        # rail — that strands it exactly like a stranger's switch would.
-        intent = self._create_intent("onchain", credits=104)
-        r = self._checkout(intent["memo"], "stripe", credential=KEY_HASH_OWNER)
-        self.assertEqual(r.status_code, 503)
-        self.assertIn(intent["memo"], self._matching_memos())
+    def test_stripe_intent_cannot_be_pulled_onto_the_onchain_rail(self):
+        # The reverse direction, and the one that used to succeed: a
+        # stripe intent must never appear in the watcher's matching
+        # table, or a Stripe session and an on-chain quote would be
+        # payable for the same order at the same time.
+        intent = self._create_intent("stripe", credits=103)
+        self.assertNotIn(intent["memo"], self._matching_memos())
+        r = self._checkout(intent["memo"], "onchain")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertNotIn(intent["memo"], self._matching_memos(),
+                         "a refused request must not move the row")
 
     # ── the flows that must keep working ──────────────────────────────
 
@@ -154,15 +160,22 @@ class CheckoutRouteTest(unittest.TestCase):
         self.assertIn("onchain", body)
         self.assertEqual(body["onchain"]["note_kind"], "p2id")
 
-    def test_owner_can_switch_stripe_intent_onto_the_onchain_rail(self):
-        # Stripe checkout creation fails softly at create time (rail
-        # unconfigured) but the row exists — the owner moves it onchain.
-        intent = self._create_intent("stripe", credits=106)
-        self.assertNotIn(intent["memo"], self._matching_memos())
-        r = self._checkout(intent["memo"], "onchain", credential=KEY_HASH_OWNER)
+    def test_empty_body_rebuilds_the_intents_own_rail(self):
+        # What buy_credits.py prints as the retry command: `-d '{}'`.
+        # It must work on BOTH rails — an omitted provider means "this
+        # intent's own rail", never a default that switches it.
+        intent = self._create_intent("onchain", credits=106)
+        r = self._checkout(intent["memo"])
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("onchain", r.json())
-        self.assertIn(intent["memo"], self._matching_memos())
+
+    def test_retry_on_an_unconfigured_own_rail_is_503(self):
+        # Stripe is deliberately unconfigured in this class: retrying a
+        # stripe intent's own checkout surfaces the rail's 503, which is
+        # the operator's problem, not a client error.
+        intent = self._create_intent("stripe", credits=107)
+        r = self._checkout(intent["memo"], "stripe")
+        self.assertEqual(r.status_code, 503, r.text)
 
 
 if __name__ == "__main__":

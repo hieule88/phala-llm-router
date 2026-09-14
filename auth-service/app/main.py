@@ -143,11 +143,15 @@ RATE_LIMIT_WEBHOOK = os.getenv("RATE_LIMIT_WEBHOOK", "600/minute")
 # headroom for future event shapes.
 WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", str(64 * 1024)))
 
-# Operator override for the checkout provider. When set (e.g. "stripe"),
-# every intent uses THIS provider regardless of what the client asked for —
-# payment rails are operator policy, and this lets you switch providers
-# (say, when a sandbox is down) without touching any deployed frontend.
+# Operator override for the payment rail. When set (e.g. "stripe"), every
+# intent is CREATED on THIS rail regardless of what the client asked for —
+# payment rails are operator policy, and this lets you change rails (say,
+# when a sandbox is down) without touching any deployed frontend.
 # Empty = respect the client's requested provider.
+#
+# Creation only: an intent's rail is fixed once it exists, so flipping
+# this does not move intents already out there. They finish on the rail
+# they were quoted for (their checkout stays retryable) or expire.
 TOPUP_PROVIDER_OVERRIDE = os.getenv("TOPUP_PROVIDER_OVERRIDE", "").strip()
 
 
@@ -739,20 +743,16 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
 
 
 class CheckoutRequest(BaseModel):
-    provider: str = Field("stripe",
-        description="'stripe' or 'onchain' — which checkout/payment "
-                    "instructions to create.")
-    credential_type: Optional[str] = Field(None,
-        description="Required only when SWITCHING the intent to a different "
-                    "provider: the owning identity's credential type ('api_key').")
-    credential_value: Optional[str] = Field(None,
-        description="The owning identity's credential (api_key hash). "
-                    "Switching rails mutates the intent, so unlike plain "
-                    "checkout retries it must be authenticated.")
+    provider: Optional[str] = Field(None,
+        description="Optional guard: must equal the intent's OWN rail "
+                    "('stripe' or 'onchain'). Omit to simply rebuild that "
+                    "rail's instructions. An intent's rail is fixed when the "
+                    "intent is created — to pay a different way, create a "
+                    "new intent with that provider.")
 
 
-# Rails a checkout can be created for. 'manual' is allowed at intent
-# creation but has no checkout to build, so it is not switchable-to here.
+# Rails a checkout can be built for. 'manual' is allowed at intent
+# creation but is settled by an admin, so it has no checkout to build.
 _CHECKOUT_PROVIDERS = ("stripe", "onchain")
 
 
@@ -761,23 +761,23 @@ _CHECKOUT_PROVIDERS = ("stripe", "onchain")
 async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutRequest):
     """Retry-friendly checkout creation for an existing pending intent.
 
-    RETRYING checkout on the intent's OWN provider needs no auth — anyone
-    with the memo may request instructions, because paying always credits
-    the intent's original identity, fixed at intent-create.
+    Rebuilding instructions needs no auth — anyone with the memo may ask
+    for them, because paying always credits the intent's ORIGINAL
+    identity, fixed at intent-create.
 
-    SWITCHING the intent to a different provider is a state mutation and
-    is treated differently: memos leak through payment channels by
-    design, and an unauthenticated switch would let a stranger flip a
-    victim's on-chain intent off the matching table while the victim's
-    payment is in flight — stranding real money. So a switch requires
-    the OWNING identity's credential (401/403 otherwise), except when
-    TOPUP_PROVIDER_OVERRIDE forces the rail (explicit operator policy).
+    An intent's RAIL is fixed at creation and this endpoint will not move
+    it. Moving one was possible in an earlier revision and it opened a
+    window where BOTH rails were payable for the same order: switching
+    away from Stripe does not cancel the Checkout Session already handed
+    to the payer, and the on-chain side simultaneously became matchable.
+    One order paid twice is credited once (topups UNIQUE(source=memo)),
+    so the second, real payment turns into a manual refund case. Paying
+    a different way is therefore a NEW intent, never a mutation of this
+    one — which also keeps this endpoint free of the owner-credential
+    gate a state mutation would have required.
 
-    Order matters and every validation happens BEFORE the row mutates:
-    unsupported provider → 400, rail not configured → 503, wrong owner →
-    401/403, slot discipline → 409 — none of which may leave the intent
-    half-switched. Only then are the instructions built (an instructions
-    failure after a successful switch leaves a consistent row — retry).
+    `provider`, when supplied, is only a sanity check against the
+    intent's own rail (409 on mismatch, nothing is changed either way).
     """
     intent = await handlers.get_intent_by_memo(app.state.db, memo)
     if intent is None:
@@ -787,42 +787,23 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             status_code=409,
             detail=f"intent is {intent['status']}, cannot create checkout",
         )
-    provider = TOPUP_PROVIDER_OVERRIDE or req.provider
-    if provider not in _CHECKOUT_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"unsupported provider: {provider!r}")
-
-    if provider != intent["provider"]:
-        if not TOPUP_PROVIDER_OVERRIDE:
-            # The mutation gate: only the intent's owner may move it.
-            if (req.credential_type not in handlers.AUTHENTICATOR_CREDENTIAL_TYPES
-                    or not req.credential_value):
-                raise HTTPException(
-                    status_code=401,
-                    detail="switching providers requires the intent owner's credential",
-                )
-            identity_id = await handlers.lookup_identity(
-                app.state.db, req.credential_type, req.credential_value,
-            )
-            if identity_id is None or identity_id != intent["identity_id"]:
-                raise HTTPException(
-                    status_code=403, detail="credential does not own this intent",
-                )
-        # The target rail must be configured before the row moves onto
-        # it — a switch onto a dead rail strands the intent just as a
-        # stranger's switch would.
-        try:
-            if provider == "stripe":
-                stripe_client._require_config()
-            else:
-                onchain_client._require_config()
-        except (stripe_client.StripeError, onchain_client.OnchainError) as e:
-            raise HTTPException(status_code=e.status_code, detail=e.detail) from None
-        switched = await handlers.set_intent_provider(app.state.db, memo, provider)
-        if not switched.get("success"):
+    provider = intent["provider"]
+    if req.provider is not None:
+        if req.provider not in _CHECKOUT_PROVIDERS:
+            raise HTTPException(
+                status_code=400, detail=f"unsupported provider: {req.provider!r}")
+        if req.provider != provider:
             raise HTTPException(
                 status_code=409,
-                detail=switched.get("error", "cannot switch provider"),
+                detail=(f"intent is on the {provider!r} rail; its rail is fixed "
+                        f"at creation — create a new intent with provider "
+                        f"{req.provider!r} instead of moving this one"),
             )
+    if provider not in _CHECKOUT_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"intent provider {provider!r} has no checkout to create")
+
     if provider == "stripe":
         try:
             invoice = await stripe_client.create_checkout_session(
@@ -831,7 +812,7 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             )
         except stripe_client.StripeError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
-    elif provider == "onchain":
+    else:   # 'onchain' — the only other member of _CHECKOUT_PROVIDERS
         try:
             invoice = await onchain_client.create_payment_request(
                 memo=intent["memo"],
@@ -839,8 +820,6 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             )
         except onchain_client.OnchainError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
-    else:
-        raise HTTPException(status_code=400, detail=f"unsupported provider: {provider!r}")
     resp = {
         "memo": intent["memo"],
         "invoice_url": invoice["invoice_url"],

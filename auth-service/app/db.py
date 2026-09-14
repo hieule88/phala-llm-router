@@ -96,8 +96,10 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     -- past this deadline so a user can't sit on a pending intent for a
     -- year and pay at the stale price after the operator raised rates.
     expires_at    TIMESTAMP,
-    -- When the intent ENTERED the on-chain rail (creation or rail
-    -- switch). The watcher's time-order anchor — see the migration note.
+    -- When the intent entered the on-chain rail. Rails are fixed at
+    -- creation, so this equals created_at for provider='onchain' rows
+    -- and is NULL for every other rail. Audit/forensics only — see the
+    -- migration note for the history.
     onchain_since TIMESTAMP
 );
 
@@ -257,13 +259,14 @@ async def _run_light_migrations(conn: aiosqlite.Connection) -> None:
         # NULL means "not superseded"; rows predating this column are NULL and
         # so behave exactly as before.
         "ALTER TABLE credentials ADD COLUMN grace_until TIMESTAMP",
-        # When the intent ENTERED the on-chain rail — set at creation for
-        # provider='onchain' rows and RE-SET by a rail switch. The
-        # watcher's time-order filter anchors on this, not created_at:
-        # anchoring on created_at let an attacker pre-mint cheap Stripe
-        # intents (no slot discipline), park them, and later switch one
-        # onto the on-chain rail with an old-looking timestamp to claim
-        # a parked note. NULL for rows never on the on-chain rail.
+        # When the intent entered the on-chain rail. Historically this
+        # anchored the watcher's time-order filter, because a rail
+        # SWITCH could give an intent an old-looking created_at and let
+        # it claim a note parked earlier. Both of those are gone: the
+        # watcher matches on the note's attachment memo (no time filter)
+        # and an intent's rail is now fixed at creation. The column is
+        # kept for audit/forensics — dropping it is a separate, optional
+        # migration. NULL for rows never on the on-chain rail.
         "ALTER TABLE payment_intents ADD COLUMN onchain_since TIMESTAMP",
     ]
     for stmt in migrations:

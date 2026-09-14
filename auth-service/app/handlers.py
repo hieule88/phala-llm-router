@@ -922,9 +922,11 @@ async def create_intent(
             "   onchain_since) "
             "VALUES (?, ?, ?, ?, ?, 'pending', "
             "        datetime(CURRENT_TIMESTAMP, ?), "
-            # The watcher's time-order anchor: when the intent ENTERED the
-            # on-chain rail. NULL for other rails; a later rail switch
-            # sets it to the switch time, never inheriting created_at.
+            # When the intent entered the on-chain rail; NULL for other
+            # rails. Rails are fixed at creation, so this always equals
+            # created_at — it is kept for audit/forensics only and is NOT
+            # an input to matching (the watcher matches on the note's
+            # attachment memo alone).
             "        CASE WHEN ? = 'onchain' THEN CURRENT_TIMESTAMP END) "
             "RETURNING id, expires_at",
             (identity_id, credits, amount_cents, memo, provider, expires_modifier,
@@ -1106,79 +1108,6 @@ async def cancel_intent_by_memo(
         return {"success": True, "intent_id": row[0], "identity_id": row[1], "status": "cancelled"}
 
 
-async def set_intent_provider(
-    conn: aiosqlite.Connection, memo: str, provider: str,
-) -> dict:
-    """Move a still-pending intent to another payment rail.
-
-    Exists so the retry-friendly checkout endpoint can switch rails
-    WITHOUT leaving the row's provider stale: an intent recorded as
-    'stripe' but paid on-chain would be invisible to the note-watcher's
-    matching table (filtered by provider), so the money would arrive
-    with nobody to credit it — and no MONEY RECEIVED log, since the
-    webhook refuses foreign-rail memos.
-
-    Switching TO 'onchain' applies the same per-identity cap as
-    creating an on-chain intent and shortens expires_at to the on-chain
-    TTL so the quote is not payable for a hosted-checkout-sized
-    lifetime.
-    """
-    if provider not in ALLOWED_PROVIDERS:
-        return {"success": False, "error": f"unknown provider {provider!r}"}
-    async with transaction(conn):
-        cur = await conn.execute(
-            "SELECT id, identity_id, provider, status "
-            "FROM payment_intents WHERE memo = ?",
-            (memo,),
-        )
-        row = await cur.fetchone()
-        if not row:
-            return {"success": False, "error": "intent not found"}
-        intent_id, identity_id, old_provider, status_ = row
-        if status_ != "pending":
-            return {"success": False,
-                    "error": f"intent is {status_}, cannot switch provider"}
-        if provider == old_provider:
-            return {"success": True, "intent_id": intent_id,
-                    "provider": provider, "changed": False}
-
-        if provider == "onchain":
-            # Same cap rule as create_intent: live pending only.
-            cur = await conn.execute(
-                "SELECT COUNT(*) FROM payment_intents "
-                "WHERE identity_id = ? AND provider = 'onchain' "
-                "  AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP",
-                (identity_id,),
-            )
-            if (await cur.fetchone())[0] >= ONCHAIN_MAX_PENDING_PER_IDENTITY:
-                return {
-                    "success": False,
-                    "error": ("too many unpaid on-chain intents "
-                              f"(max {ONCHAIN_MAX_PENDING_PER_IDENTITY}); "
-                              "pay or let one expire first"),
-                }
-            await conn.execute(
-                # onchain_since = NOW, never the row's created_at: the
-                # watcher refuses to match notes seen before this stamp,
-                # so a stockpiled old intent switched onto the rail can
-                # never claim a note that was already parked.
-                "UPDATE payment_intents SET provider = 'onchain', "
-                "expires_at = datetime(CURRENT_TIMESTAMP, ?), "
-                "onchain_since = CURRENT_TIMESTAMP WHERE id = ?",
-                (f"+{ONCHAIN_INTENT_TTL_SECONDS} seconds", intent_id),
-            )
-        else:
-            # Leaving expires_at alone on the way OUT of onchain keeps
-            # the price-staleness guard: switching rails must not extend
-            # an intent's life.
-            await conn.execute(
-                "UPDATE payment_intents SET provider = ? WHERE id = ?",
-                (provider, intent_id),
-            )
-        return {"success": True, "intent_id": intent_id,
-                "provider": provider, "changed": True}
-
-
 async def list_pending_onchain_intents(
     conn: aiosqlite.Connection,
 ) -> list:
@@ -1207,9 +1136,10 @@ async def list_pending_onchain_intents(
     """
     cur = await conn.execute(
         "SELECT id, identity_id, memo, credits, amount_cents, created_at, expires_at, "
-        # The watcher's time-order anchor: when the intent ENTERED the
-        # on-chain rail. COALESCE covers rows predating the column —
-        # those were created as onchain, so created_at IS their entry.
+        # When the intent entered the on-chain rail — audit/diagnostics
+        # only, NOT a matching input (matching is the note's attachment
+        # memo alone). Rails are fixed at creation, so this equals
+        # created_at; COALESCE covers rows predating the column.
         "       COALESCE(onchain_since, created_at) AS matchable_since "
         "FROM payment_intents "
         f"WHERE {_ONCHAIN_MATCHABLE_SQL} "

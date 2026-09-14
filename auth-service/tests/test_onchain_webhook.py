@@ -648,7 +648,14 @@ class IntentSlotDisciplineTest(SetupMixin, unittest.TestCase):
         self.assertGreater(ttls["stripe"], 20 * 86400)   # ~30d
 
 
-class SetIntentProviderTest(SetupMixin, unittest.TestCase):
+class OnchainAnchorTest(SetupMixin, unittest.TestCase):
+    """`onchain_since` is stamped at creation for on-chain intents.
+
+    Rails are fixed at creation (there is no rail switch), so the anchor
+    always equals created_at. It is audit/forensics metadata, NOT a
+    matching input — the watcher matches on the note's attachment memo.
+    """
+
     def _db(self, scenario):
         from app.db import init_db
         from app import handlers
@@ -663,53 +670,6 @@ class SetIntentProviderTest(SetupMixin, unittest.TestCase):
 
         return run(go())
 
-    def test_switch_to_onchain_updates_row_and_matching_table(self):
-        async def scenario(conn, h):
-            intent = await h.create_intent(conn, 1, 300, "stripe")
-            out = await h.set_intent_provider(conn, intent["memo"], "onchain")
-            listed = await h.list_pending_onchain_intents(conn)
-            cur = await conn.execute(
-                "SELECT provider, "
-                "(julianday(expires_at) - julianday(CURRENT_TIMESTAMP)) * 86400 "
-                "FROM payment_intents WHERE memo = ?", (intent["memo"],))
-            row = await cur.fetchone()
-            return intent, out, listed, row
-
-        intent, out, listed, (provider, ttl) = self._db(scenario)
-        self.assertTrue(out["success"] and out["changed"])
-        self.assertEqual(provider, "onchain")
-        self.assertEqual([i["memo"] for i in listed], [intent["memo"]])
-        # the slot is not held for a hosted-checkout-sized lifetime
-        self.assertLess(ttl, 2 * 86400)
-
-    def test_switch_resets_the_time_anchor(self):
-        # The pre-mint bypass: stockpile a cheap Stripe intent, backdate
-        # it, switch onto the on-chain rail, and claim a note that was
-        # parked before the switch. matchable_since must be the SWITCH
-        # time, never the row's created_at.
-        async def scenario(conn, h):
-            intent = await h.create_intent(conn, 1, 300, "stripe")
-            await conn.execute(
-                "UPDATE payment_intents SET created_at = "
-                "datetime(CURRENT_TIMESTAMP, '-2 days') WHERE memo = ?",
-                (intent["memo"],))
-            await conn.commit()
-            out = await h.set_intent_provider(conn, intent["memo"], "onchain")
-            listed = await h.list_pending_onchain_intents(conn)
-            cur = await conn.execute(
-                "SELECT (julianday(CURRENT_TIMESTAMP) - julianday(onchain_since)) * 86400, "
-                "       (julianday(CURRENT_TIMESTAMP) - julianday(created_at)) * 86400 "
-                "FROM payment_intents WHERE memo = ?", (intent["memo"],))
-            anchor_age, created_age = await cur.fetchone()
-            return out, listed, anchor_age, created_age
-
-        out, listed, anchor_age, created_age = self._db(scenario)
-        self.assertTrue(out["success"])
-        self.assertLess(anchor_age, 60, "anchor must be the switch time")
-        self.assertGreater(created_age, 86400, "created_at stays historical")
-        # and the matching table serves the fresh anchor, not created_at
-        self.assertEqual(listed[0]["matchable_since"] == listed[0]["created_at"], False)
-
     def test_created_as_onchain_gets_an_anchor(self):
         async def scenario(conn, h):
             await h.create_intent(conn, 1, 300, "onchain")
@@ -722,37 +682,23 @@ class SetIntentProviderTest(SetupMixin, unittest.TestCase):
         self.assertTrue(has_anchor)
         self.assertTrue(listed[0]["matchable_since"])
 
-    def test_switch_away_from_onchain_leaves_matching_table(self):
+    def test_other_rails_get_no_anchor(self):
         async def scenario(conn, h):
-            intent = await h.create_intent(conn, 1, 300, "onchain")
-            out = await h.set_intent_provider(conn, intent["memo"], "stripe")
-            return out, await h.list_pending_onchain_intents(conn)
+            await h.create_intent(conn, 1, 300, "stripe")
+            cur = await conn.execute(
+                "SELECT onchain_since IS NULL FROM payment_intents")
+            return (await cur.fetchone())[0]
 
-        out, listed = self._db(scenario)
-        self.assertTrue(out["success"])
-        self.assertEqual(listed, [])
+        self.assertTrue(self._db(scenario))
 
-    def test_non_pending_intent_cannot_switch(self):
-        async def scenario(conn, h):
-            intent = await h.create_intent(conn, 1, 300, "stripe")
-            await h.mark_paid_by_memo(conn, intent["memo"])
-            return await h.set_intent_provider(conn, intent["memo"], "onchain")
-
-        out = self._db(scenario)
-        self.assertFalse(out["success"])
-        self.assertIn("paid", out["error"])
-
-    def test_switch_to_onchain_beside_a_same_price_quote(self):
-        # No dust slots anymore: switching next to a live same-price
-        # on-chain quote is fine — the note attachment disambiguates.
-        async def scenario(conn, h):
-            await h.create_intent(conn, 1, 300, "onchain")
-            other = await h.create_intent(conn, 1, 300, "stripe")
-            return await h.set_intent_provider(conn, other["memo"], "onchain")
-
-        out = self._db(scenario)
-        self.assertTrue(out["success"], out)
-        self.assertTrue(out["changed"])
+    def test_the_switch_helper_is_gone(self):
+        # Pins the decision: moving an intent between rails opened a
+        # window where both rails were payable for one order (a switch
+        # away from Stripe does not cancel the Checkout Session already
+        # handed to the payer), so one order could be paid twice and
+        # credited once. Paying differently is a NEW intent.
+        from app import handlers
+        self.assertFalse(hasattr(handlers, "set_intent_provider"))
 
 
 class WatcherTokenGateTest(unittest.TestCase):
