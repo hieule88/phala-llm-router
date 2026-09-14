@@ -224,10 +224,32 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
             409, f"note {p['note_id']} already credited another intent",
         ) from None
     if result.get("success"):
-        logger.info(
-            "onchain payment credited (note=%s memo=%s cents=%d dedup=%s)",
-            p["note_id"], p["memo"], actual_cents, bool(result.get("deduplicated")),
-        )
+        dup = result.get("duplicate_payment")
+        if dup:
+            # Two notes carrying the SAME memo both match while the intent
+            # is still pending (the watcher reads the table once per tick),
+            # so the note-reuse pre-check above cannot see it: each note id
+            # is new, only the ORDER is already paid. Real money, held by
+            # us, owed back.
+            logger.error(
+                "DUPLICATE PAYMENT: intent %s was already paid by %s and has NOW "
+                "ALSO been paid by note %s (%d cents). The balance is credited "
+                "once — refund or return the duplicate. Recorded in usage_log as "
+                "operation='duplicate_payment'.",
+                p["memo"], dup["credited_ref"], p["note_id"], actual_cents,
+            )
+        elif result.get("backfilled_provider_ref"):
+            logger.warning(
+                "onchain note matched a hand-settled intent (note=%s memo=%s) "
+                "— provider_ref backfilled, no second credit",
+                p["note_id"], p["memo"],
+            )
+        else:
+            logger.info(
+                "onchain payment credited (note=%s memo=%s cents=%d dedup=%s)",
+                p["note_id"], p["memo"], actual_cents,
+                bool(result.get("deduplicated")),
+            )
         return {"handled": True, "result": result}
 
     error = result.get("error", "")

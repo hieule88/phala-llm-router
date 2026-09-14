@@ -133,8 +133,25 @@ async def dispatch(conn: aiosqlite.Connection, event: dict) -> dict:
         allow_expired=True,
     )
     if result.get("success"):
-        logger.info("stripe payment credited (session=%s memo=%s dedup=%s)",
-                    session_id, memo, bool(result.get("deduplicated")))
+        dup = result.get("duplicate_payment")
+        if dup:
+            # Two sessions can be live for one memo: every checkout retry
+            # mints one, and Stripe prunes the idempotency key after 24h.
+            # The ledger credits the order once, so this second payment is
+            # money we are holding and owe back.
+            logger.error(
+                "DUPLICATE PAYMENT: intent %s was already paid by %s and has NOW "
+                "ALSO been paid by stripe session %s (%s cents). The balance is "
+                "credited once — refund the duplicate. Recorded in usage_log as "
+                "operation='duplicate_payment'.",
+                memo, dup["credited_ref"], session_id, amount_total)
+        elif result.get("backfilled_provider_ref"):
+            logger.warning(
+                "stripe payment matched a hand-settled intent (session=%s memo=%s)"
+                " — provider_ref backfilled, no second credit", session_id, memo)
+        else:
+            logger.info("stripe payment credited (session=%s memo=%s dedup=%s)",
+                        session_id, memo, bool(result.get("deduplicated")))
     else:
         logger.error(
             "MONEY RECEIVED BUT NOT CREDITED: stripe session=%s memo=%s "

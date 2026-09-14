@@ -776,6 +776,13 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
     one — which also keeps this endpoint free of the owner-credential
     gate a state mutation would have required.
 
+    That closed the CROSS-RAIL window only. Within the Stripe rail this
+    endpoint still mints a Checkout Session per call, and Stripe prunes
+    the idempotency key that collapses retries after 24h, so one order
+    can still end up with two payable links. Nothing here can rule that
+    out; mark_paid_by_memo catches it after the fact by comparing
+    provider_refs, alerting and recording a 'duplicate_payment' row.
+
     `provider`, when supplied, is only a sanity check against the
     intent's own rail (409 on mismatch, nothing is changed either way).
     """

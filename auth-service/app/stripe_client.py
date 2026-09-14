@@ -20,6 +20,7 @@ Stripe Checkout Sessions API:
 
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import Optional
 
@@ -96,12 +97,40 @@ async def create_checkout_session(
     if STRIPE_CANCEL_URL:
         form["cancel_url"] = STRIPE_CANCEL_URL
 
+    # Retrying checkout for one memo must hand back the SAME Session, not
+    # mint a parallel one: two live sessions for a single order is how an
+    # order gets paid twice (the ledger then credits it once and the payer
+    # is owed a refund).
+    #
+    # The key carries a digest of the exact request rather than the memo
+    # alone, because Stripe "compares incoming parameters to those of the
+    # original request and errors if they're not the same" — and
+    # success_url/cancel_url are read from the environment at call time.
+    # Keyed on the memo alone, changing STRIPE_SUCCESS_URL and redeploying
+    # would turn every open intent's checkout into an error instead of a
+    # link. Keyed on the parameters, a config change simply starts a new
+    # key, which is the intended behaviour.
+    #
+    # This NARROWS the window, it does not close it: Stripe prunes keys
+    # after 24h and then treats a reuse as a fresh request, so an intent
+    # living 30 days can still accumulate sessions. The ledger's
+    # duplicate-payment detection is the actual safety net.
+    request_digest = hashlib.sha256(
+        "\n".join(f"{k}={v}" for k, v in sorted(form.items())).encode()
+    ).hexdigest()[:32]
+
     try:
         async with httpx.AsyncClient(timeout=STRIPE_HTTP_TIMEOUT) as client:
             r = await client.post(
                 f"{STRIPE_API_BASE}/checkout/sessions",
                 data=form,
-                headers={"Authorization": f"Bearer {api_key}"},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    # memo is an opaque server-generated token, never
+                    # personal data — safe to put in the key, and it makes
+                    # the key greppable in the Stripe dashboard.
+                    "Idempotency-Key": f"checkout:{memo}:{request_digest}",
+                },
             )
     except httpx.RequestError as e:
         raise StripeError(f"Stripe unreachable: {e}") from None

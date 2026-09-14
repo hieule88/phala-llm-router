@@ -995,6 +995,14 @@ async def mark_paid_by_memo(
     knows the exact paid amount) provides it, we reject under-payments.
     Manual admin calls can leave it None to trust the intent's amount.
 
+    A replay that carries a provider_ref DIFFERENT from the one already
+    recorded means the order was paid twice for real. The result then
+    carries `duplicate_payment: {credited_ref, duplicate_ref}` for the
+    caller to alert on, and a 'duplicate_payment' row lands in usage_log
+    so the evidence outlives any log buffer. A replay whose stored ref is
+    NULL (hand-settled, then reported by the provider) only backfills the
+    reference and reports `backfilled_provider_ref`.
+
     `allow_expired` — webhook adapters set this True. A slow bank
     transfer or on-chain confirmation can land after the intent's TTL
     has elapsed; if the provider says money arrived, honour the payment
@@ -1005,7 +1013,7 @@ async def mark_paid_by_memo(
     async with transaction(conn):
         cur = await conn.execute(
             "SELECT id, identity_id, credits, amount_cents, status, "
-            "       expires_at, "
+            "       expires_at, provider_ref, "
             "       (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP) "
             "FROM payment_intents WHERE memo = ?",
             (memo,),
@@ -1013,7 +1021,8 @@ async def mark_paid_by_memo(
         row = await cur.fetchone()
         if not row:
             return {"success": False, "error": "intent not found"}
-        intent_id, identity_id, credits, expected_cents, status, _exp, is_expired = row
+        (intent_id, identity_id, credits, expected_cents, status, _exp,
+         stored_ref, is_expired) = row
 
         # Lazy expiry sweep: flip the row to 'expired' the first time
         # anyone tries to mark it paid after the deadline. Webhook path
@@ -1027,14 +1036,66 @@ async def mark_paid_by_memo(
             return {"success": False, "error": "intent has expired"}
 
         if status == "paid":
-            # Idempotent replay — already credited. Do not touch balance.
-            return {
+            # Already credited — never touch the balance again. But THREE
+            # very different things land here and blurring them is how a
+            # real payment disappears from the books:
+            #
+            #  * same provider_ref → the SAME payment delivered twice.
+            #    Stripe retries deliveries and fires two crediting event
+            #    types for one session; the watcher re-sends reports it
+            #    never got an answer for. Routine, stays quiet.
+            #  * nothing stored → settled by hand (admin mark-paid leaves
+            #    provider_ref unset) and now the provider reports the very
+            #    same money. Backfill the reference — this is the normal
+            #    ops flow for a parked note, NOT a second payment, and
+            #    crying wolf here would burn the alert's credibility on
+            #    its most common trigger.
+            #  * a DIFFERENT ref → money arrived TWICE for one order.
+            #    Nobody is over-credited (topups UNIQUE(source=memo)), but
+            #    a real payer is out of pocket until someone refunds.
+            #
+            # The duplicate is recorded in usage_log, not just returned:
+            # container logs are the first thing lost on a redeploy, while
+            # a chargeback surfaces weeks later — by then a log line is
+            # gone and payment_intents still shows a single provider_ref.
+            # The row keeps the evidence queryable for as long as the
+            # order exists. Detection lives HERE rather than in each
+            # adapter so every rail, and admin settlement, is covered by
+            # construction.
+            out = {
                 "success": True,
                 "intent_id": intent_id,
                 "identity_id": identity_id,
                 "status": "paid",
                 "deduplicated": True,
+                "provider_ref": stored_ref,
             }
+            if provider_ref is not None and stored_ref is None:
+                await conn.execute(
+                    "UPDATE payment_intents SET provider_ref = ? WHERE id = ?",
+                    (provider_ref, intent_id),
+                )
+                out["provider_ref"] = provider_ref
+                out["backfilled_provider_ref"] = True
+            elif provider_ref is not None and provider_ref != stored_ref:
+                cur = await conn.execute(
+                    "SELECT balance FROM balances WHERE identity_id = ?",
+                    (identity_id,),
+                )
+                bal_row = await cur.fetchone()
+                await conn.execute(
+                    "INSERT INTO usage_log "
+                    "  (identity_id, operation, delta, balance_after, note) "
+                    "VALUES (?, 'duplicate_payment', 0, ?, ?)",
+                    (identity_id, bal_row[0] if bal_row else 0,
+                     f"intent={memo} paid_by={stored_ref} "
+                     f"also_paid={provider_ref}"),
+                )
+                out["duplicate_payment"] = {
+                    "credited_ref": stored_ref,
+                    "duplicate_ref": provider_ref,
+                }
+            return out
         if status != "pending" and not (status == "expired" and allow_expired):
             return {
                 "success": False,
