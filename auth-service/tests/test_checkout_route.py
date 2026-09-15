@@ -42,11 +42,39 @@ os.environ.setdefault("ADMIN_TOKEN", "A" * 40)
 os.environ.setdefault("PROXY_REFUND_TOKEN", "P" * 40)
 os.environ.setdefault("AUTH_DB_PATH", ":memory:")
 
+import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app.main as main  # noqa: E402
 from app import onchain_client, stripe_client  # noqa: E402
 from app.db import init_db as real_init_db  # noqa: E402
+
+
+class _StripeStub:
+    """Canned Checkout Session transport. Both rails must be configured
+    here: creating an intent now preflights its rail, so an unconfigured
+    Stripe would fail at creation and these tests would never reach the
+    checkout route they exist to exercise."""
+
+    def __init__(self, *a, **kw):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, data=None, headers=None):
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"id": "cs_stub", "url": "https://checkout.stripe.com/stub"}
+
+        return _Resp()
+
 
 ADMIN = "a" * 32
 WATCHER = "w" * 32
@@ -70,12 +98,15 @@ class CheckoutRouteTest(unittest.TestCase):
             patch.object(main, "ADMIN_TOKEN", ADMIN),
             patch.object(main, "ONCHAIN_WATCHER_TOKEN", WATCHER),
             patch.object(main, "TOPUP_PROVIDER_OVERRIDE", ""),
-            # onchain rail fully configured...
+            # The shared per-minute limiter is not what these tests
+            # exercise, and its state outlives a test class — one
+            # chatty test would otherwise 429 every later one.
+            patch.object(main.limiter, "enabled", False),
             patch.object(onchain_client, "ONCHAIN_GATEWAY_ADDRESS", GATEWAY),
             patch.object(onchain_client, "ONCHAIN_FAUCET_ID", FAUCET),
-            # ...stripe deliberately NOT (the 503-before-mutation case)
-            patch.object(stripe_client, "STRIPE_SECRET_KEY", ""),
-            patch.object(stripe_client, "STRIPE_SUCCESS_URL", ""),
+            patch.object(stripe_client, "STRIPE_SECRET_KEY", "sk_test_stub"),
+            patch.object(stripe_client, "STRIPE_SUCCESS_URL", "https://app.example/ok"),
+            patch.object(httpx, "AsyncClient", _StripeStub),
         ]
         for p in cls._patches:
             p.start()
@@ -169,13 +200,19 @@ class CheckoutRouteTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("onchain", r.json())
 
-    def test_retry_on_an_unconfigured_own_rail_is_503(self):
-        # Stripe is deliberately unconfigured in this class: retrying a
-        # stripe intent's own checkout surfaces the rail's 503, which is
-        # the operator's problem, not a client error.
+    def test_retry_after_the_rail_breaks_is_503(self):
+        # The intent was created while Stripe worked (creation preflights
+        # the rail, so it could not have been created otherwise); the rail
+        # broke afterwards. Retrying surfaces the rail's 503 — an
+        # operator problem, not a client error, and the intent survives
+        # for a later retry.
         intent = self._create_intent("stripe", credits=107)
-        r = self._checkout(intent["memo"], "stripe")
+        with patch.object(stripe_client, "STRIPE_SECRET_KEY", ""):
+            r = self._checkout(intent["memo"], "stripe")
         self.assertEqual(r.status_code, 503, r.text)
+        # and once the rail is back, the same intent still yields a link
+        again = self._checkout(intent["memo"], "stripe")
+        self.assertEqual(again.status_code, 200, again.text)
 
 
 if __name__ == "__main__":

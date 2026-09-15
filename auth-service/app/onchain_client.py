@@ -120,6 +120,18 @@ def cents_for_token_amount(base_units: int) -> int:
     return (base_units * ONCHAIN_CENTS_PER_TOKEN) // (10 ** ONCHAIN_TOKEN_DECIMALS)
 
 
+def preflight(amount_cents: int) -> None:
+    """Everything that can be refused WITHOUT building instructions.
+
+    Symmetric with stripe_client.preflight: callers run this BEFORE the
+    intent row is committed, so a rail that cannot quote does not cost
+    the user one of their capped, self-uncancellable pending slots.
+    The on-chain rail has no minimum — any positive amount is payable.
+    """
+    _require_config()
+    token_amount_for_cents(amount_cents)   # raises on a non-positive amount
+
+
 async def create_payment_request(
     *,
     memo: str,

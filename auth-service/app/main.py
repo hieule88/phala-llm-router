@@ -708,6 +708,24 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
     if identity_id is None:
         raise HTTPException(status_code=401, detail="invalid credential")
     provider = TOPUP_PROVIDER_OVERRIDE or req.provider
+
+    # Refuse what the rail would refuse anyway BEFORE writing the row.
+    # The intent used to be committed first and a provider failure came
+    # back only as a soft `checkout_error`, on the assumption that the
+    # client would retry checkout for the same memo. No client does —
+    # they all create another intent. And because pending intents are
+    # capped per rail and only an admin can cancel one, every doomed
+    # attempt cost the user a slot for the intent's full TTL: an
+    # unconfigured rail, or simply buying less than Stripe's minimum
+    # charge, locked the rail for 30 days after a handful of clicks.
+    try:
+        if provider == "stripe":
+            stripe_client.preflight(handlers.amount_cents_for(req.credits))
+        elif provider == "onchain":
+            onchain_client.preflight(handlers.amount_cents_for(req.credits))
+    except (stripe_client.StripeError, onchain_client.OnchainError) as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+
     result = await handlers.create_intent(
         app.state.db, identity_id, req.credits, provider,
     )

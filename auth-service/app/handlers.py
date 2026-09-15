@@ -844,6 +844,13 @@ async def refund(
 # ─── Payment intents (provider-agnostic) ───────────────────────────────
 
 
+def amount_cents_for(credits: int) -> int:
+    """Server-side price for `credits`. The ONE place credits become
+    money — callers that must know the price before an intent exists
+    (rail preflight) use this instead of re-deriving it."""
+    return credits * CENTS_PER_CREDIT
+
+
 def _new_memo() -> str:
     """Random public-safe reference the user includes in their payment.
     Not a secret — an attacker who guesses one can query the intent's
@@ -882,7 +889,7 @@ async def create_intent(
     if provider not in ALLOWED_PROVIDERS:
         return {"success": False, "error": f"unknown provider {provider!r}"}
 
-    amount_cents = credits * CENTS_PER_CREDIT
+    amount_cents = amount_cents_for(credits)
 
     async with transaction(conn):
         cur = await conn.execute(

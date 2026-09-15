@@ -39,6 +39,18 @@ STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "")
 
 STRIPE_HTTP_TIMEOUT = float(os.getenv("STRIPE_HTTP_TIMEOUT", "10.0"))
 
+# Stripe refuses charges below a per-currency floor "to ensure the Stripe
+# fee is not greater than your payment amount". Sessions here are created
+# in USD, whose floor is $0.50 — but the floor that actually applies is
+# the one for the account's SETTLEMENT currency (GBP 0.30, HUF 175, …),
+# so operators settling elsewhere must raise this.
+#
+# Checked before the intent row is written: without it, buying fewer
+# credits than half a dollar's worth produced a committed intent plus a
+# Stripe rejection, and pending intents are capped and cannot be
+# cancelled by the user — every attempt burned a slot for 30 days.
+STRIPE_MIN_AMOUNT_CENTS = int(os.getenv("STRIPE_MIN_AMOUNT_CENTS", "50"))
+
 
 class StripeError(Exception):
     """Raised when the outbound call to Stripe failed for any reason
@@ -62,6 +74,36 @@ def _require_config() -> str:
     return STRIPE_SECRET_KEY
 
 
+def preflight(amount_cents: int) -> None:
+    """Everything that can be refused WITHOUT calling Stripe.
+
+    Callers run this BEFORE committing the intent row. The row used to be
+    written first and a provider failure only came back as a soft
+    `checkout_error`, on the theory that the client would retry checkout
+    for the same memo — no client does, they all just create another
+    intent. Since pending intents are capped per rail and only the admin
+    can cancel one, every doomed attempt cost the user a slot for the
+    intent's whole TTL. Anything knowable up front therefore has to fail
+    before anything is written.
+
+    Raises StripeError (503 for missing config, 400 for an amount Stripe
+    would reject anyway).
+    """
+    _require_config()
+    if amount_cents <= 0:
+        raise StripeError(
+            f"checkout amount must be positive (got {amount_cents} cents)",
+            status_code=400,
+        )
+    if amount_cents < STRIPE_MIN_AMOUNT_CENTS:
+        raise StripeError(
+            f"amount {amount_cents} cents is below Stripe's minimum charge "
+            f"({STRIPE_MIN_AMOUNT_CENTS} cents) — buy more credits, or pay "
+            f"on the on-chain rail, which has no minimum",
+            status_code=400,
+        )
+
+
 async def create_checkout_session(
     *,
     memo: str,
@@ -77,12 +119,8 @@ async def create_checkout_session(
         "invoice_id":  <session id, cs_...>,
         "expiration_estimate_date": <unix ts or None> }
     """
-    api_key = _require_config()
-    if amount_cents <= 0:
-        raise StripeError(
-            f"checkout amount must be positive (got {amount_cents} cents)",
-            status_code=400,
-        )
+    preflight(amount_cents)
+    api_key = STRIPE_SECRET_KEY
 
     form = {
         "mode": "payment",
