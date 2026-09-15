@@ -959,10 +959,20 @@ async def create_intent(
 async def get_intent_by_memo(
     conn: aiosqlite.Connection, memo: str,
 ) -> Optional[dict]:
-    """Look up an intent by its opaque memo. Returns None if not found."""
+    """Look up an intent by its opaque memo. Returns None if not found.
+
+    `is_expired` is computed in SQL rather than compared by the caller:
+    expires_at is a SQLite UTC string, and every other time comparison in
+    this module uses CURRENT_TIMESTAMP, so deriving it anywhere else
+    invites a timezone/format mismatch. Note that `status` can still read
+    'pending' while this is true — the row is only flipped lazily, by
+    mark_paid_by_memo — so anything deciding whether an intent may still
+    be PAID must consult this flag, not the status alone.
+    """
     cur = await conn.execute(
         "SELECT id, identity_id, credits, amount_cents, memo, provider, "
-        "       provider_ref, status, created_at, paid_at, expires_at "
+        "       provider_ref, status, created_at, paid_at, expires_at, "
+        "       (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP) "
         "FROM payment_intents WHERE memo = ?",
         (memo,),
     )
@@ -981,6 +991,7 @@ async def get_intent_by_memo(
         "created_at": row[8],
         "paid_at": row[9],
         "expires_at": row[10],
+        "is_expired": bool(row[11]),
     }
 
 

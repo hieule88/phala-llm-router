@@ -200,6 +200,74 @@ class CheckoutRouteTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("onchain", r.json())
 
+    def _age_out(self, memo):
+        """Backdate an intent past its TTL, the way real time would.
+        Uses a separate sqlite connection: the app's lives in the
+        TestClient's own event loop."""
+        import sqlite3
+        raw = sqlite3.connect(os.path.join(self._tmp.name, "auth.db"))
+        raw.execute(
+            "UPDATE payment_intents SET created_at = datetime('now', '-40 days'), "
+            "    expires_at = datetime('now', '-10 days') WHERE memo = ?", (memo,))
+        raw.commit()
+        raw.close()
+
+    def test_expired_intent_gets_no_new_payment_instructions(self):
+        # The TTL is a stale-price guard: quotes are only honoured for the
+        # intent's lifetime. Handing out a fresh checkout link for a
+        # long-dead intent defeats it entirely, because the webhooks
+        # credit a confirmed payment with allow_expired=True — so the
+        # order would be paid today at a price quoted a month ago.
+        intent = self._create_intent("stripe", credits=108)
+        self._age_out(intent["memo"])
+        # the row still READS pending — it is only flipped lazily, which
+        # is exactly why the route cannot trust status alone
+        self.assertEqual(
+            self.client.get(f"/v1/payment-intents/{intent['memo']}").json()["status"],
+            "pending")
+        r = self._checkout(intent["memo"], "stripe")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("expired", r.json()["detail"])
+        self.assertNotIn("invoice_url", r.json())
+
+    def test_expired_onchain_intent_gets_no_instructions_either(self):
+        # Worse on this rail: past the watcher's match grace the intent
+        # has left the matching table, so a payment invited now would
+        # land, park, and become an ops case.
+        intent = self._create_intent("onchain", credits=109)
+        self._age_out(intent["memo"])
+        r = self._checkout(intent["memo"], "onchain")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("expired", r.json()["detail"])
+        self.assertNotIn(intent["memo"], self._matching_memos(),
+                         "and it is out of the watcher's table anyway")
+
+    def test_a_live_intent_is_unaffected(self):
+        # The guard must key on the deadline, not on age or provider.
+        intent = self._create_intent("onchain", credits=110)
+        r = self._checkout(intent["memo"], "onchain")
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_refusing_new_instructions_does_not_break_late_payments(self):
+        # The other half of the contract: a payment ALREADY in flight
+        # must still be honoured after the TTL (allow_expired). Refusing
+        # to hand out NEW instructions must not touch that path.
+        from app import handlers
+
+        intent = self._create_intent("stripe", credits=111)
+        self._age_out(intent["memo"])
+        self.assertEqual(self._checkout(intent["memo"], "stripe").status_code, 409)
+
+        async def settle():
+            return await handlers.mark_paid_by_memo(
+                main.app.state.db, intent["memo"],
+                provider_ref="stripe:cs_late", actual_amount_cents=111,
+                allow_expired=True)
+
+        result = self.client.portal.call(settle)
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(result["status"], "paid")
+
     def test_retry_after_the_rail_breaks_is_503(self):
         # The intent was created while Stripe worked (creation preflights
         # the rail, so it could not have been created otherwise); the rail

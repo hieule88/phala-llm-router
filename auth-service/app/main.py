@@ -812,6 +812,25 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             status_code=409,
             detail=f"intent is {intent['status']}, cannot create checkout",
         )
+    if intent["is_expired"]:
+        # status alone is not enough: the row is only flipped to
+        # 'expired' lazily (by mark_paid_by_memo), so a long-dead intent
+        # still reads 'pending'. Handing out instructions for it defeats
+        # the whole point of the TTL — the webhooks credit a confirmed
+        # payment with allow_expired=True, so an expired quote paid today
+        # is credited at a price that may be months stale. On the
+        # on-chain rail it fails the other way: past the watcher's match
+        # grace the intent has left the matching table, so the payment
+        # would land, park, and become an ops case.
+        #
+        # allow_expired stays exactly as it is — honouring a payment
+        # ALREADY in flight is right; inviting a new one is not.
+        raise HTTPException(
+            status_code=409,
+            detail=(f"intent expired at {intent['expires_at']} UTC and can no "
+                    f"longer be paid — create a new intent (quoted prices are "
+                    f"only held for the intent's lifetime)"),
+        )
     provider = intent["provider"]
     if req.provider is not None:
         if req.provider not in _CHECKOUT_PROVIDERS:
