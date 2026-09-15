@@ -866,6 +866,12 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
     resp = {
         "memo": intent["memo"],
+        # The rail these instructions are FOR. Clients must branch on
+        # this rather than on what they asked for: TOPUP_PROVIDER_OVERRIDE
+        # can put an order on a different rail than the caller requested,
+        # and an order's rail is then fixed for life. The create route
+        # reports it the same way.
+        "provider": provider,
         "invoice_url": invoice["invoice_url"],
         "invoice_id": invoice["invoice_id"],
         "amount_cents": intent["amount_cents"],

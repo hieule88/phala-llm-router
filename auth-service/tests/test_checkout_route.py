@@ -200,6 +200,29 @@ class CheckoutRouteTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("onchain", r.json())
 
+    def test_both_routes_report_the_rail_the_order_landed_on(self):
+        # A client cannot assume it got the rail it asked for, so both
+        # routes have to say. Without this the dApp asked for on-chain,
+        # was handed a card order, called that "no payment instructions",
+        # and minted a fresh order on every click — forever.
+        with patch.object(main, "TOPUP_PROVIDER_OVERRIDE", "stripe"):
+            created = self._create_intent("onchain", credits=112)
+            self.assertEqual(created["provider"], "stripe",
+                             "the override put it on the card rail and said so")
+            self.assertIn("invoice_url", created)
+            self.assertNotIn("onchain", created)
+            # and the retry path reports the same rail, not a guess
+            again = self._checkout(created["memo"])
+            self.assertEqual(again.status_code, 200, again.text)
+            self.assertEqual(again.json()["provider"], "stripe")
+            self.assertNotIn("onchain", again.json())
+
+    def test_checkout_reports_the_onchain_rail_too(self):
+        intent = self._create_intent("onchain", credits=113)
+        body = self._checkout(intent["memo"]).json()
+        self.assertEqual(body["provider"], "onchain")
+        self.assertIn("onchain", body)
+
     def _age_out(self, memo):
         """Backdate an intent past its TTL, the way real time would.
         Uses a separate sqlite connection: the app's lives in the
