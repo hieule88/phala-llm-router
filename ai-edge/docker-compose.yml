@@ -46,6 +46,11 @@ services:
       # slot and starve the on-chain rail (24h) for a month.
       - ONCHAIN_MAX_PENDING_PER_IDENTITY=${ONCHAIN_MAX_PENDING_PER_IDENTITY:-8}
       - INTENT_MAX_PENDING_PER_IDENTITY=${INTENT_MAX_PENDING_PER_IDENTITY:-16}
+      # Server-built wallet payloads: the ledger asks note-builder (below)
+      # for the serialized transaction a payer's wallet signs, so clients
+      # need no Miden SDK. Empty URL = off (clients build their own note).
+      - ONCHAIN_BUILDER_URL=${ONCHAIN_BUILDER_URL:-http://note-builder:8090}
+      - ONCHAIN_BUILDER_TOKEN=${ONCHAIN_BUILDER_TOKEN:-}
       # Force every top-up onto one provider regardless of what clients ask
       # for (switch rails without redeploying any frontend). Empty = client picks.
       - TOPUP_PROVIDER_OVERRIDE=${TOPUP_PROVIDER_OVERRIDE:-}
@@ -94,6 +99,35 @@ services:
       timeout: 10s
       retries: 3
       start_period: 90s
+    networks: [edge-net]
+
+  # note-builder: the SAME image as note-watcher (same SDK build, same
+  # memo codec module), run as a second process with an internal HTTP
+  # front. auth-service calls it to build the wallet payload for an
+  # on-chain intent (POST /build) and probes GET /health before it
+  # commits such an intent. A separate process on purpose: the watcher
+  # stays a pure pull loop and a build storm can never stall a scan.
+  # No published ports — reachable only on edge-net.
+  note-builder:
+    build:
+      context: ./note-watcher
+      args:
+        GITEA_NPM_TOKEN: ${GITEA_NPM_TOKEN:-}
+    container_name: leviathan-note-builder
+    restart: always
+    command: ["node", "src/builder-server.mjs"]
+    environment:
+      - BUILDER_PORT=8090
+      - BUILDER_TOKEN=${ONCHAIN_BUILDER_TOKEN:-}
+    # /health is 503 until the SDK's WASM is loaded, so "up but not
+    # ready" reads unhealthy — the same signal auth-service preflights on.
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "fetch('http://127.0.0.1:8090/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     networks: [edge-net]
 
   edge:
