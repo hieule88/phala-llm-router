@@ -433,6 +433,12 @@ class CreatePaymentIntentRequest(BaseModel):
     provider: str = Field("manual",
         description="'manual', 'stripe', or 'onchain'. "
                     "amount_cents is derived server-side from credits × CENTS_PER_CREDIT.")
+    sender_address: Optional[str] = Field(None,
+        description="'onchain' only: the payer's Miden account (bech32). When "
+                    "given, the server builds the wallet payload itself and "
+                    "returns it as onchain.custom_tx — the client hands it to "
+                    "wallet.requestTransaction({type:'Custom'}) with no Miden "
+                    "SDK of its own. Omit to build the note client-side.")
 
 
 class MarkIntentPaidRequest(BaseModel):
@@ -723,6 +729,14 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
             stripe_client.preflight(handlers.amount_cents_for(req.credits))
         elif provider == "onchain":
             onchain_client.preflight(handlers.amount_cents_for(req.credits))
+            # `is not None`, not truthiness: an EMPTY string is a malformed
+            # request (400), never a silent fall-back to the legacy path.
+            if req.sender_address is not None:
+                # A server-built payload was asked for: a malformed sender
+                # or a builder that cannot serve must fail HERE, before
+                # the row takes one of the payer's capped pending slots.
+                onchain_client.validate_sender_address(req.sender_address)
+                await onchain_client.preflight_builder()
     except (stripe_client.StripeError, onchain_client.OnchainError) as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail) from None
 
@@ -747,14 +761,31 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
             result["checkout_error"] = e.detail
     elif provider == "onchain":
         try:
+            custom_tx = None
+            if req.sender_address is not None:
+                # Built once and STORED: /checkout hands back this same
+                # payload on every retry. Rebuilding would mint a second
+                # payable note for the same memo (random serial) — two
+                # notes paid is one refund by hand.
+                custom_tx = await onchain_client.build_custom_tx(
+                    memo=result["memo"],
+                    amount_cents=result["amount_cents"],
+                    sender_address=req.sender_address,
+                )
+                await handlers.store_custom_tx(
+                    app.state.db, result["memo"], req.sender_address, custom_tx)
             invoice = await onchain_client.create_payment_request(
                 memo=result["memo"],
                 amount_cents=result["amount_cents"],
+                custom_tx=custom_tx,
             )
             result["invoice_url"] = invoice["invoice_url"]
             result["invoice_id"] = invoice["invoice_id"]
             result["onchain"] = invoice["onchain"]
         except onchain_client.OnchainError as e:
+            # Intent is committed (the builder passed preflight a moment
+            # ago, so this is a transient failure); the client retries
+            # via /checkout with its sender_address and gets the payload.
             result["checkout_error"] = e.detail
     result["provider"] = provider
     return result
@@ -767,11 +798,43 @@ class CheckoutRequest(BaseModel):
                     "rail's instructions. An intent's rail is fixed when the "
                     "intent is created — to pay a different way, create a "
                     "new intent with that provider.")
+    sender_address: Optional[str] = Field(None,
+        description="'onchain' only: the payer's Miden account. Returns the "
+                    "payload stored at creation when it was built for this "
+                    "account; (re)builds and stores a new one when the payer "
+                    "switched accounts or none was built yet. Omit to get "
+                    "whatever is stored (possibly nothing).")
 
 
 # Rails a checkout can be built for. 'manual' is allowed at intent
 # creation but is settled by an admin, so it has no checkout to build.
 _CHECKOUT_PROVIDERS = ("stripe", "onchain")
+
+
+async def _custom_tx_for_checkout(intent: dict, sender_address: Optional[str]) -> Optional[dict]:
+    """The wallet payload to hand out for an existing on-chain intent.
+
+    Prefer what is STORED: the same payload on every retry means the same
+    note, so a payer who clicks twice cannot end up with two payable notes
+    for one memo. A rebuild happens only when the payer names a DIFFERENT
+    account than the stored payload was built for (a Miden note names its
+    sender; the wallet signs only for its own account) — or when nothing
+    was built yet (the intent predates server-built payloads, or its
+    build failed transiently at creation).
+    """
+    stored = intent.get("custom_tx")
+    if sender_address is None:
+        return stored
+    onchain_client.validate_sender_address(sender_address)
+    if stored and intent.get("sender_address") == sender_address:
+        return stored
+    custom_tx = await onchain_client.build_custom_tx(
+        memo=intent["memo"],
+        amount_cents=intent["amount_cents"],
+        sender_address=sender_address,
+    )
+    await handlers.store_custom_tx(app.state.db, intent["memo"], sender_address, custom_tx)
+    return custom_tx
 
 
 @app.post("/v1/payment-intents/{memo}/checkout")
@@ -858,9 +921,11 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
     else:   # 'onchain' — the only other member of _CHECKOUT_PROVIDERS
         try:
+            custom_tx = await _custom_tx_for_checkout(intent, req.sender_address)
             invoice = await onchain_client.create_payment_request(
                 memo=intent["memo"],
                 amount_cents=intent["amount_cents"],
+                custom_tx=custom_tx,
             )
         except onchain_client.OnchainError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
