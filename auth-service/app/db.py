@@ -100,7 +100,18 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     -- creation, so this equals created_at for provider='onchain' rows
     -- and is NULL for every other rail. Audit/forensics only — see the
     -- migration note for the history.
-    onchain_since TIMESTAMP
+    onchain_since TIMESTAMP,
+    -- Server-built wallet payload for 'onchain' intents (see
+    -- onchain_client.build_custom_tx). The payer's account address the
+    -- payload was built FOR (a Miden note names its sender; the wallet
+    -- only signs for that account), the payload itself as JSON, and the
+    -- id of the note it will publish. Stored rather than rebuilt on
+    -- every checkout: a rebuilt payload is a SECOND payable note for the
+    -- same memo (random serial), and two notes paid = one refund by hand.
+    -- NULL when the client built its own note (legacy path).
+    sender_address   TEXT,
+    custom_tx        TEXT,
+    expected_note_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payment_intents_identity
@@ -268,6 +279,11 @@ async def _run_light_migrations(conn: aiosqlite.Connection) -> None:
         # kept for audit/forensics — dropping it is a separate, optional
         # migration. NULL for rows never on the on-chain rail.
         "ALTER TABLE payment_intents ADD COLUMN onchain_since TIMESTAMP",
+        # Server-built wallet payload (see the CREATE above). Rows
+        # predating these columns are NULL = "client built its own note".
+        "ALTER TABLE payment_intents ADD COLUMN sender_address TEXT",
+        "ALTER TABLE payment_intents ADD COLUMN custom_tx TEXT",
+        "ALTER TABLE payment_intents ADD COLUMN expected_note_id TEXT",
     ]
     for stmt in migrations:
         try:
