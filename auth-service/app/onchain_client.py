@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import os
 
+import httpx
+
 
 # The gateway's receiving account, as a public bech32 address
 # (mm1... mainnet, mtst1... testnet). Public information — the seed that
@@ -63,6 +65,16 @@ ONCHAIN_NETWORK = os.getenv("ONCHAIN_NETWORK", "testnet")
 # foreign-chain address fails at config time instead of minting unpayable
 # intents.
 _KNOWN_ADDRESS_PREFIXES = ("mm1", "mtst1", "mdev1", "mlcl1", "mcst1")
+
+# The note-builder: an internal HTTP service (ai-edge/note-watcher,
+# `node src/builder-server.mjs`) that turns (sender, gateway, faucet,
+# amount, memo) into the serialized wallet payload the payer's wallet
+# signs. Same SDK build and same memo codec as the watcher that later
+# reads the note. Empty URL = server-built payloads are OFF: intents are
+# still created, clients must build their own note (legacy path).
+ONCHAIN_BUILDER_URL = os.getenv("ONCHAIN_BUILDER_URL", "").rstrip("/")
+ONCHAIN_BUILDER_TOKEN = os.getenv("ONCHAIN_BUILDER_TOKEN", "")
+ONCHAIN_BUILDER_TIMEOUT_SEC = float(os.getenv("ONCHAIN_BUILDER_TIMEOUT_SEC", "10"))
 
 
 class OnchainError(Exception):
@@ -132,11 +144,115 @@ def preflight(amount_cents: int) -> None:
     token_amount_for_cents(amount_cents)   # raises on a non-positive amount
 
 
+def validate_sender_address(sender_address: str) -> str:
+    """The payer's Miden account the payload is built FOR.
+
+    A note names its sender and the wallet signs only for its own
+    account, so a payload built for address A is unusable from B — the
+    address must be right BEFORE we spend a build on it. Only the shape
+    and the network can be checked here (the wallet proves ownership by
+    signing); a wrong-but-well-formed address costs nothing: the wallet
+    refuses to sign it, and any payload can only ever pay the gateway.
+    """
+    if (not isinstance(sender_address, str)
+            or not (20 <= len(sender_address) <= 120)
+            or not sender_address.startswith(_KNOWN_ADDRESS_PREFIXES)
+            or not all(ch in "abcdefghijklmnopqrstuvwxyz0123456789" for ch in sender_address)):
+        raise OnchainError("sender_address must be a Miden bech32 address", status_code=400)
+    gateway_prefix = next((p for p in _KNOWN_ADDRESS_PREFIXES
+                           if ONCHAIN_GATEWAY_ADDRESS.startswith(p)), None)
+    if gateway_prefix and not sender_address.startswith(gateway_prefix):
+        raise OnchainError(
+            f"sender_address is on a different network than the gateway "
+            f"({ONCHAIN_NETWORK})", status_code=400)
+    return sender_address
+
+
+def builder_enabled() -> bool:
+    return bool(ONCHAIN_BUILDER_URL)
+
+
+async def _builder_request(method: str, path: str, json: dict | None = None) -> httpx.Response:
+    """One HTTP call to the note-builder. Kept as a single seam so tests
+    replace it without touching httpx (the Stripe tests already patch
+    httpx.AsyncClient globally, and the two must not collide)."""
+    headers = {}
+    if ONCHAIN_BUILDER_TOKEN:
+        headers["authorization"] = f"Bearer {ONCHAIN_BUILDER_TOKEN}"
+    async with httpx.AsyncClient(timeout=ONCHAIN_BUILDER_TIMEOUT_SEC) as client:
+        return await client.request(method, f"{ONCHAIN_BUILDER_URL}{path}",
+                                    json=json, headers=headers)
+
+
+async def preflight_builder() -> None:
+    """Refuse BEFORE the intent row exists when the builder cannot serve.
+
+    Symmetric with preflight(): a payer who asked for a server-built
+    payload gets nothing useful from an intent whose payload cannot be
+    built, and that intent would still hold one of their capped pending
+    slots for the whole TTL. /health is 503 until the builder's WASM is
+    loaded, so "up but not ready" is refused too.
+    """
+    if not builder_enabled():
+        raise OnchainError(
+            "server-built wallet payloads are not enabled on this server "
+            "(ONCHAIN_BUILDER_URL unset) — build the note client-side", status_code=503)
+    try:
+        r = await _builder_request("GET", "/health")
+    except httpx.HTTPError as e:
+        raise OnchainError(f"note-builder unreachable: {e}", status_code=503) from None
+    if r.status_code != 200:
+        raise OnchainError(
+            f"note-builder not ready (HTTP {r.status_code})", status_code=503)
+
+
+async def build_custom_tx(*, memo: str, amount_cents: int, sender_address: str) -> dict:
+    """Ask the note-builder for the wallet payload of one intent.
+
+    Returns {address, recipientAddress, transactionRequest, note_id} —
+    `transactionRequest` is the base64 the wallet's
+    requestTransaction({type:'Custom'}) deserializes; `note_id` is the
+    note the payer will publish, known here BEFORE payment.
+    """
+    _require_config()
+    if not builder_enabled():
+        raise OnchainError("ONCHAIN_BUILDER_URL not configured on server", status_code=503)
+    body = {
+        "sender_address": validate_sender_address(sender_address),
+        "pay_to_address": ONCHAIN_GATEWAY_ADDRESS,
+        "faucet_id": ONCHAIN_FAUCET_ID,
+        "token_amount": str(token_amount_for_cents(amount_cents)),
+        "memo": memo,
+    }
+    try:
+        r = await _builder_request("POST", "/build", json=body)
+    except httpx.HTTPError as e:
+        raise OnchainError(f"note-builder unreachable: {e}", status_code=502) from None
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    if r.status_code != 200:
+        detail = data.get("error") if isinstance(data, dict) else None
+        # The builder's 4xx are OUR bugs or bad input (validation
+        # mirrors ours), never the payer's fault: report as 502.
+        raise OnchainError(
+            f"note-builder refused (HTTP {r.status_code}): {detail or r.text[:200]}",
+            status_code=502)
+    for key in ("address", "recipientAddress", "transactionRequest", "note_id"):
+        if not isinstance(data.get(key), str) or not data[key]:
+            raise OnchainError(f"note-builder returned no {key}", status_code=502)
+    if data["address"] != body["sender_address"] or data["recipientAddress"] != ONCHAIN_GATEWAY_ADDRESS:
+        raise OnchainError("note-builder returned a payload for other parties", status_code=502)
+    return {k: data[k] for k in ("address", "recipientAddress", "transactionRequest", "note_id")}
+
+
 async def create_payment_request(
     *,
     memo: str,
     amount_cents: int,
     description: str = "Leviathan AI credits",
+    custom_tx: dict | None = None,
 ) -> dict:
     """Build the payment instructions for an intent bound to `memo`.
 
@@ -190,5 +306,10 @@ async def create_payment_request(
             "memo": memo,
             "network": ONCHAIN_NETWORK,
             "description": description,
+            # Server-built wallet payload (build_custom_tx), when the
+            # payer supplied a sender_address: hand it straight to
+            # wallet.requestTransaction({type:'Custom', payload}) — no
+            # client-side SDK needed. Absent = client builds its own.
+            **({"custom_tx": custom_tx} if custom_tx else {}),
         },
     }

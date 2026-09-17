@@ -11,6 +11,7 @@ another consume on the same identity.
 """
 
 import hashlib
+import json
 import os
 import secrets
 from typing import Optional
@@ -972,13 +973,20 @@ async def get_intent_by_memo(
     cur = await conn.execute(
         "SELECT id, identity_id, credits, amount_cents, memo, provider, "
         "       provider_ref, status, created_at, paid_at, expires_at, "
-        "       (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP) "
+        "       (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP), "
+        "       sender_address, custom_tx, expected_note_id "
         "FROM payment_intents WHERE memo = ?",
         (memo,),
     )
     row = await cur.fetchone()
     if not row:
         return None
+    custom_tx = None
+    if row[13]:
+        try:
+            custom_tx = json.loads(row[13])
+        except ValueError:
+            custom_tx = None   # unreadable → behave as "none stored"; checkout rebuilds
     return {
         "intent_id": row[0],
         "identity_id": row[1],
@@ -992,7 +1000,34 @@ async def get_intent_by_memo(
         "paid_at": row[9],
         "expires_at": row[10],
         "is_expired": bool(row[11]),
+        "sender_address": row[12],
+        "custom_tx": custom_tx,
+        "expected_note_id": row[14],
     }
+
+
+async def store_custom_tx(
+    conn: aiosqlite.Connection,
+    memo: str,
+    sender_address: str,
+    custom_tx: dict,
+) -> bool:
+    """Record the server-built wallet payload for a pending intent.
+
+    Overwrites: a payer who switched accounts asks for a payload built for
+    the new sender, and the previous one is unusable from that account
+    anyway. Stored so /checkout returns the SAME note on every retry — a
+    rebuilt payload would be a second payable note for one memo.
+    """
+    cur = await conn.execute(
+        "UPDATE payment_intents "
+        "SET sender_address = ?, custom_tx = ?, expected_note_id = ? "
+        "WHERE memo = ? AND status = 'pending'",
+        (sender_address, json.dumps(custom_tx, separators=(",", ":")),
+         custom_tx.get("note_id"), memo),
+    )
+    await conn.commit()
+    return cur.rowcount == 1
 
 
 async def mark_paid_by_memo(
@@ -1222,7 +1257,11 @@ async def list_pending_onchain_intents(
         # only, NOT a matching input (matching is the note's attachment
         # memo alone). Rails are fixed at creation, so this equals
         # created_at; COALESCE covers rows predating the column.
-        "       COALESCE(onchain_since, created_at) AS matchable_since "
+        "       COALESCE(onchain_since, created_at) AS matchable_since, "
+        # The note the server-built payload will publish (NULL when the
+        # client built its own). Diagnostics today; a future watcher may
+        # treat it as a second, stronger key — it is still not one here.
+        "       expected_note_id "
         "FROM payment_intents "
         f"WHERE {_ONCHAIN_MATCHABLE_SQL} "
         "ORDER BY id",
@@ -1239,6 +1278,7 @@ async def list_pending_onchain_intents(
             "created_at": r[5],
             "expires_at": r[6],
             "matchable_since": r[7],
+            "expected_note_id": r[8],
             "sender_accounts": [],
         }
         for r in rows
