@@ -309,6 +309,7 @@ class AuthClient:
 
     async def create_payment_intent_hashed(
         self, key_hash: str, credits: int, provider: str = "stripe",
+        sender_address: Optional[str] = None,
     ) -> "tuple[Optional[dict], Optional[AuthResult]]":
         """Create a payment intent for the identity behind `key_hash`.
 
@@ -325,6 +326,10 @@ class AuthClient:
                 json={
                     "credential_type": "api_key", "credential_value": key_hash,
                     "credits": credits, "provider": provider,
+                    # The payer's Miden account: lets auth-service build
+                    # the wallet payload server-side (onchain.custom_tx).
+                    # Passed through verbatim; validated by the ledger.
+                    **({"sender_address": sender_address} if sender_address else {}),
                 },
             )
         except httpx.RequestError as e:
@@ -672,9 +677,16 @@ async def wallet_payment_intent(request: Request):
     provider = payload.get("provider", "stripe")
     if not isinstance(provider, str):
         return _wallet_error(WalletAuthError("wallet_invalid_request", "provider must be a string", status=400))
+    # Optional: the payer's Miden account, so the ledger can build the
+    # wallet payload server-side. Only its type is checked here — the
+    # ledger owns the address rules and answers 400 for a bad one.
+    sender_address = payload.get("sender_address")
+    if sender_address is not None and (not isinstance(sender_address, str) or not sender_address):
+        return _wallet_error(WalletAuthError(
+            "wallet_invalid_request", "sender_address must be a non-empty string", status=400))
 
     intent, err = await request.app.state.auth.create_payment_intent_hashed(
-        principal.credential_hash, credits, provider)
+        principal.credential_hash, credits, provider, sender_address=sender_address)
     if err is not None:
         return _deny_response(err)
     return intent

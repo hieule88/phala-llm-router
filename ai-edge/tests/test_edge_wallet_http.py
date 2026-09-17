@@ -293,6 +293,43 @@ class WalletHttpTest(unittest.TestCase):
                          self.edge.app.state.wallet.spend_credential_hash(WALLET_PK))
         self.assertEqual(payload["credits"], 300)
 
+    def test_topup_passes_the_payers_account_through_for_a_server_built_payload(self):
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        body = (b'{"credits": 300, "provider": "onchain", '
+                b'"sender_address": "mtst1ard3m9w34puygyqe5thme4u5dqhsr3np"}')
+        out = self.client.post(
+            "/v1/wallet/payment-intents",
+            headers=self._signed_headers(sk, session_id, "POST", "/v1/wallet/payment-intents", body),
+            content=body)
+        self.assertEqual(out.status_code, 200, out.text)
+        _, payload = next(c for c in reversed(self.ledger_calls) if c[0] == "/v1/payment-intents")
+        # Verbatim pass-through: the ledger owns the address rules.
+        self.assertEqual(payload["sender_address"], "mtst1ard3m9w34puygyqe5thme4u5dqhsr3np")
+        self.assertEqual(payload["provider"], "onchain")
+
+    def test_topup_omits_sender_address_when_the_client_sends_none(self):
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        body = b'{"credits": 300}'
+        self.client.post(
+            "/v1/wallet/payment-intents",
+            headers=self._signed_headers(sk, session_id, "POST", "/v1/wallet/payment-intents", body),
+            content=body)
+        _, payload = next(c for c in reversed(self.ledger_calls) if c[0] == "/v1/payment-intents")
+        self.assertNotIn("sender_address", payload)
+
+    def test_topup_rejects_a_non_string_sender_address(self):
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        body = b'{"credits": 300, "provider": "onchain", "sender_address": 42}'
+        out = self.client.post(
+            "/v1/wallet/payment-intents",
+            headers=self._signed_headers(sk, session_id, "POST", "/v1/wallet/payment-intents", body),
+            content=body)
+        self.assertEqual(out.status_code, 400)
+        self.assertEqual(out.json()["error"]["type"], "wallet_invalid_request")
+
     def test_topup_rejects_non_positive_credits(self):
         res, sk = self._bind()
         session_id = res.json()["session_id"]
