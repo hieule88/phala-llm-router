@@ -30,6 +30,7 @@ reason: the ledger must never credit a cent that wasn't fully paid.
 from __future__ import annotations
 
 import os
+import re
 
 import httpx
 
@@ -154,10 +155,14 @@ def validate_sender_address(sender_address: str) -> str:
     signing); a wrong-but-well-formed address costs nothing: the wallet
     refuses to sign it, and any payload can only ever pay the gateway.
     """
+    # Two spellings are valid: the bare account id (`mtst1…`) and the
+    # wallet's Address form with an interface suffix (`mtst1…_qr7qqq9wr6w`,
+    # from toBech32(network, AccountInterface.BasicWallet)) — the Leviathan
+    # wallet hands dApps the latter, and the SDK parses both.
     if (not isinstance(sender_address, str)
             or not (20 <= len(sender_address) <= 120)
             or not sender_address.startswith(_KNOWN_ADDRESS_PREFIXES)
-            or not all(ch in "abcdefghijklmnopqrstuvwxyz0123456789" for ch in sender_address)):
+            or not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)?", sender_address)):
         raise OnchainError("sender_address must be a Miden bech32 address", status_code=400)
     gateway_prefix = next((p for p in _KNOWN_ADDRESS_PREFIXES
                            if ONCHAIN_GATEWAY_ADDRESS.startswith(p)), None)

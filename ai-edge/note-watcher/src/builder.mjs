@@ -38,9 +38,12 @@ export class BuildError extends Error {
   }
 }
 
+// Both spellings the SDK parses: the bare account id (`mtst1…`) and the
+// wallet's Address form with an interface suffix (`mtst1…_qr7qqq9wr6w`,
+// what the Leviathan wallet hands dApps as `address`).
 function isBech32(addr) {
   return typeof addr === 'string' && addr.length >= 20 && addr.length <= 120
-    && /^[a-z0-9]+$/.test(addr) && KNOWN_PREFIXES.some((p) => addr.startsWith(p));
+    && /^[a-z0-9]+(?:_[a-z0-9]+)?$/.test(addr) && KNOWN_PREFIXES.some((p) => addr.startsWith(p));
 }
 
 function prefixOf(addr) {

@@ -267,6 +267,19 @@ class ServerBuiltPayloadTest(unittest.TestCase):
         self.assertEqual(self._memos(), before)
         self.assertEqual(self._build_calls(), [])
 
+    def test_wallet_style_suffixed_address_is_accepted_verbatim(self):
+        # The Leviathan wallet hands dApps `mtst1…_<interface>` (Address form),
+        # not the bare account id. Rejecting it broke the very first
+        # production attempt; the builder echoes it back unchanged and the
+        # SDK compares that echo with the connected account, so it must
+        # travel verbatim.
+        suffixed = SENDER_A + "_qr7qqq9wr6w"
+        r = self._create(sender=suffixed)
+        self.assertEqual(r.status_code, 201, r.text)
+        tx = r.json()["onchain"]["custom_tx"]
+        self.assertEqual(tx["address"], suffixed)
+        self.assertEqual(self._build_calls()[-1][2]["sender_address"], suffixed)
+
     def test_malformed_sender_is_400_and_no_row(self):
         before = self._memos()
         for bad in ["", "not-an-address", "MTST1UPPERCASE00000000000000000000000",

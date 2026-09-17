@@ -23,6 +23,16 @@ test('validateBuildRequest accepts a server-shaped request', () => {
   assert.equal(v.memo, GOOD.memo);
 });
 
+test('validateBuildRequest accepts the wallet\'s interface-suffixed address form', () => {
+  const suffixed = GOOD.sender_address + '_qr7qqq9wr6w';
+  const v = validateBuildRequest({ ...GOOD, sender_address: suffixed });
+  assert.equal(v.senderAddress, suffixed);   // verbatim — the SDK compares this echo
+  // ...but not two suffixes, an empty suffix, or uppercase
+  for (const bad of [suffixed + '_x', GOOD.sender_address + '_', GOOD.sender_address + '_QR']) {
+    assert.throws(() => validateBuildRequest({ ...GOOD, sender_address: bad }), /sender_address/);
+  }
+});
+
 test('validateBuildRequest refuses each malformed field with a specific reason', () => {
   const cases = [
     [{ ...GOOD, sender_address: 'not-an-address' }, /sender_address/],
@@ -166,6 +176,21 @@ test('real WASM: payload deserializes and carries memo, amount, faucet, sender; 
     assert.equal(assets[0].amount(), 3000000n);
     assert.equal(assets[0].faucetId().toBech32(wasm.NetworkId.testnet()).startsWith(GOOD.faucet_id), true);
     assert.equal(note.metadata().noteType(), wasm.NoteType.Public);
+  });
+
+test('real WASM: the wallet\'s suffixed address form builds and names the same sender',
+  { skip: !sdkPresent && 'SDK not installed' }, async () => {
+    const wasm = await loadWasm();
+    const bare = validateBuildRequest(GOOD);
+    const suffixed = validateBuildRequest({
+      ...GOOD, sender_address: GOOD.sender_address + '_qr7qqq9wr6w' });
+    const a = buildTopupPayload(wasm, bare);
+    const b = buildTopupPayload(wasm, suffixed);
+    const senderOf = (p) => wasm.TransactionRequest.deserialize(
+      new Uint8Array(Buffer.from(p.transactionRequest, 'base64')))
+      .expectedOutputOwnNotes()[0].metadata().sender().toString();
+    assert.equal(senderOf(a), senderOf(b), 'both spellings must resolve to one account id');
+    assert.equal(b.address, GOOD.sender_address + '_qr7qqq9wr6w');   // echoed verbatim
   });
 
 test('real WASM: two builds of one memo are two different notes (random serial)',
