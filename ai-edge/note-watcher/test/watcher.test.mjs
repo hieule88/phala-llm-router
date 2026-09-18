@@ -186,6 +186,67 @@ test('note racing the intent listing is parked, then matched next tick', async (
   assert.deepEqual(state.unmatched, {});
 });
 
+// ── duplicates: a second note for an already-PAID intent ─────────────────
+// The table lists recently paid intents (status:'paid'). Such a note must
+// still be REPORTED — the ledger records the duplicate — but logged as
+// what it is, never as "credited".
+
+const dupBody = {
+  handled: true,
+  result: { success: true, duplicate_payment: { credited_ref: 'miden:0xfirst', duplicate_ref: 'miden:0xn1' } },
+};
+
+test('second note naming a PAID intent is reported and logged as a duplicate, not credited', async () => {
+  const cfg = makeCfg();
+  const log = makeLogCapture();
+  const ledger = makeLedger({ intents: [tableIntent({ status: 'paid' })], reportBody: dupBody });
+  const state = await runTick({ cfg, state: fresh(), chain: makeChain([note()]), ledger, log });
+
+  assert.equal(ledger.reports.length, 1, 'the duplicate IS reported — that is how it gets recorded');
+  assert.equal(ledger.reports[0].memo, 'intent-a');
+  assert.ok(log.lines.alert.some(l => l.includes('suspected DUPLICATE') && l.includes('ALREADY PAID')));
+  assert.ok(log.lines.alert.some(l => l.includes('DUPLICATE PAYMENT recorded') && l.includes('miden:0xfirst')));
+  assert.ok(!log.lines.info.some(l => l.startsWith('credited')), 'must not read like a credit');
+  assert.ok(state.reported['0xn1'], 'settled — never re-reported');
+  assert.deepEqual(state.unmatched, {});
+});
+
+test('a normal credit still logs "credited" and never alerts (old table shape, no status)', async () => {
+  const cfg = makeCfg();
+  const log = makeLogCapture();
+  const ledger = makeLedger({
+    intents: [tableIntent()],                                  // no `status` → treated as pending
+    reportBody: { handled: true, result: { success: true } },
+  });
+  await runTick({ cfg, state: fresh(), chain: makeChain([note()]), ledger, log });
+  assert.ok(log.lines.info.some(l => l === 'credited note=0xn1 memo=intent-a'));
+  assert.ok(log.lines.info.some(l => l.includes('matched via on-note attachment memo')));
+  assert.deepEqual(log.lines.alert, []);
+});
+
+test('wrong-amount note against a PAID intent says "second payment", not "finalise via mark-paid"', async () => {
+  const cfg = makeCfg();
+  const log = makeLogCapture();
+  const ledger = makeLedger({ intents: [tableIntent({ status: 'paid', token_amount: '1000000' })] });
+  const state = await runTick({ cfg, state: fresh(), chain: makeChain([note()]), ledger, log });
+  assert.equal(ledger.reports.length, 0);
+  assert.ok(state.unmatched['0xn1']);
+  const alert = log.lines.alert.find(l => l.includes('attachment mismatch'));
+  assert.ok(alert && alert.includes('ALREADY PAID') && !alert.includes('mark-paid'));
+});
+
+test('unattached-note hints list live intents only, never paid ones', async () => {
+  const cfg = makeCfg();
+  const log = makeLogCapture();
+  const ledger = makeLedger({ intents: [
+    tableIntent({ memo: 'intent-live' }),
+    tableIntent({ memo: 'intent-settled', status: 'paid' }),
+  ] });
+  await runTick({ cfg, state: fresh(), chain: makeChain([note({ attachment: null })]), ledger, log });
+  const alert = log.lines.alert.find(l => l.includes('unattached payment'));
+  assert.ok(alert && alert.includes('intent-live') && !alert.includes('intent-settled'));
+});
+
 test('parked notes keep the block-time anchor for the TTL', async () => {
   // Downtime scenario: the watcher restarts and scans a note whose
   // block committed an hour ago. The unmatched TTL must count from

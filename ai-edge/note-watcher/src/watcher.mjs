@@ -101,8 +101,18 @@ async function drainPending({ state, ledger, log, deadLetterFile }) {
       outcome = classifyReport(res.status);
       detail = res.body?.detail ?? null;
       if (outcome === 'done') {
-        const dedup = res.body?.result?.deduplicated ? ' (deduplicated)' : '';
-        log.info(`credited note=${noteId} memo=${entry.payload.memo}${dedup}`);
+        const result = res.body?.result ?? {};
+        if (result.duplicate_payment) {
+          // 200, but NOT a credit: the ledger recognised a second payment
+          // for an already-credited intent and recorded it. Logging this
+          // as "credited" is how a refund case hides in plain sight.
+          log.alert(`DUPLICATE PAYMENT recorded: note=${noteId} memo=${entry.payload.memo} — `
+            + `intent already credited by ${result.duplicate_payment.credited_ref}; balance `
+            + `credited once, refund the duplicate by hand (usage_log has the row)`);
+        } else {
+          const dedup = result.deduplicated ? ' (deduplicated)' : '';
+          log.info(`credited note=${noteId} memo=${entry.payload.memo}${dedup}`);
+        }
       }
     } catch (err) {
       outcome = 'retry';
@@ -127,8 +137,19 @@ async function drainPending({ state, ledger, log, deadLetterFile }) {
 /** Decide the fate of one qualified note against the current table. */
 function disposition({ note, intents, state, log, faucetId, now }) {
   const verdict = matchNote(note, intents);
+  const rowOf = (memo) => intents.find(i => i.memo === memo);
   if (verdict.kind === 'match') {
-    log.info(`note ${note.noteId} matched via on-note attachment memo`);
+    if (rowOf(verdict.memo)?.status === 'paid') {
+      // The memo names an intent the ledger has ALREADY credited: this
+      // is a second payment. Still reported — mark_paid_by_memo is
+      // where the duplicate gets recorded (usage_log) — but say so now
+      // rather than letting "matched" read like a normal credit.
+      log.alert(`suspected DUPLICATE payment: note ${note.noteId} names intent `
+        + `${verdict.memo}, which is ALREADY PAID — reporting it so the ledger `
+        + `records the duplicate (nothing will be credited twice)`);
+    } else {
+      log.info(`note ${note.noteId} matched via on-note attachment memo`);
+    }
     state.pending[note.noteId] = {
       payload: buildReport(note, verdict.memo, faucetId),
       firstSeenAt: state.unmatched[note.noteId]?.firstSeenAt ?? now,
@@ -150,9 +171,14 @@ function disposition({ note, intents, state, log, faucetId, now }) {
     // Never credited (exact amount stays a hard requirement) — park it
     // and hand ops the named memo, once.
     if (!state.unmatched[note.noteId]?.mismatchAlerted) {
+      // "finalise via mark-paid" is the wrong advice when the intent is
+      // already paid — that note is a second payment, owed back.
+      const advice = rowOf(verdict.memo)?.status === 'paid'
+        ? 'that intent is ALREADY PAID, so this is a second payment with a different '
+          + 'amount — never credited; refund it by hand'
+        : 'never auto-credited; verify the note, then finalise via admin mark-paid';
       log.alert(`attachment mismatch: note=${note.noteId} names memo ${verdict.memo} `
-        + `but paid ${note.amount}, expected ${verdict.expected} — never auto-credited; `
-        + `verify the note, then finalise via admin mark-paid`);
+        + `but paid ${note.amount}, expected ${verdict.expected} — ${advice}`);
     }
     park().mismatchAlerted = true;
     return;
@@ -165,7 +191,9 @@ function disposition({ note, intents, state, log, faucetId, now }) {
     // the 48h dead-letter, and shortlist same-amount intents as a
     // starting point. Alerted once per note; re-matching cannot help.
     if (!state.unmatched[note.noteId]?.unattachedAlerted) {
-      const hints = sameAmountMemos(note, intents);
+      // Candidates for ops are LIVE intents only — a settled one cannot
+      // be what this payment was for.
+      const hints = sameAmountMemos(note, intents.filter(i => i.status !== 'paid'));
       const hint = hints.length > 0
         ? `same-amount intents: ${hints.join(', ')}`
         : 'no same-amount intent live';
@@ -206,10 +234,15 @@ export async function runTick({ cfg, state, chain, ledger, log,
 
   // Matching needs only (memo, exact token_amount) — the memo comes off
   // the note's own attachment, so no time anchors and no sender labels
-  // enter the decision.
+  // enter the decision. `status` is NOT a matching input: the table now
+  // also lists recently PAID intents so a second note naming a settled
+  // memo is reported (and recorded as a duplicate by the ledger) instead
+  // of parking as "unmatched"; status only decides how that is logged.
+  // Older servers omit it → 'pending'.
   const intents = (table.intents ?? []).map(i => ({
     memo: i.memo,
     token_amount: i.token_amount,
+    status: i.status ?? 'pending',
   }));
 
   // 0. Trim settled bookkeeping so the state file stays bounded.

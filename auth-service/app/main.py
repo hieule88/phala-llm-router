@@ -1069,7 +1069,9 @@ async def onchain_webhook_endpoint(request: Request):
 @app.get("/v1/onchain/pending-intents", dependencies=[Depends(require_watcher_token)])
 @limiter.limit(RATE_LIMIT_VALIDATE)
 async def onchain_pending_intents(request: Request):
-    """The note-watcher's matching table: every pending 'onchain' intent
+    """The note-watcher's matching table: every MATCHABLE 'onchain' intent
+    — pending, recently expired, or recently PAID (`status` says which;
+    see handlers.list_pending_onchain_intents for why paid rows stay) —
     with the exact token amount to expect (server-derived, base units —
     the intent's plain price, see onchain_client.token_amount_for_cents).
 

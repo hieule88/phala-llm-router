@@ -448,7 +448,10 @@ class PendingIntentsTest(SetupMixin, unittest.TestCase):
                 # a stripe intent must not appear
                 await handlers.create_intent(
                     conn, identity_id=1, credits=100, provider="stripe")
-                # a PAID onchain intent must not appear
+                # a recently PAID onchain intent DOES appear, flagged
+                # status='paid': a second note naming its memo must be
+                # reported (→ duplicate_payment in usage_log), not parked
+                # as "unmatched" and dead-lettered under a generic message.
                 paid = await handlers.create_intent(
                     conn, identity_id=1, credits=200, provider="onchain")
                 await handlers.mark_paid_by_memo(conn, paid["memo"])
@@ -458,15 +461,93 @@ class PendingIntentsTest(SetupMixin, unittest.TestCase):
                 bare = await handlers.create_intent(
                     conn, identity_id=2, credits=50, provider="onchain")
                 out = await handlers.list_pending_onchain_intents(conn)
-                return kept, bare, out
+                return kept, paid, bare, out
             finally:
                 await conn.close()
 
-        kept, bare, out = run(go())
-        self.assertEqual([i["memo"] for i in out], [kept["memo"], bare["memo"]])
+        kept, paid, bare, out = run(go())
+        self.assertEqual([i["memo"] for i in out], [kept["memo"], paid["memo"], bare["memo"]])
+        self.assertEqual([i["status"] for i in out], ["pending", "paid", "pending"])
+        self.assertIsNone(out[0]["paid_at"])
+        self.assertIsNotNone(out[1]["paid_at"])
         self.assertEqual(out[0]["sender_accounts"], ["mtst1payeraccount000"])
         self.assertEqual(out[0]["amount_cents"], 300)
-        self.assertEqual(out[1]["sender_accounts"], [])
+        self.assertEqual(out[2]["sender_accounts"], [])
+
+    def test_paid_intent_leaves_the_table_after_the_grace_window(self):
+        # Paid rows are matchable only as long as a duplicate is plausible;
+        # past the grace window they leave like everything else, so the
+        # table stays bounded.
+        from app.db import init_db
+        from app import handlers
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_1")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="onchain")
+                await handlers.mark_paid_by_memo(conn, intent["memo"])
+                before = await handlers.list_pending_onchain_intents(conn)
+                await conn.execute(
+                    "UPDATE payment_intents SET paid_at = datetime(CURRENT_TIMESTAMP, ?) "
+                    "WHERE memo = ?",
+                    (f"-{handlers.ONCHAIN_MATCH_GRACE_SECONDS + 3600} seconds", intent["memo"]))
+                await conn.commit()
+                after = await handlers.list_pending_onchain_intents(conn)
+                return before, after
+            finally:
+                await conn.close()
+
+        before, after = run(go())
+        self.assertEqual([i["status"] for i in before], ["paid"])
+        self.assertEqual(after, [])
+
+    def test_second_note_for_a_paid_intent_is_recorded_as_duplicate_via_webhook(self):
+        # End to end on the ledger side of the reviewer's scenario: the
+        # first note credits; a second note with the same memo, reported
+        # later (the watcher now finds the paid row in its table), does
+        # NOT credit again and leaves a durable duplicate_payment row.
+        from app.db import init_db
+        from app import handlers, onchain_client, onchain_webhook
+
+        async def go():
+            conn = await init_db(":memory:")
+            try:
+                await handlers.create_identity(conn, "api_key", "hash_1")
+                intent = await handlers.create_intent(
+                    conn, identity_id=1, credits=300, provider="onchain")
+                units = str(onchain_client.token_amount_for_cents(intent["amount_cents"]))
+                report = lambda note: {  # noqa: E731
+                    "memo": intent["memo"], "note_id": note,
+                    "faucet_id": onchain_client.ONCHAIN_FAUCET_ID,
+                    "amount_base_units": units, "note_kind": "p2id",
+                }
+                first = await onchain_webhook.dispatch(conn, report("0x" + "a" * 64))
+                listed = await handlers.list_pending_onchain_intents(conn)
+                second = await onchain_webhook.dispatch(conn, report("0x" + "b" * 64))
+                bal = (await (await conn.execute(
+                    "SELECT balance FROM balances WHERE identity_id = 1")).fetchone())[0]
+                dups = await (await conn.execute(
+                    "SELECT note FROM usage_log WHERE operation = 'duplicate_payment'")).fetchall()
+                return first, listed, second, bal, dups
+            finally:
+                await conn.close()
+
+        with patch.object(onchain_client, "ONCHAIN_FAUCET_ID", "mtst1azftenneus72ugqqsj9rk7cveqk0eraz"), \
+             patch.object(onchain_client, "ONCHAIN_GATEWAY_ADDRESS", "mtst1gatewayreceivingaccount000000000"):
+            first, listed, second, bal, dups = run(go())
+        self.assertTrue(first["result"]["success"])
+        self.assertNotIn("duplicate_payment", first["result"])
+        # the paid intent is still in the watcher's table, flagged
+        self.assertEqual([i["status"] for i in listed], ["paid"])
+        # the second note: handled, not credited, recorded
+        self.assertTrue(second["result"]["success"])
+        self.assertEqual(second["result"]["duplicate_payment"]["credited_ref"], "miden:0x" + "a" * 64)
+        self.assertEqual(second["result"]["duplicate_payment"]["duplicate_ref"], "miden:0x" + "b" * 64)
+        self.assertEqual(bal, 300)
+        self.assertEqual(len(dups), 1)
+        self.assertIn("b" * 64, dups[0][0])
 
     def test_expired_pending_intent_stays_listed(self):
         # The webhook honours late payments (allow_expired), so the watcher

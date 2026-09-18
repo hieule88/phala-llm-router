@@ -104,17 +104,36 @@ for _name, _val in (("ONCHAIN_INTENT_TTL_SECONDS", ONCHAIN_INTENT_TTL_SECONDS),
         raise RuntimeError(f"{_name} must be > 0 (got {_val})")
 
 # SQL fragment selecting on-chain intents that are still MATCHABLE by
-# the note-watcher: pending, or lazily flipped to 'expired' but still
-# inside the grace window (the webhook credits those via allow_expired).
-# Takes one bound parameter: the negative grace modifier string.
+# the note-watcher:
+#   * pending, or lazily flipped to 'expired', while still inside the
+#     grace window past expires_at (the webhook credits those via
+#     allow_expired);
+#   * PAID, for the same grace window past paid_at. Not to credit again —
+#     so a SECOND note carrying a settled memo is REPORTED and lands in
+#     mark_paid_by_memo, whose provider_ref comparison records it as a
+#     'duplicate_payment' in usage_log. Without this the second note
+#     found no row, parked as "unmatched" and dead-lettered 48h later
+#     under a generic message, and the duplicate detector only ever saw
+#     two notes that arrived in the same watcher tick.
+# Takes TWO bound parameters: the negative grace modifier string, twice
+# (see _matchable_params).
 _ONCHAIN_MATCHABLE_SQL = (
-    "provider = 'onchain' AND status IN ('pending', 'expired') "
-    "AND expires_at > datetime(CURRENT_TIMESTAMP, ?)"
+    "provider = 'onchain' AND ("
+    "  (status IN ('pending', 'expired') "
+    "   AND expires_at > datetime(CURRENT_TIMESTAMP, ?)) "
+    "  OR (status = 'paid' AND paid_at IS NOT NULL "
+    "      AND paid_at > datetime(CURRENT_TIMESTAMP, ?))"
+    ")"
 )
 
 
 def _grace_modifier() -> str:
     return f"-{ONCHAIN_MATCH_GRACE_SECONDS} seconds"
+
+
+def _matchable_params() -> tuple:
+    """Bound parameters for _ONCHAIN_MATCHABLE_SQL, in order."""
+    return (_grace_modifier(), _grace_modifier())
 
 
 # How long an idempotency replay stays free. Covers genuine network-drop
@@ -1250,6 +1269,12 @@ async def list_pending_onchain_intents(
     forever, so past the grace window a late payment becomes an ops
     case. expires_at is returned so the watcher can prioritise fresh
     intents.
+
+    Also matchable: intents PAID within the grace window past paid_at,
+    returned with status='paid'. Never to credit twice — so that a
+    SECOND note naming a settled memo is reported rather than parked:
+    mark_paid_by_memo then compares provider_refs and records the
+    'duplicate_payment' in usage_log, the evidence a refund is owed.
     """
     cur = await conn.execute(
         "SELECT id, identity_id, memo, credits, amount_cents, created_at, expires_at, "
@@ -1261,11 +1286,15 @@ async def list_pending_onchain_intents(
         # The note the server-built payload will publish (NULL when the
         # client built its own). Diagnostics today; a future watcher may
         # treat it as a second, stronger key — it is still not one here.
-        "       expected_note_id "
+        "       expected_note_id, "
+        # 'pending' | 'expired' | 'paid'. The watcher matches regardless
+        # (memo + exact amount) and reports; `status` only decides how it
+        # LOGS — a match against a 'paid' row is a suspected duplicate.
+        "       status, paid_at "
         "FROM payment_intents "
         f"WHERE {_ONCHAIN_MATCHABLE_SQL} "
         "ORDER BY id",
-        (_grace_modifier(),),
+        _matchable_params(),
     )
     rows = await cur.fetchall()
     intents = [
@@ -1279,6 +1308,8 @@ async def list_pending_onchain_intents(
             "expires_at": r[6],
             "matchable_since": r[7],
             "expected_note_id": r[8],
+            "status": r[9],
+            "paid_at": r[10],
             "sender_accounts": [],
         }
         for r in rows
