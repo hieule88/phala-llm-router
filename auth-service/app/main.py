@@ -771,6 +771,7 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
                     memo=result["memo"],
                     amount_cents=result["amount_cents"],
                     sender_address=req.sender_address,
+                    token_amount=result["token_amount"],   # the frozen quote
                 )
                 await handlers.store_custom_tx(
                     app.state.db, result["memo"], req.sender_address, custom_tx)
@@ -778,6 +779,7 @@ async def create_payment_intent(request: Request, req: CreatePaymentIntentReques
                 memo=result["memo"],
                 amount_cents=result["amount_cents"],
                 custom_tx=custom_tx,
+                token_amount=result["token_amount"],
             )
             result["invoice_url"] = invoice["invoice_url"]
             result["invoice_id"] = invoice["invoice_id"]
@@ -857,6 +859,9 @@ async def _custom_tx_for_checkout(
         memo=intent["memo"],
         amount_cents=intent["amount_cents"],
         sender_address=sender_address,
+        # A rebuild pays the SAME quoted figure as the original payload —
+        # never a re-price from the live rate.
+        token_amount=intent.get("token_amount"),
     )
     await handlers.store_custom_tx(app.state.db, intent["memo"], sender_address, custom_tx)
     return custom_tx
@@ -970,6 +975,7 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
                 memo=intent["memo"],
                 amount_cents=intent["amount_cents"],
                 custom_tx=custom_tx,
+                token_amount=intent.get("token_amount"),
             )
         except onchain_client.OnchainError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
@@ -1133,8 +1139,13 @@ async def onchain_pending_intents(request: Request):
     """
     intents = await handlers.list_pending_onchain_intents(app.state.db)
     for intent in intents:
-        intent["token_amount"] = str(
-            onchain_client.token_amount_for_cents(intent["amount_cents"]))
+        # The QUOTED figure, frozen on the row at creation — what the
+        # payer's payload carries. Only rows predating the column (NULL)
+        # are priced from the live rate; for everything else a rate
+        # change must not turn an in-flight payment into a mismatch.
+        if not intent.get("token_amount"):
+            intent["token_amount"] = str(
+                onchain_client.token_amount_for_cents(intent["amount_cents"]))
     return {
         "pay_to_address": onchain_client.ONCHAIN_GATEWAY_ADDRESS,
         "faucet_id": onchain_client.ONCHAIN_FAUCET_ID,

@@ -211,13 +211,36 @@ async def preflight_builder() -> None:
             f"note-builder not ready (HTTP {r.status_code})", status_code=503)
 
 
-async def build_custom_tx(*, memo: str, amount_cents: int, sender_address: str) -> dict:
+def _quoted_units(amount_cents: int, token_amount: str | None) -> int:
+    """The base units an intent is payable for.
+
+    `token_amount` is the figure FROZEN on the intent row at creation;
+    when present it is authoritative and the live rate is not consulted,
+    so a later ONCHAIN_CENTS_PER_TOKEN / decimals change reprices new
+    intents only. None (rows predating the column) falls back to the
+    live rate — the pre-freeze behaviour, unchanged for those rows.
+    """
+    if token_amount:
+        if not isinstance(token_amount, str) or not token_amount.isdigit() or int(token_amount) <= 0:
+            raise OnchainError(
+                f"stored token_amount {token_amount!r} is not a positive base-unit figure",
+                status_code=500)
+        return int(token_amount)
+    return token_amount_for_cents(amount_cents)
+
+
+async def build_custom_tx(
+    *, memo: str, amount_cents: int, sender_address: str, token_amount: str | None = None,
+) -> dict:
     """Ask the note-builder for the wallet payload of one intent.
 
     Returns {address, recipientAddress, transactionRequest, note_id} —
     `transactionRequest` is the base64 the wallet's
     requestTransaction({type:'Custom'}) deserializes; `note_id` is the
     note the payer will publish, known here BEFORE payment.
+
+    `token_amount` is the intent's frozen quote (see _quoted_units): a
+    rebuild pays exactly what the original payload did.
     """
     _require_config()
     if not builder_enabled():
@@ -226,7 +249,7 @@ async def build_custom_tx(*, memo: str, amount_cents: int, sender_address: str) 
         "sender_address": validate_sender_address(sender_address),
         "pay_to_address": ONCHAIN_GATEWAY_ADDRESS,
         "faucet_id": ONCHAIN_FAUCET_ID,
-        "token_amount": str(token_amount_for_cents(amount_cents)),
+        "token_amount": str(_quoted_units(amount_cents, token_amount)),
         "memo": memo,
     }
     try:
@@ -258,6 +281,7 @@ async def create_payment_request(
     amount_cents: int,
     description: str = "Leviathan AI credits",
     custom_tx: dict | None = None,
+    token_amount: str | None = None,
 ) -> dict:
     """Build the payment instructions for an intent bound to `memo`.
 
@@ -286,7 +310,8 @@ async def create_payment_request(
     network call here.
     """
     _require_config()
-    base_units = token_amount_for_cents(amount_cents)
+    # The frozen quote when the intent has one; live rate only for legacy rows.
+    base_units = _quoted_units(amount_cents, token_amount)
 
     return {
         # The wallet's QR format is address-only (`miden:<address>`); amount

@@ -946,10 +946,17 @@ async def create_intent(
         # sees a literal like '+86400 seconds' — the concatenation form
         # `'+' || ? || ' seconds'` is fragile across driver versions.
         expires_modifier = f"+{ttl_seconds} seconds"
+        # The quote, frozen. Computed ONCE here from the live rate and
+        # stored as a decimal string; the watcher, the webhook and any
+        # /checkout rebuild compare against this figure, so a later change
+        # to ONCHAIN_CENTS_PER_TOKEN / decimals reprices new intents only.
+        token_amount = (str(onchain_client.token_amount_for_cents(amount_cents))
+                        if provider == "onchain" else None)
+
         cur = await conn.execute(
             "INSERT INTO payment_intents "
             "  (identity_id, credits, amount_cents, memo, provider, status, expires_at, "
-            "   onchain_since) "
+            "   onchain_since, token_amount) "
             "VALUES (?, ?, ?, ?, ?, 'pending', "
             "        datetime(CURRENT_TIMESTAMP, ?), "
             # When the intent entered the on-chain rail; NULL for other
@@ -957,10 +964,11 @@ async def create_intent(
             # created_at — it is kept for audit/forensics only and is NOT
             # an input to matching (the watcher matches on the note's
             # attachment memo alone).
-            "        CASE WHEN ? = 'onchain' THEN CURRENT_TIMESTAMP END) "
+            "        CASE WHEN ? = 'onchain' THEN CURRENT_TIMESTAMP END, "
+            "        ?) "
             "RETURNING id, expires_at",
             (identity_id, credits, amount_cents, memo, provider, expires_modifier,
-             provider),
+             provider, token_amount),
         )
         row = await cur.fetchone()
         return {
@@ -973,6 +981,7 @@ async def create_intent(
             "provider": provider,
             "status": "pending",
             "expires_at": row[1],
+            "token_amount": token_amount,
         }
 
 
@@ -993,7 +1002,7 @@ async def get_intent_by_memo(
         "SELECT id, identity_id, credits, amount_cents, memo, provider, "
         "       provider_ref, status, created_at, paid_at, expires_at, "
         "       (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP), "
-        "       sender_address, custom_tx, expected_note_id "
+        "       sender_address, custom_tx, expected_note_id, token_amount "
         "FROM payment_intents WHERE memo = ?",
         (memo,),
     )
@@ -1022,6 +1031,10 @@ async def get_intent_by_memo(
         "sender_address": row[12],
         "custom_tx": custom_tx,
         "expected_note_id": row[14],
+        # Frozen quoted base units (decimal string) or None for rows that
+        # predate the column / other rails — callers fall back to the live
+        # rate ONLY in the None case.
+        "token_amount": row[15],
     }
 
 
@@ -1290,7 +1303,11 @@ async def list_pending_onchain_intents(
         # 'pending' | 'expired' | 'paid'. The watcher matches regardless
         # (memo + exact amount) and reports; `status` only decides how it
         # LOGS — a match against a 'paid' row is a suspected duplicate.
-        "       status, paid_at "
+        "       status, paid_at, "
+        # The quote frozen at creation (decimal base units) — the figure
+        # the payer's payload carries. NULL on rows predating the column;
+        # the route then prices from the live rate, as it always did.
+        "       token_amount "
         "FROM payment_intents "
         f"WHERE {_ONCHAIN_MATCHABLE_SQL} "
         "ORDER BY id",
@@ -1310,6 +1327,7 @@ async def list_pending_onchain_intents(
             "expected_note_id": r[8],
             "status": r[9],
             "paid_at": r[10],
+            "token_amount": r[11],
             "sender_accounts": [],
         }
         for r in rows

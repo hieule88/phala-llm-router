@@ -111,7 +111,15 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     -- NULL when the client built its own note (legacy path).
     sender_address   TEXT,
     custom_tx        TEXT,
-    expected_note_id TEXT
+    expected_note_id TEXT,
+    -- The QUOTED price in token base units, frozen at creation for
+    -- 'onchain' intents (decimal string: base units exceed 2^53). Every
+    -- later comparison — the watcher's matching table, the webhook's
+    -- exact-amount guard, a /checkout rebuild — reads THIS, never the
+    -- live ONCHAIN_CENTS_PER_TOKEN / decimals: a rate change must only
+    -- price NEW intents, not turn every in-flight payment into a
+    -- mismatch. NULL for other rails and for rows predating the column.
+    token_amount     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payment_intents_identity
@@ -284,6 +292,9 @@ async def _run_light_migrations(conn: aiosqlite.Connection) -> None:
         "ALTER TABLE payment_intents ADD COLUMN sender_address TEXT",
         "ALTER TABLE payment_intents ADD COLUMN custom_tx TEXT",
         "ALTER TABLE payment_intents ADD COLUMN expected_note_id TEXT",
+        # Frozen quoted token amount (see the CREATE above). Rows predating
+        # it are NULL and keep being priced from the live rate, as before.
+        "ALTER TABLE payment_intents ADD COLUMN token_amount TEXT",
     ]
     for stmt in migrations:
         try:

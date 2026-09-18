@@ -114,6 +114,7 @@ class ServerBuiltPayloadTest(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory()
         db_path = os.path.join(cls._tmp.name, "auth.db")
+        cls.db_path = db_path
 
         async def fake_init():
             return await real_init_db(db_path)
@@ -409,6 +410,76 @@ class ServerBuiltPayloadTest(unittest.TestCase):
                                    "sender_address": SENDER_B})
         self.assertEqual(r.status_code, 401, r.text)
         self.assertEqual(len(self._build_calls()), builds_before)
+
+    # ── the quote is frozen: a rate change prices NEW intents only ─────
+    # Reviewer finding (2026-09-18): the payload fixed the token amount at
+    # build time, but the matching table and the webhook recomputed the
+    # expectation from the live rate. Changing ONCHAIN_CENTS_PER_TOKEN (or
+    # decimals) inside the 24h TTL + 48h grace turned every real in-flight
+    # note into a mismatch → 409 → dead-letter.
+
+    def _webhook(self, memo, units):
+        return self.client.post(
+            "/v1/webhooks/onchain",
+            headers={"authorization": f"Bearer {WATCHER}"},
+            json={"memo": memo, "note_id": "0x" + hashlib.sha256(f"{memo}{units}".encode()).hexdigest(),
+                  "faucet_id": FAUCET, "amount_base_units": str(units), "note_kind": "p2id"},
+        )
+
+    def test_rate_change_after_creation_does_not_break_an_in_flight_payment(self):
+        j = self._create().json()
+        memo = j["memo"]
+        quoted = int(j["onchain"]["token_amount"])
+        self.assertEqual(j["token_amount"], str(quoted))                 # frozen on the row
+        self.assertEqual(self._build_calls()[-1][2]["token_amount"], str(quoted))
+
+        # Operator doubles the token price while the order is open.
+        with patch.object(onchain_client, "ONCHAIN_CENTS_PER_TOKEN",
+                          onchain_client.ONCHAIN_CENTS_PER_TOKEN * 2):
+            repriced = onchain_client.token_amount_for_cents(j["amount_cents"])
+            self.assertNotEqual(repriced, quoted, "test premise: the live rate now differs")
+
+            # 1. The watcher's table still names the QUOTED figure.
+            row = next(i for i in self._matching_table() if i["memo"] == memo)
+            self.assertEqual(row["token_amount"], str(quoted))
+
+            # 2. A /checkout rebuild for another account pays the SAME quote.
+            r = self._checkout(memo, sender=SENDER_B, credential=KEY_HASH)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["onchain"]["token_amount"], str(quoted))
+            self.assertEqual(self._build_calls()[-1][2]["token_amount"], str(quoted))
+
+            # 3. A note paying today's re-priced figure is NOT the quote → refused…
+            r = self._webhook(memo, repriced)
+            self.assertEqual(r.status_code, 409, r.text)
+
+            # 4. …and the note paying the quote is credited at the quoted PRICE.
+            r = self._webhook(memo, quoted)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(r.json()["result"]["success"])
+        status = self.client.get(f"/v1/payment-intents/{memo}").json()
+        self.assertEqual(status["status"], "paid")
+        self.assertEqual(status["credits"], j["credits"])
+
+    def test_legacy_row_without_a_frozen_quote_is_priced_from_the_live_rate(self):
+        # Rows created before the column exist in production; for them the
+        # pre-freeze behaviour is preserved exactly.
+        import sqlite3
+        j = self._create(sender=None).json()
+        memo = j["memo"]
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE payment_intents SET token_amount = NULL WHERE memo = ?", (memo,))
+        with patch.object(onchain_client, "ONCHAIN_CENTS_PER_TOKEN",
+                          onchain_client.ONCHAIN_CENTS_PER_TOKEN * 2):
+            live = str(onchain_client.token_amount_for_cents(j["amount_cents"]))
+            row = next(i for i in self._matching_table() if i["memo"] == memo)
+            self.assertEqual(row["token_amount"], live)
+            r = self._webhook(memo, int(live))
+            self.assertEqual(r.status_code, 200, r.text)
+
+    def test_stripe_intents_carry_no_token_quote(self):
+        j = self._create(provider="stripe", sender=None).json()
+        self.assertIsNone(j.get("token_amount"))
 
     def test_bad_credential_on_a_stripe_intent_never_mints_a_checkout_session(self):
         # Ownership is checked BEFORE the provider call on every rail: a

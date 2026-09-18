@@ -160,8 +160,17 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
         raise WebhookError(
             400, f"intent {p['memo']} is not an onchain intent")
     if intent is not None:
-        expected_units = onchain_client.token_amount_for_cents(
-            intent["amount_cents"])
+        # The figure the payer was QUOTED — frozen on the row at creation
+        # (the payload carries exactly this). Only legacy rows without it
+        # are priced from the live rate. Recomputing here from env used to
+        # turn every in-flight payment into a 409 whenever the operator
+        # changed ONCHAIN_CENTS_PER_TOKEN or decimals inside the 24h TTL +
+        # 48h grace window.
+        try:
+            expected_units = onchain_client._quoted_units(
+                intent["amount_cents"], intent.get("token_amount"))
+        except onchain_client.OnchainError as e:
+            raise WebhookError(e.status_code, e.detail) from None
         if p["amount_base_units"] != expected_units:
             direction = ("underpaid" if p["amount_base_units"] < expected_units
                          else "amount mismatch")
@@ -179,8 +188,15 @@ async def dispatch(conn: aiosqlite.Connection, payload: dict) -> dict:
                 (f"{direction}: intent expects exactly {expected_units} "
                  f"base units, got {p['amount_base_units']}"),
             )
+        # Exact match against the quote means the quoted PRICE was paid in
+        # full, by definition — so the cents handed to the ledger are the
+        # intent's own amount_cents, not a re-conversion of the units at
+        # today's rate (which, after a rate change, would read as under-
+        # or over-payment of a price that has not changed).
+        actual_cents = intent["amount_cents"]
     # intent None falls through: mark_paid_by_memo reports 'intent not
-    # found' through the standard fail-loud path.
+    # found' through the standard fail-loud path (actual_cents keeps the
+    # live-rate conversion computed above, for the log line only).
 
     # One note, one credit — ever. A replay of the SAME (note, memo) pair
     # is the ordinary retry case and proceeds into mark_paid's dedup; the
