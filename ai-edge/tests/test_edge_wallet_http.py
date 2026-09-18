@@ -98,6 +98,19 @@ class WalletHttpTest(unittest.TestCase):
             })
         if path == "/v1/validate":
             return httpx.Response(200, json={"valid": True, "identity_id": 7, "balance": 49})
+        if path.startswith("/v1/payment-intents/") and path.endswith("/checkout"):
+            memo = path.split("/")[3]
+            if memo == "memo_paid":
+                return httpx.Response(409, json={"detail": "intent is paid, cannot create checkout"})
+            if body.get("credential_value") == "not-the-owner":
+                return httpx.Response(403, json={"detail": "credential does not own this intent"})
+            return httpx.Response(200, json={
+                "memo": memo, "provider": "onchain", "invoice_url": "miden:mtst1gw",
+                "invoice_id": None, "amount_cents": 300, "credits": 300,
+                "onchain": {"custom_tx": {
+                    "address": body.get("sender_address"), "recipientAddress": "mtst1gw",
+                    "transactionRequest": "QUJD", "note_id": "0x" + "1" * 64}},
+            })
         if path == "/v1/payment-intents":
             return httpx.Response(201, json={
                 "success": True, "intent_id": 3, "identity_id": 7,
@@ -327,6 +340,56 @@ class WalletHttpTest(unittest.TestCase):
             "/v1/wallet/payment-intents",
             headers=self._signed_headers(sk, session_id, "POST", "/v1/wallet/payment-intents", body),
             content=body)
+        self.assertEqual(out.status_code, 400)
+        self.assertEqual(out.json()["error"]["type"], "wallet_invalid_request")
+
+    # ── /v1/wallet/payment-intents/{memo}/checkout ───────────────────────
+
+    def _checkout(self, sk, session_id, memo, body: bytes):
+        path = f"/v1/wallet/payment-intents/{memo}/checkout"
+        return self.client.post(
+            path, headers=self._signed_headers(sk, session_id, "POST", path, body), content=body)
+
+    def test_wallet_checkout_vouches_for_the_owner_and_passes_the_sender(self):
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        body = b'{"sender_address": "mtst1ard3m9w34puygyqe5thme4u5dqhsr3np_qr7qqq9wr6w"}'
+        out = self._checkout(sk, session_id, "memo_abc123", body)
+        self.assertEqual(out.status_code, 200, out.text)
+        j = out.json()
+        self.assertEqual(j["onchain"]["custom_tx"]["address"],
+                         "mtst1ard3m9w34puygyqe5thme4u5dqhsr3np_qr7qqq9wr6w")
+        path, payload = next(c for c in reversed(self.ledger_calls) if c[0].endswith("/checkout"))
+        self.assertEqual(path, "/v1/payment-intents/memo_abc123/checkout")
+        # The ledger receives the wallet's DERIVED credential — the proof of
+        # ownership a browser never holds — plus the sender verbatim.
+        self.assertEqual(payload["credential_type"], "api_key")
+        self.assertEqual(payload["credential_value"],
+                         self.edge.app.state.wallet.spend_credential_hash(WALLET_PK))
+        self.assertEqual(payload["sender_address"],
+                         "mtst1ard3m9w34puygyqe5thme4u5dqhsr3np_qr7qqq9wr6w")
+
+    def test_wallet_checkout_passes_the_ledgers_status_through(self):
+        # 409 (no longer payable) must reach the SDK as 409 — it maps that
+        # to topup_not_pending and creates a fresh order.
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        out = self._checkout(sk, session_id, "memo_paid", b"{}")
+        self.assertEqual(out.status_code, 409, out.text)
+        self.assertEqual(out.json()["error"]["type"], "topup_not_pending")
+        self.assertIn("paid", out.json()["error"]["message"])
+
+    def test_wallet_checkout_requires_a_wallet_session_and_a_sane_memo(self):
+        out = self.client.post(
+            "/v1/wallet/payment-intents/memo_abc123/checkout",
+            headers={"authorization": "Bearer lev_plainkey", "content-type": "application/json"},
+            content=b"{}")
+        self.assertEqual(out.status_code, 400)
+        self.assertEqual(out.json()["error"]["type"], "wallet_required")
+
+        res, sk = self._bind()
+        session_id = res.json()["session_id"]
+        out = self._checkout(sk, session_id, "memo with spaces", b"{}")
         self.assertEqual(out.status_code, 400)
         self.assertEqual(out.json()["error"]["type"], "wallet_invalid_request")
 

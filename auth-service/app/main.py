@@ -801,9 +801,15 @@ class CheckoutRequest(BaseModel):
     sender_address: Optional[str] = Field(None,
         description="'onchain' only: the payer's Miden account. Returns the "
                     "payload stored at creation when it was built for this "
-                    "account; (re)builds and stores a new one when the payer "
-                    "switched accounts or none was built yet. Omit to get "
-                    "whatever is stored (possibly nothing).")
+                    "account (no credential needed). Naming a DIFFERENT "
+                    "account — or asking for a first build — is a WRITE and "
+                    "requires the order owner's credential below; without it "
+                    "the request is refused (403) and nothing is changed.")
+    credential_type: Optional[str] = Field(None,
+        description="With credential_value: proves the caller owns the intent, "
+                    "which alone permits (re)building the wallet payload. The "
+                    "Edge fills these in for a wallet session.")
+    credential_value: Optional[str] = None
 
 
 # Rails a checkout can be built for. 'manual' is allowed at intent
@@ -811,7 +817,9 @@ class CheckoutRequest(BaseModel):
 _CHECKOUT_PROVIDERS = ("stripe", "onchain")
 
 
-async def _custom_tx_for_checkout(intent: dict, sender_address: Optional[str]) -> Optional[dict]:
+async def _custom_tx_for_checkout(
+    intent: dict, sender_address: Optional[str], owner_verified: bool,
+) -> Optional[dict]:
     """The wallet payload to hand out for an existing on-chain intent.
 
     Prefer what is STORED: the same payload on every retry means the same
@@ -821,6 +829,15 @@ async def _custom_tx_for_checkout(intent: dict, sender_address: Optional[str]) -
     sender; the wallet signs only for its own account) — or when nothing
     was built yet (the intent predates server-built payloads, or its
     build failed transiently at creation).
+
+    A rebuild is a WRITE and is gated on `owner_verified`: this route is
+    otherwise public (anyone holding the memo may re-read instructions,
+    because paying can only ever credit the owner), and the memo is not a
+    secret — it travels in the note attachment and is public on-chain.
+    Left open, anyone with a memo could make the builder work on demand
+    and overwrite `expected_note_id`, turning that field into something
+    reconciliation could no longer trust. Reads stay unauthenticated;
+    only the write needs the owner.
     """
     stored = intent.get("custom_tx")
     if sender_address is None:
@@ -828,6 +845,14 @@ async def _custom_tx_for_checkout(intent: dict, sender_address: Optional[str]) -
     onchain_client.validate_sender_address(sender_address)
     if stored and intent.get("sender_address") == sender_address:
         return stored
+    if not owner_verified:
+        raise HTTPException(
+            status_code=403,
+            detail=("preparing the wallet payload for another account requires "
+                    "the order owner's credential — go through your authenticated "
+                    "wallet session (the SDK's retryCheckout does), or pay from the "
+                    "account the order was created with"),
+        )
     custom_tx = await onchain_client.build_custom_tx(
         memo=intent["memo"],
         amount_cents=intent["amount_cents"],
@@ -842,9 +867,12 @@ async def _custom_tx_for_checkout(intent: dict, sender_address: Optional[str]) -
 async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutRequest):
     """Retry-friendly checkout creation for an existing pending intent.
 
-    Rebuilding instructions needs no auth — anyone with the memo may ask
+    RE-READING instructions needs no auth — anyone with the memo may ask
     for them, because paying always credits the intent's ORIGINAL
-    identity, fixed at intent-create.
+    identity, fixed at intent-create. (Re)PREPARING the on-chain wallet
+    payload for a named account is a write and does need the owner's
+    credential (see _custom_tx_for_checkout); the Edge supplies it for a
+    wallet session.
 
     An intent's RAIL is fixed at creation and this endpoint will not move
     it. Moving one was possible in an earlier revision and it opened a
@@ -911,6 +939,22 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             status_code=400,
             detail=f"intent provider {provider!r} has no checkout to create")
 
+    # Optional proof of ownership — checked BEFORE any provider call, so a
+    # bad credential never costs a Stripe Checkout Session or a build. Any
+    # credential offered is verified, and "unknown" and "someone else's"
+    # get the same answer so a guesser learns nothing about which
+    # credentials exist.
+    owner_verified = False
+    if req.credential_type is not None or req.credential_value is not None:
+        if (req.credential_type not in handlers.AUTHENTICATOR_CREDENTIAL_TYPES
+                or not req.credential_value):
+            raise HTTPException(status_code=401, detail="invalid credential")
+        owner = await handlers.lookup_identity(
+            app.state.db, req.credential_type, req.credential_value)
+        if owner is None or owner != intent["identity_id"]:
+            raise HTTPException(status_code=403, detail="credential does not own this intent")
+        owner_verified = True
+
     if provider == "stripe":
         try:
             invoice = await stripe_client.create_checkout_session(
@@ -921,7 +965,7 @@ async def create_checkout_for_intent(request: Request, memo: str, req: CheckoutR
             raise HTTPException(status_code=e.status_code, detail=e.detail) from None
     else:   # 'onchain' — the only other member of _CHECKOUT_PROVIDERS
         try:
-            custom_tx = await _custom_tx_for_checkout(intent, req.sender_address)
+            custom_tx = await _custom_tx_for_checkout(intent, req.sender_address, owner_verified)
             invoice = await onchain_client.create_payment_request(
                 memo=intent["memo"],
                 amount_cents=intent["amount_cents"],

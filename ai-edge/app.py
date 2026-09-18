@@ -49,6 +49,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -342,6 +343,37 @@ class AuthClient:
             status = DENY_UNAUTH if r.status_code in (400, 401) else DENY_DOWN
             return None, AuthResult(status, error=str(detail or f"auth returned {r.status_code}"))
         return r.json(), None
+
+    async def checkout_payment_intent_hashed(
+        self, key_hash: str, memo: str, sender_address: Optional[str] = None,
+    ) -> "tuple[int, dict]":
+        """Reopen an existing intent's payment instructions for the wallet
+        behind `key_hash`, vouching for it with its derived credential.
+
+        The ledger's /checkout is public for READS, but (re)preparing the
+        on-chain wallet payload for a named account is a write that needs
+        the order owner's credential — which a browser never holds. The
+        Edge supplies it here, exactly as it does for intent creation.
+
+        Returns (status, json) VERBATIM rather than an AuthResult: the
+        ledger's 403 (not the owner) / 404 / 409 (no longer payable) carry
+        meaning the SDK acts on, and collapsing them would lose it.
+        """
+        try:
+            r = await self._c.post(
+                f"{AUTH_SERVICE_URL}/v1/payment-intents/{memo}/checkout",
+                json={
+                    "credential_type": "api_key", "credential_value": key_hash,
+                    **({"sender_address": sender_address} if sender_address else {}),
+                },
+            )
+        except httpx.RequestError as e:
+            return 503, {"detail": f"auth unreachable: {e}"}
+        try:
+            data = r.json()
+        except ValueError:
+            data = {"detail": r.text[:200]}
+        return r.status_code, data if isinstance(data, dict) else {"detail": str(data)[:200]}
 
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -690,6 +722,74 @@ async def wallet_payment_intent(request: Request):
     if err is not None:
         return _deny_response(err)
     return intent
+
+
+_MEMO_SHAPE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+# Ledger status → error type the SDK understands (toError reads .error.type).
+_CHECKOUT_ERROR_TYPES = {
+    400: "wallet_invalid_request",
+    401: "unauth",
+    403: "topup_not_owner",
+    404: "topup_not_pending",
+    409: "topup_not_pending",
+    502: "auth_down",
+    503: "auth_down",
+}
+
+
+@app.post("/v1/wallet/payment-intents/{memo}/checkout")
+async def wallet_payment_intent_checkout(request: Request, memo: str):
+    """Reopen an unpaid top-up's payment instructions for the wallet that
+    owns it — the authenticated counterpart of the ledger's public
+    /v1/payment-intents/{memo}/checkout.
+
+    Reading instructions is public and stays so. But (re)PREPARING the
+    on-chain wallet payload for a named account is a write the ledger
+    only performs for the order owner: memos travel in the note
+    attachment and are public on-chain, so an open write would let
+    anyone drive the builder and overwrite the note id kept for
+    reconciliation. The Edge proves ownership the same way it does at
+    intent creation — the wallet session's derived credential hash.
+
+    Status codes from the ledger pass through unchanged (403/404/409 mean
+    things to the client); the body is reshaped to the Edge's error form.
+    """
+    body = await request.body()
+    path = f"/v1/wallet/payment-intents/{memo}/checkout"
+    try:
+        principal = await _resolve_principal(request, path, body, None)
+    except WalletAuthError as exc:
+        return _wallet_error(exc)
+    if principal.session is None:
+        return _wallet_error(WalletAuthError(
+            "wallet_required", "only a wallet session can reopen a wallet top-up", status=400))
+    if not _MEMO_SHAPE.fullmatch(memo):
+        return _wallet_error(WalletAuthError("wallet_invalid_request", "invalid memo", status=400))
+
+    try:
+        payload = json.loads(body or b"{}")
+    except ValueError:
+        return _wallet_error(WalletAuthError("wallet_invalid_request", "body must be JSON", status=400))
+    if not isinstance(payload, dict):
+        return _wallet_error(WalletAuthError("wallet_invalid_request", "body must be a JSON object", status=400))
+    sender_address = payload.get("sender_address")
+    if sender_address is not None and (not isinstance(sender_address, str) or not sender_address):
+        return _wallet_error(WalletAuthError(
+            "wallet_invalid_request", "sender_address must be a non-empty string", status=400))
+
+    status_code, data = await request.app.state.auth.checkout_payment_intent_hashed(
+        principal.credential_hash, memo, sender_address)
+    if 200 <= status_code < 300:
+        return data
+    detail = data.get("detail")
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {
+            "type": _CHECKOUT_ERROR_TYPES.get(status_code, f"http_{status_code}"),
+            "message": str(detail or f"ledger returned {status_code}"),
+        }},
+    )
 
 
 @app.get("/v1/wallet/balance")

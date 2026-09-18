@@ -170,8 +170,12 @@ class ServerBuiltPayloadTest(unittest.TestCase):
             body["sender_address"] = sender
         return self.client.post("/v1/payment-intents", json=body)
 
-    def _checkout(self, memo, sender=None):
+    def _checkout(self, memo, sender=None, credential=None):
+        """`credential` = the api_key hash proving ownership (what the Edge
+        adds for a wallet session); None = the public, unauthenticated call."""
         body = {} if sender is None else {"sender_address": sender}
+        if credential is not None:
+            body.update({"credential_type": "api_key", "credential_value": credential})
         return self.client.post(f"/v1/payment-intents/{memo}/checkout", json=body)
 
     def _matching_table(self):
@@ -236,7 +240,7 @@ class ServerBuiltPayloadTest(unittest.TestCase):
         j = self._create().json()
         memo, tx_a = j["memo"], j["onchain"]["custom_tx"]
 
-        r = self._checkout(memo, sender=SENDER_B)
+        r = self._checkout(memo, sender=SENDER_B, credential=KEY_HASH)   # the owner asks
         self.assertEqual(r.status_code, 200, r.text)
         tx_b = r.json()["onchain"]["custom_tx"]
         self.assertEqual(tx_b["address"], SENDER_B)
@@ -314,10 +318,11 @@ class ServerBuiltPayloadTest(unittest.TestCase):
         memo = j["memo"]
         self.assertIn(memo, self._memos())
 
-        # Builder recovers; the client retries with its sender and gets
-        # a payload, which is then stored like any other.
+        # Builder recovers; the client retries with its sender (through
+        # its session, so the owner credential rides along) and gets a
+        # payload, which is then stored like any other.
         self.builder.build_status = 200
-        r = self._checkout(memo, sender=SENDER_A)
+        r = self._checkout(memo, sender=SENDER_A, credential=KEY_HASH)
         self.assertEqual(r.status_code, 200, r.text)
         tx = r.json()["onchain"]["custom_tx"]
         self.assertEqual(tx["address"], SENDER_A)
@@ -336,11 +341,85 @@ class ServerBuiltPayloadTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertNotIn("custom_tx", r.json()["onchain"])
         self.assertEqual(self.builder.calls, [])
-        # A later checkout WITH a sender upgrades the intent to a stored payload.
-        r = self._checkout(j["memo"], sender=SENDER_A)
+        # A later checkout WITH a sender — from the owner — upgrades the
+        # intent to a stored payload.
+        r = self._checkout(j["memo"], sender=SENDER_A, credential=KEY_HASH)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["onchain"]["custom_tx"]["address"], SENDER_A)
         self.assertEqual(len(self._build_calls()), 1)
+
+    # ── the public route is READ-ONLY for the payload ──────────────────
+    # Reviewer finding (2026-09-18): /checkout is deliberately public, and
+    # the memo is public on-chain once a note commits. Rebuilding on a
+    # foreign sender therefore let anyone drive the builder and overwrite
+    # expected_note_id. Reads stay open; writes need the owner.
+
+    def test_public_checkout_cannot_replace_the_stored_payload(self):
+        j = self._create().json()
+        memo, tx_a = j["memo"], j["onchain"]["custom_tx"]
+        builds_before = len(self._build_calls())
+
+        r = self._checkout(memo, sender=SENDER_B)              # no credential
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertIn("owner", r.json()["detail"])
+        self.assertEqual(len(self._build_calls()), builds_before, "builder must not be driven")
+        # Stored payload and the reconciliation note id are untouched.
+        self.assertEqual(self._checkout(memo).json()["onchain"]["custom_tx"], tx_a)
+        row = next(i for i in self._matching_table() if i["memo"] == memo)
+        self.assertEqual(row["expected_note_id"], tx_a["note_id"])
+
+    def test_public_checkout_still_reads_the_stored_payload_for_its_own_sender(self):
+        j = self._create().json()
+        memo, tx_a = j["memo"], j["onchain"]["custom_tx"]
+        builds_before = len(self._build_calls())
+        # Same sender as stored: a read, allowed without credential.
+        r = self._checkout(memo, sender=SENDER_A)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["onchain"]["custom_tx"], tx_a)
+        # No sender at all: also a read.
+        self.assertEqual(self._checkout(memo).status_code, 200)
+        self.assertEqual(len(self._build_calls()), builds_before)
+
+    def test_public_checkout_cannot_seed_a_payload_on_a_bare_intent(self):
+        memo = self._create(sender=None).json()["memo"]        # legacy: nothing stored
+        r = self._checkout(memo, sender=SENDER_B)
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(self._build_calls(), [])
+        row = next(i for i in self._matching_table() if i["memo"] == memo)
+        self.assertIsNone(row["expected_note_id"])
+
+    def test_someone_elses_credential_is_refused_like_an_unknown_one(self):
+        memo = self._create().json()["memo"]
+        other = hashlib.sha256(b"lev_someone_else").hexdigest()
+        r = self.client.post("/v1/identities", headers={"authorization": f"Bearer {ADMIN}"},
+                             json={"credential_type": "api_key", "credential_value": other})
+        self.assertEqual(r.status_code, 201, r.text)
+        builds_before = len(self._build_calls())
+        for cred in (other, hashlib.sha256(b"never_issued").hexdigest()):
+            r = self._checkout(memo, sender=SENDER_B, credential=cred)
+            self.assertEqual(r.status_code, 403, r.text)
+            self.assertEqual(r.json()["detail"], "credential does not own this intent")
+        self.assertEqual(len(self._build_calls()), builds_before)
+
+    def test_malformed_credential_is_401_before_any_provider_call(self):
+        memo = self._create().json()["memo"]
+        builds_before = len(self._build_calls())
+        r = self.client.post(f"/v1/payment-intents/{memo}/checkout",
+                             json={"credential_type": "miden_wallet", "credential_value": "x",
+                                   "sender_address": SENDER_B})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(len(self._build_calls()), builds_before)
+
+    def test_bad_credential_on_a_stripe_intent_never_mints_a_checkout_session(self):
+        # Ownership is checked BEFORE the provider call on every rail: a
+        # refused request must not leave a live Stripe Checkout Session behind.
+        memo = self._create(provider="stripe", sender=None).json()["memo"]
+        r = self._checkout(memo, credential=hashlib.sha256(b"never_issued").hexdigest())
+        self.assertEqual(r.status_code, 403, r.text)
+        # and the owner still can
+        r = self._checkout(memo, credential=KEY_HASH)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("checkout.stripe.com", r.json()["invoice_url"])
 
     def test_operator_override_onto_onchain_still_yields_a_payload(self):
         # Reviewer finding (2026-09-18): the SDK used to send sender_address
