@@ -42,7 +42,7 @@ import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app.main as main  # noqa: E402
-from app import onchain_client, stripe_client  # noqa: E402
+from app import handlers, onchain_client, stripe_client  # noqa: E402
 from app.db import init_db as real_init_db  # noqa: E402
 
 
@@ -125,6 +125,10 @@ class ServerBuiltPayloadTest(unittest.TestCase):
             patch.object(main, "ONCHAIN_WATCHER_TOKEN", WATCHER),
             patch.object(main, "TOPUP_PROVIDER_OVERRIDE", ""),
             patch.object(main.limiter, "enabled", False),
+            # One identity serves every test here and each leaves a pending
+            # on-chain order behind; the per-rail cap (8) is not what these
+            # tests exercise and would otherwise 400 whichever test runs 9th.
+            patch.object(handlers, "ONCHAIN_MAX_PENDING_PER_IDENTITY", 1000),
             patch.object(onchain_client, "ONCHAIN_GATEWAY_ADDRESS", GATEWAY),
             patch.object(onchain_client, "ONCHAIN_FAUCET_ID", FAUCET),
             patch.object(onchain_client, "ONCHAIN_BUILDER_URL", "http://note-builder.test:8090"),
@@ -336,6 +340,22 @@ class ServerBuiltPayloadTest(unittest.TestCase):
         r = self._checkout(j["memo"], sender=SENDER_A)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["onchain"]["custom_tx"]["address"], SENDER_A)
+        self.assertEqual(len(self._build_calls()), 1)
+
+    def test_operator_override_onto_onchain_still_yields_a_payload(self):
+        # Reviewer finding (2026-09-18): the SDK used to send sender_address
+        # only when the CLIENT asked for on-chain. With
+        # TOPUP_PROVIDER_OVERRIDE=onchain and a client asking for Stripe, the
+        # server (rightly) made an on-chain order — but without a sender it
+        # had no payload, and the first payTopup failed. The SDK now sends
+        # the sender on every rail; this pins the server half: the override
+        # rail gets its payload from a sender sent alongside a Stripe request.
+        with patch.object(main, "TOPUP_PROVIDER_OVERRIDE", "onchain"):
+            r = self._create(provider="stripe", sender=SENDER_A)
+        self.assertEqual(r.status_code, 201, r.text)
+        j = r.json()
+        self.assertEqual(j["provider"], "onchain")            # the server's rail…
+        self.assertEqual(j["onchain"]["custom_tx"]["address"], SENDER_A)   # …with its payload
         self.assertEqual(len(self._build_calls()), 1)
 
     def test_stripe_rail_ignores_sender_and_never_calls_the_builder(self):
