@@ -170,6 +170,16 @@ def main():
     if not added and not removed:
         print("  (no changes)")
 
+    # The Edge surfaces input modalities on /v1/models from an operator-kept
+    # map (EDGE_MODEL_INPUT_MODALITIES) — the gateway does not expose them
+    # per alias. Print the line that matches THIS map so it is updated in the
+    # same motion as the model map, never left to drift.
+    by_id = {m["id"]: m for m in catalog}
+    modalities = {alias: (by_id.get(mid, {}).get("input_modalities") or ["text"])
+                  for alias, mid in sorted(new_map.items())}
+    print("\nEdge .env line to match (ai-edge/.env, then recreate edge):")
+    print(f"  EDGE_MODEL_INPUT_MODALITIES={json.dumps(modalities, separators=(',', ':'))}")
+
     if not args.apply:
         print("\ndry-run only — re-run with --apply to update the gateway")
         return
