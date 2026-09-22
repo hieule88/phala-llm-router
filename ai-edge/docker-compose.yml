@@ -143,6 +143,10 @@ services:
       # The Phala-hosted gateway + its internal service token (sent on
       # x-gateway-token; authorization carries the per-user tenant bearer).
       - GATEWAY_URL=${GATEWAY_URL:?set GATEWAY_URL (the Phala gateway base, no trailing slash)}
+      # Per-model input modalities surfaced on /v1/models (frontends enable
+      # image attachment from this, not from hardcoded names). Keep in step
+      # with the gateway's model map — `sync_tee_models.py` prints the line.
+      - EDGE_MODEL_INPUT_MODALITIES=${EDGE_MODEL_INPUT_MODALITIES:-{"glm-5.3-flash":["text","image"],"qwen3.8-27b":["text","image"],"qwen3.6-35b-a3b":["text"]}}
       - GATEWAY_API_TOKEN=${GATEWAY_API_TOKEN:?set GATEWAY_API_TOKEN (the gateway's api_token)}
       # Derives per-user tenant bearers (receipt ownership at the gateway).
       # Rotating it orphans receipts issued under the old bearers.

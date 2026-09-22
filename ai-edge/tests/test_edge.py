@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import unittest
+import unittest.mock
 
 import httpx
 
@@ -539,6 +540,75 @@ class ReceiptRouteTest(unittest.TestCase):
         resp, state = self._get_receipt({"valid": False, "error": "credential not found"})
         self.assertEqual(resp.status_code, 401)
         self.assertIsNone(state["gw_headers"])
+
+
+class ModelsInputModalitiesTest(unittest.TestCase):
+    """/v1/models decorates each model with `input_modalities` from the
+    operator map, so frontends enable image attachment per model without
+    hardcoding names. It decorates only: errors and odd bodies pass through."""
+
+    MAP = {"glm-5.3-flash": ["text", "image"], "qwen3.6-35b-a3b": ["text"]}
+    GW_LIST = (b'{"object":"list","data":[{"id":"glm-5.3-flash","object":"model","owned_by":"phala"},'
+               b'{"id":"qwen3.6-35b-a3b","object":"model","owned_by":"phala"},'
+               b'{"id":"brand-new","object":"model","owned_by":"phala"}]}')
+
+    def test_annotate_adds_modalities_and_defaults_unknown_to_text(self):
+        import json as _json
+        with unittest.mock.patch.object(edge, "MODEL_INPUT_MODALITIES", self.MAP):
+            out = _json.loads(edge._annotate_models(self.GW_LIST))
+        by_id = {m["id"]: m for m in out["data"]}
+        self.assertEqual(by_id["glm-5.3-flash"]["input_modalities"], ["text", "image"])
+        self.assertEqual(by_id["qwen3.6-35b-a3b"]["input_modalities"], ["text"])
+        self.assertEqual(by_id["brand-new"]["input_modalities"], ["text"])   # conservative default
+        self.assertEqual(by_id["glm-5.3-flash"]["owned_by"], "phala")           # nothing else touched
+
+    def test_annotate_passes_non_list_bodies_through_untouched(self):
+        for body in (b'{"error":{"message":"nope"}}', b"not json", b"[]", b'{"data":"x"}'):
+            self.assertEqual(edge._annotate_models(body), body)
+
+    def test_annotate_respects_a_gateway_that_already_knows(self):
+        import json as _json
+        body = b'{"object":"list","data":[{"id":"glm-5.3-flash","input_modalities":["text","image","audio"]}]}'
+        out = _json.loads(edge._annotate_models(body))
+        self.assertEqual(out["data"][0]["input_modalities"], ["text", "image", "audio"])
+
+    def test_parse_modalities_accepts_lists_and_csv_and_rejects_garbage(self):
+        self.assertEqual(edge._parse_modalities(""), {})
+        self.assertEqual(edge._parse_modalities('{"a":["text","image"],"b":"text, image"}'),
+                         {"a": ["text", "image"], "b": ["text", "image"]})
+        for bad in ("[1,2]", '{"a":[]}', '{"a":[1]}', "{nope"):
+            with self.assertRaises(RuntimeError):
+                edge._parse_modalities(bad)
+
+    def test_models_route_returns_decorated_list_for_an_api_key(self):
+        def auth_handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/v1/validate":
+                return httpx.Response(200, json={"valid": True, "identity_id": 7, "balance": 49})
+            return httpx.Response(404)
+
+        def gw_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=self.GW_LIST,
+                                  headers={"content-type": "application/json",
+                                           "content-length": str(len(self.GW_LIST))})
+
+        ac = edge.AuthClient()
+        ac._c = httpx.AsyncClient(transport=httpx.MockTransport(auth_handler))
+        edge.app.state.auth = ac
+        edge.app.state.gw = httpx.AsyncClient(transport=httpx.MockTransport(gw_handler))
+
+        async def go():
+            transport = httpx.ASGITransport(app=edge.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://edge") as c:
+                return await c.get("/v1/models", headers={"authorization": "Bearer lev_user"})
+
+        with unittest.mock.patch.object(edge, "MODEL_INPUT_MODALITIES", self.MAP):
+            resp = run(go())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        by_id = {m["id"]: m for m in resp.json()["data"]}
+        self.assertEqual(by_id["glm-5.3-flash"]["input_modalities"], ["text", "image"])
+        self.assertEqual(by_id["brand-new"]["input_modalities"], ["text"])
+        # a stale upstream content-length must not be forwarded with a longer body
+        self.assertEqual(len(resp.content), int(resp.headers["content-length"]))
 
 
 if __name__ == "__main__":

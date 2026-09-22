@@ -88,6 +88,62 @@ AUTH_SERVICE_VERIFY_TLS = _resolve_verify(os.getenv("AUTH_SERVICE_VERIFY_TLS", "
 # x-gateway-token so `authorization` stays free for the tenant bearer).
 GATEWAY_URL = os.getenv("GATEWAY_URL", "").rstrip("/")
 GATEWAY_API_TOKEN = os.getenv("GATEWAY_API_TOKEN", "")
+
+# Which public models accept which input modalities, e.g.
+#   {"glm-5.3-flash": ["text", "image"], "qwen3.6-35b-a3b": ["text"]}
+# Merged into /v1/models as `input_modalities` so a frontend can enable
+# image attachment per model without hardcoding names. The truth lives in
+# the upstream catalog (NEAR's /v1/models, per upstream id), which the
+# gateway does not expose per public alias — so the operator keeps this
+# map alongside the model map (ai-edge/sync_tee_models.py prints the
+# matching line). Unknown model → ["text"], the conservative default.
+
+
+def _parse_modalities(raw: str) -> "dict[str, list[str]]":
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise RuntimeError(f"EDGE_MODEL_INPUT_MODALITIES is not valid JSON: {e}") from None
+    if not isinstance(data, dict):
+        raise RuntimeError("EDGE_MODEL_INPUT_MODALITIES must be a JSON object {model: [modalities]}")
+    out: dict[str, list[str]] = {}
+    for model_id, mods in data.items():
+        if isinstance(mods, str):
+            mods = [m.strip() for m in mods.split(",") if m.strip()]
+        if (not isinstance(mods, list) or not mods
+                or not all(isinstance(m, str) and m for m in mods)):
+            raise RuntimeError(
+                f"EDGE_MODEL_INPUT_MODALITIES[{model_id!r}] must be a non-empty list of strings")
+        out[str(model_id)] = mods
+    return out
+
+
+MODEL_INPUT_MODALITIES = _parse_modalities(os.getenv("EDGE_MODEL_INPUT_MODALITIES", ""))
+DEFAULT_INPUT_MODALITIES = ["text"]
+
+
+def _annotate_models(content: bytes) -> bytes:
+    """Add `input_modalities` to every entry of an OpenAI-style model list.
+
+    Anything that is not a well-formed list response (an error body, a
+    non-JSON payload) is returned byte-for-byte: this decorates, it never
+    decides. Entries already carrying `input_modalities` (a future gateway
+    that knows) are left alone.
+    """
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return content
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return content
+    for entry in data:
+        if isinstance(entry, dict) and "input_modalities" not in entry:
+            entry["input_modalities"] = list(
+                MODEL_INPUT_MODALITIES.get(str(entry.get("id")), DEFAULT_INPUT_MODALITIES))
+    return json.dumps(payload).encode("utf-8")
 GATEWAY_TIMEOUT_SEC = float(os.getenv("GATEWAY_TIMEOUT_SEC", "600.0"))
 
 # Secret behind the per-user tenant bearers. Receipts at the gateway are owned
@@ -957,7 +1013,12 @@ async def models(request: Request):
         r = await gw.get(f"{GATEWAY_URL}/v1/models", headers={"authorization": f"Bearer {GATEWAY_API_TOKEN}"})
     except httpx.RequestError:
         return JSONResponse(status_code=502, content={"error": {"message": "gateway unreachable", "type": "gateway"}})
-    return Response(content=r.content, status_code=r.status_code, headers=_fwd_response_headers(r))
+    # Decorate a successful list with per-model `input_modalities` (see
+    # MODEL_INPUT_MODALITIES); errors and odd bodies pass through untouched.
+    content = _annotate_models(r.content) if r.status_code == 200 else r.content
+    headers = _fwd_response_headers(r)
+    headers.pop("content-length", None)   # body may have grown
+    return Response(content=content, status_code=r.status_code, headers=headers)
 
 
 @app.api_route("/v1/attestation/report", methods=["GET"])
