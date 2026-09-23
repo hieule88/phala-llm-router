@@ -211,6 +211,20 @@ class HelpersTest(unittest.TestCase):
             headers = {}
         self.assertEqual(edge._bound_header_digest(R()), edge._bound_header_digest(R()))
 
+    def test_cors_exposes_every_forwarded_header_a_client_acts_on(self):
+        # Forwarding a header is not enough for a cross-origin page: the
+        # browser hides it unless it is in Access-Control-Expose-Headers.
+        # The SDK refuses a reply without x-e2ee-applied, so a Railway/Vite
+        # frontend saw every encrypted chat fail while same-origin proxies
+        # (which never consult this list) worked — the 2026-09-23 bug.
+        exposed = {h.lower() for h in edge._CORS_EXPOSE_HEADERS}
+        for must in ("x-receipt-id", "x-e2ee-applied", "x-e2ee-version", "x-e2ee-algo"):
+            self.assertIn(must, exposed)
+        # and everything the forwarder lets through by name is exposed too
+        for h in edge._FWD_RESP_HEADERS:
+            if h != "content-type":
+                self.assertIn(h, exposed)
+
     def test_fwd_response_headers_expose_the_e2ee_verdict(self):
         # The gateway stamps x-e2ee-applied true/false on every completion.
         # Swallowing it leaves a client unable to distinguish "encrypted to the

@@ -466,6 +466,18 @@ app = FastAPI(title="Leviathan AI Edge", lifespan=lifespan)
 # wallet session cross-site. Auth still rests on per-request signatures; CORS
 # here only gates which pages a browser will let talk to us at all.
 EDGE_CORS_ORIGINS = [o.strip() for o in os.getenv("EDGE_CORS_ORIGINS", "").split(",") if o.strip()]
+
+# Response headers a CROSS-ORIGIN page may read. Everything the Edge forwards
+# from the gateway that a client acts on must be here, or a browser app on
+# another origin sees the request succeed and the header vanish:
+#   x-receipt-id      — verifiability
+#   x-e2ee-applied    — the gateway's confirmation that it decrypted the
+#                       request; an E2EE client REFUSES the reply without it
+#                       (the SDK throws e2ee_not_applied). A same-origin proxy
+#                       never notices this list; a Railway/Vite page does.
+#   x-e2ee-version / x-e2ee-algo — which scheme the reply is encrypted under
+_CORS_EXPOSE_HEADERS = ["x-receipt-id", "x-e2ee-applied", "x-e2ee-version", "x-e2ee-algo"]
+
 if EDGE_CORS_ORIGINS:
     from fastapi.middleware.cors import CORSMiddleware
 
@@ -479,7 +491,7 @@ if EDGE_CORS_ORIGINS:
             "x-signing-algo", "x-client-pub-key", "x-model-pub-key",
             "x-e2ee-version", "x-e2ee-nonce", "x-e2ee-timestamp",
         ],
-        expose_headers=["x-receipt-id"],
+        expose_headers=_CORS_EXPOSE_HEADERS,
     )
 
 
