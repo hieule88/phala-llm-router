@@ -36,6 +36,10 @@ def run(coro):
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Like asyncio.run(): finalize async generators a request left
+        # half-consumed (e.g. a body the Edge stopped reading at its cap)
+        # instead of leaving their aclose() as a destroyed pending task.
+        loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
 
 
@@ -627,3 +631,102 @@ class ModelsInputModalitiesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BodyCapTest(unittest.TestCase):
+    """The Edge refuses an oversized body BEFORE auth, spend-cap booking and
+    debit — by Content-Length without reading a byte, or while streaming a
+    body that declares no length — so an anonymous client cannot balloon the
+    Edge's memory and a too-large legitimate request costs no debit/refund
+    round trip. Caps are patched small so the tests stay cheap."""
+
+    def _post(self, content, headers=None, cap=1024):
+        state = {"consumes": 0, "gw_calls": 0}
+
+        def auth_handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/v1/consume":
+                state["consumes"] += 1
+                return httpx.Response(200, json={"success": True, "balance": 9, "identity_id": 7,
+                                                 "debit_token": "tok-1"})
+            return httpx.Response(200, json={"success": True})
+
+        def gw_handler(req: httpx.Request) -> httpx.Response:
+            state["gw_calls"] += 1
+            return httpx.Response(200, content=b'{"ok":true}', headers={"content-type": "application/json"})
+
+        ac = edge.AuthClient()
+        ac._c = httpx.AsyncClient(transport=httpx.MockTransport(auth_handler))
+        edge.app.state.auth = ac
+        edge.app.state.gw = httpx.AsyncClient(transport=httpx.MockTransport(gw_handler))
+
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=edge.app), base_url="http://edge") as c:
+                return await c.post("/v1/chat/completions",
+                                    headers={"authorization": "Bearer lev_user",
+                                             "content-type": "application/json", **(headers or {})},
+                                    content=content)
+
+        with unittest.mock.patch.object(edge, "EDGE_MAX_BODY_BYTES", cap):
+            resp = run(go())
+        return resp, state
+
+    def test_declared_length_over_cap_is_413_before_auth_or_debit(self):
+        resp, state = self._post(b"x" * 2000)          # httpx sets Content-Length: 2000
+        self.assertEqual(resp.status_code, 413)
+        self.assertEqual(resp.json()["error"]["type"], "request_too_large")
+        self.assertEqual(state["consumes"], 0, "no debit for a body the gateway would refuse")
+        self.assertEqual(state["gw_calls"], 0)
+
+    def test_streamed_body_without_length_is_cut_at_cap(self):
+        async def chunks():
+            for _ in range(20):
+                yield b"y" * 100                      # 2000 bytes, Transfer-Encoding: chunked
+        resp, state = self._post(chunks())   # left half-consumed by design; run() finalizes it
+        self.assertEqual(resp.status_code, 413)
+        self.assertEqual(resp.json()["error"]["type"], "request_too_large")
+        self.assertEqual(state["consumes"], 0)
+
+    def test_body_under_cap_goes_through_unchanged(self):
+        body = b'{"model":"m","messages":[{"role":"user","content":"' + b"z" * 800 + b'"}]}'
+        resp, state = self._post(body)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(state["consumes"], 1)
+        self.assertEqual(state["gw_calls"], 1)
+
+    def test_read_body_helper_caps_wallet_endpoints_too(self):
+        """_read_body is what every wallet handler and _json_body use, with the
+        small wallet cap; drive it with a raw ASGI receive."""
+        from starlette.requests import Request
+
+        def make_request(headers, payload_chunks):
+            it = iter(payload_chunks)
+
+            async def receive():
+                try:
+                    return {"type": "http.request", "body": next(it), "more_body": True}
+                except StopIteration:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            scope = {"type": "http", "method": "POST", "path": "/v1/wallet/challenge",
+                     "headers": [(k.encode(), v.encode()) for k, v in headers.items()], "query_string": b""}
+            return Request(scope, receive)
+
+        cap = edge.EDGE_MAX_WALLET_BODY_BYTES
+        self.assertEqual(cap, 64 * 1024)
+        # declared over the cap: refused without reading
+        req = make_request({"content-length": str(cap + 1)}, [b"never read"])
+        with self.assertRaises(edge.WalletAuthError) as ctx:
+            run(edge._read_body(req, cap))
+        self.assertEqual(ctx.exception.status, 413)
+        # no length, streamed past the cap: refused mid-stream
+        req = make_request({}, [b"a" * 1024] * 70)
+        with self.assertRaises(edge.WalletAuthError) as ctx:
+            run(edge._read_body(req, cap))
+        self.assertEqual(ctx.exception.status, 413)
+        # under the cap: the exact bytes come back (the signature covers them)
+        req = make_request({}, [b"hel", b"lo"])
+        self.assertEqual(run(edge._read_body(req, cap)), b"hello")
+        # a garbage Content-Length is a 400, not a crash
+        req = make_request({"content-length": "lots"}, [b""])
+        with self.assertRaises(edge.WalletAuthError) as ctx:
+            run(edge._read_body(req, cap))
+        self.assertEqual(ctx.exception.status, 400)

@@ -83,6 +83,13 @@
 		file_server
 	}
 	handle {
+		# Outer body cap, same as the Edge's own EDGE_MAX_BODY_BYTES and the
+		# gateway's 32 MiB: an oversized upload is cut at the front door
+		# instead of streaming into the Edge. The Edge enforces the cap
+		# itself too (it must hold without Caddy in front of it).
+		request_body {
+			max_size 32MiB
+		}
 		reverse_proxy edge:8090 {
 			header_up X-Real-IP {remote_host}
 		}

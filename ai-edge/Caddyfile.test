@@ -22,6 +22,10 @@
 		file_server
 	}
 	handle {
+		# Same outer body cap as production (see Caddyfile).
+		request_body {
+			max_size 32MiB
+		}
 		reverse_proxy edge:8090 {
 			header_up X-Real-IP {remote_host}
 		}

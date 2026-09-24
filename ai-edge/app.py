@@ -89,6 +89,18 @@ AUTH_SERVICE_VERIFY_TLS = _resolve_verify(os.getenv("AUTH_SERVICE_VERIFY_TLS", "
 GATEWAY_URL = os.getenv("GATEWAY_URL", "").rstrip("/")
 GATEWAY_API_TOKEN = os.getenv("GATEWAY_API_TOKEN", "")
 
+# Request-body caps. The gateway refuses bodies over 32 MiB
+# (MAX_REQUEST_BODY_BYTES); the Edge refuses the same BEFORE reading them into
+# memory, authenticating, or debiting: a Content-Length over the cap is
+# rejected without reading a byte, and a body without one is read up to the
+# cap and not further. Keep EDGE_MAX_BODY_BYTES equal to the gateway's cap —
+# lower rejects requests the gateway would take, higher debits a credit for a
+# guaranteed 413 (refunded, but a round trip for nothing). Wallet control
+# endpoints carry a few KB of JSON (a Falcon signature is ~1.3 KB); they get a
+# cap that no honest client reaches and no anonymous client can abuse.
+EDGE_MAX_BODY_BYTES = int(os.getenv("EDGE_MAX_BODY_BYTES", str(32 * 1024 * 1024)))
+EDGE_MAX_WALLET_BODY_BYTES = int(os.getenv("EDGE_MAX_WALLET_BODY_BYTES", str(64 * 1024)))
+
 # Which public models accept which input modalities, e.g.
 #   {"glm-5.3-flash": ["text", "image"], "qwen3.6-35b-a3b": ["text"]}
 # Merged into /v1/models as `input_modalities` so a frontend can enable
@@ -642,9 +654,45 @@ def _wallet_or_501(request: Request) -> "wallet_auth.WalletAuthenticator":
     return wallet
 
 
+async def _read_body(request: Request, limit: int) -> bytes:
+    """Read the request body, never holding more than `limit` bytes.
+
+    A wallet signature covers the exact bytes, so nothing can be authenticated
+    before the body is read — but the body can be refused before it is read:
+    a declared Content-Length over the cap is a 413 with zero bytes consumed,
+    and an undeclared (chunked) or lying length is read only up to the cap.
+    Raises WalletAuthError(status=413) — `_wallet_error` renders it for API-key
+    and wallet callers alike.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            n = int(declared)
+        except ValueError:
+            n = -1
+        if n < 0:
+            raise WalletAuthError("wallet_invalid_request", "invalid Content-Length", status=400)
+        if n > limit:
+            raise WalletAuthError(
+                "request_too_large", f"request body exceeds {limit} bytes", status=413)
+    chunks: list[bytes] = []
+    total = 0
+    stream = request.stream()
+    try:
+        async for chunk in stream:
+            total += len(chunk)
+            if total > limit:
+                raise WalletAuthError(
+                    "request_too_large", f"request body exceeds {limit} bytes", status=413)
+            chunks.append(chunk)
+    finally:
+        await stream.aclose()   # bailing out mid-body must not leave the generator dangling
+    return b"".join(chunks)
+
+
 async def _json_body(request: Request) -> dict:
     try:
-        payload = json.loads(await request.body() or b"{}")
+        payload = json.loads(await _read_body(request, EDGE_MAX_WALLET_BODY_BYTES) or b"{}")
     except ValueError:
         raise WalletAuthError("wallet_invalid_request", "body must be JSON") from None
     if not isinstance(payload, dict):
@@ -710,8 +758,8 @@ async def wallet_bind(request: Request):
 async def wallet_session_revoke(request: Request):
     """End this session. The extension calls it when the wallet locks — and
     drops its keys either way, so a failure here costs the user nothing."""
-    body = await request.body()
     try:
+        body = await _read_body(request, EDGE_MAX_WALLET_BODY_BYTES)
         principal = await _resolve_principal(
             request, "/v1/wallet/session/revoke", body, "inference",
         )
@@ -728,8 +776,8 @@ async def wallet_session_revoke(request: Request):
 async def wallet_sessions_revoke_all(request: Request):
     """Kill every session of this wallet — the lost-device button. Reachable
     from any device holding the mnemonic, since binding is all it takes."""
-    body = await request.body()
     try:
+        body = await _read_body(request, EDGE_MAX_WALLET_BODY_BYTES)
         principal = await _resolve_principal(
             request, "/v1/wallet/sessions/revoke-all", body, "inference",
         )
@@ -754,8 +802,8 @@ async def wallet_payment_intent(request: Request):
     payment instructions in `onchain`. Either receive side credits this
     wallet's identity — no wallet-specific billing code.
     """
-    body = await request.body()
     try:
+        body = await _read_body(request, EDGE_MAX_WALLET_BODY_BYTES)
         # No spend/read scope required: funding your own balance only helps you.
         principal = await _resolve_principal(request, "/v1/wallet/payment-intents", body, None)
     except WalletAuthError as exc:
@@ -823,9 +871,9 @@ async def wallet_payment_intent_checkout(request: Request, memo: str):
     Status codes from the ledger pass through unchanged (403/404/409 mean
     things to the client); the body is reshaped to the Edge's error form.
     """
-    body = await request.body()
     path = f"/v1/wallet/payment-intents/{memo}/checkout"
     try:
+        body = await _read_body(request, EDGE_MAX_WALLET_BODY_BYTES)
         principal = await _resolve_principal(request, path, body, None)
     except WalletAuthError as exc:
         return _wallet_error(exc)
@@ -879,9 +927,11 @@ async def wallet_balance(request: Request):
 
 async def _metered_proxy(request: Request, path: str) -> Response:
     # Body first: a wallet signature covers the exact bytes, so it cannot be
-    # checked before they are read.
-    body = await request.body()
+    # checked before they are read. Capped: an oversized body is a 413 here,
+    # before any auth call, spend-cap booking or ledger debit — the gateway
+    # would refuse it anyway, so nothing is booked only to be refunded.
     try:
+        body = await _read_body(request, EDGE_MAX_BODY_BYTES)
         principal = await _resolve_principal(request, path, body, "inference")
     except WalletAuthError as exc:
         return _wallet_error(exc)

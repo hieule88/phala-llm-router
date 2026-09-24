@@ -148,6 +148,11 @@ services:
       # with the gateway's model map — `sync_tee_models.py` prints the line.
       - EDGE_MODEL_INPUT_MODALITIES=${EDGE_MODEL_INPUT_MODALITIES:-{"glm-5.3-flash":["text","image"],"qwen3.8-27b":["text","image"],"qwen3.6-35b-a3b":["text"]}}
       - GATEWAY_API_TOKEN=${GATEWAY_API_TOKEN:?set GATEWAY_API_TOKEN (the gateway's api_token)}
+      # Request-body cap, enforced BEFORE auth and debit (a Content-Length
+      # over it is refused without reading a byte). Keep equal to the
+      # gateway's MAX_REQUEST_BODY_BYTES (32 MiB) and to the Caddyfile's
+      # request_body max_size.
+      - EDGE_MAX_BODY_BYTES=${EDGE_MAX_BODY_BYTES:-33554432}
       # Derives per-user tenant bearers (receipt ownership at the gateway).
       # Rotating it orphans receipts issued under the old bearers.
       - EDGE_TENANT_SECRET=${EDGE_TENANT_SECRET:?set EDGE_TENANT_SECRET (openssl rand -hex 32)}
